@@ -1,0 +1,116 @@
+{
+  "title": "Complete Trading Tutorial",
+  "subtitle": "From zero to placing a calculated trade",
+  "search_placeholder": "Search the tutorial…",
+  "no_results": "Nothing matched that search.",
+  "progress": "Lesson {current} of {total}",
+  "next": "Next lesson ›",
+  "previous": "‹ Previous lesson",
+  "level_basic": "Basic",
+  "level_intermediate": "Intermediate",
+  "level_advanced": "Advanced",
+  "chapters": [
+    {
+      "key": "market",
+      "level": "basic",
+      "title": "1. What crypto futures actually are",
+      "body": "On the spot market you buy the coin itself and own it. On the futures market you own nothing — you take a contract on the direction of the price. Expecting a rise, you go long; expecting a fall, you go short.\n\nThat ability to short is the main difference: you can profit in a falling market. For exactly the same reason, losses run both ways too.\n\nA perpetual contract has no expiry date. Instead, a mechanism called the funding rate keeps the contract price close to the real market price. Every few hours, depending on whether longs or shorts dominate, one side pays the other a small amount. Hold a position for days and that cost stops being small.\n\nThe key point: futures are not a tool for bigger profits, they are a tool for bigger risk. Bigger profit is merely a side effect."
+    },
+    {
+      "key": "leverage",
+      "level": "basic",
+      "title": "2. Leverage and margin — where most accounts die",
+      "body": "Leverage means opening a large position with little capital. With $100 and 10x leverage you control a $1,000 position.\n\nThe common mistake is thinking leverage multiplies profit by ten. It multiplies profit and loss by ten. More importantly, it divides your distance to liquidation by ten.\n\nRough liquidation maths: with leverage L, roughly a 100/L percent move against you wipes out the margin.\n\n• 5x  → about 20% away\n• 10x → about 10% away\n• 25x → about 4% away\n• 50x → about 2% away\n\nBitcoin easily moves 3% in a day. At 50x, one ordinary day is enough to zero your account — even if your analysis eventually turns out to be right.\n\nIsolated margin risks only that position's funds; cross margin risks the whole balance. Start with isolated, always.\n\nPractical advice: until you have been profitable on a paper account for three consecutive months, do not go above 3x."
+    },
+    {
+      "key": "orders",
+      "level": "basic",
+      "title": "3. Order types",
+      "body": "• Market order: fills immediately at the best available price. Certain but more expensive; in a thin market slippage can cost several percent.\n\n• Limit order: you name your price and it fills only at that price or better. Cheaper in fees, but it may never fill and the market leaves without you.\n\n• Stop loss: closes the position once price hits a defined level, so the loss cannot grow. This is the single most important order in trading.\n\n• Take profit: the same logic, on the winning side.\n\n• OCO: two orders where filling one cancels the other. Used to place a stop loss and a take profit together.\n\nRule with no exceptions: place the stop loss at the same moment you open the position. \"I'll add it later\" means you won't."
+    },
+    {
+      "key": "risk",
+      "level": "basic",
+      "title": "4. Risk management — the most important lesson here",
+      "body": "Professionals do not win by predicting better. They win by losing better.\n\nThe one-to-two-percent rule: never risk more than 1–2% of total capital on a single trade. Risk means the amount you lose if the stop is hit, not the position size.\n\nWhy it matters this much? Look at the numbers:\n• Lose 10% → need 11% to recover\n• Lose 25% → need 33%\n• Lose 50% → need 100%\n• Lose 75% → need 300%\n\nLosses and recoveries are not symmetric. The deeper the hole, the less likely the climb out.\n\nRisking 1% per trade, ten losses in a row cost about 10% and you are still in the game. Risking 20%, three losses swallow half your capital.\n\nSet a daily loss limit too: after two consecutive losses, stop for the day. That single rule saves you from revenge trading."
+    },
+    {
+      "key": "sizing",
+      "level": "intermediate",
+      "title": "5. Calculating position size",
+      "body": "Position size is never a guess. You derive it from the stop loss, not the other way round.\n\nFormula: size = (capital × risk percent) ÷ stop distance\n\nWorked example:\n• Capital: $1,000\n• Risk allowed: 1% = $10\n• Entry: $60,000\n• Stop: $58,800 → distance $1,200, i.e. 2%\n\nSize = 10 ÷ 1,200 = 0.0083 BTC (about $500 of exposure)\n\nSo with $1,000 of capital you take a $500 position, and if the stop hits you lose only $10.\n\nThe correct order is always: market structure → stop placement → size. Never start with \"I want to put in $500\" and then hunt for somewhere to hide a stop.\n\nLeverage plays no part in this calculation; it only decides how much margin gets locked up."
+    },
+    {
+      "key": "rr",
+      "level": "intermediate",
+      "title": "6. Risk/reward and win rate",
+      "body": "Risk/reward (R/R) is how many units of profit you expect per unit of risk. A stop 2% below and a target 6% above gives an R/R of 3.\n\nThe important part: you do not need to be right most of the time. Minimum win rate to break even:\n\n• R/R = 1 → need 50%\n• R/R = 2 → need 34%\n• R/R = 3 → need 25%\n• R/R = 5 → need 17%\n\nAt R/R 3 you can be wrong three times out of four and still make money.\n\nThat is why this app's risk engine rejects setups below your minimum R/R and turns them into WAIT — even when the direction is right. A correct read with bad structure is still a bad trade."
+    },
+    {
+      "key": "structure",
+      "level": "intermediate",
+      "title": "7. Market structure: trend, support, resistance",
+      "body": "A market is always in one of three states: uptrend, downtrend, or range.\n\nAn uptrend is a sequence of higher highs and higher lows. A downtrend is lower highs and lower lows. Until that sequence breaks, the trend stands.\n\nSupport is a level where price previously turned and buyers stepped in; resistance is the mirror image. These are zones, not thin lines. Expecting a reaction at one exact number is asking too much.\n\nRole reversal: once resistance breaks decisively, it usually acts as support on the next retest. That flip produces some of the best low-risk entries available.\n\nValid levels are the ones that have been touched several times, are visible on a higher timeframe too, and saw high volume.\n\nAlways trade in the direction of the higher timeframe trend. Swimming against the current is possible, but tiring and expensive."
+    },
+    {
+      "key": "candles",
+      "level": "intermediate",
+      "title": "8. Reading candles",
+      "body": "Every candle carries four numbers: open, close, high and low. The body spans open to close; the wicks show the full range.\n\nWhat matters is the candle's story, not its name:\n\n• Long lower wick = sellers pushed price down and buyers took it all back. Buyer strength, especially at support.\n\n• Long upper wick = buyers failed. Weakness, especially under resistance.\n\n• Large body, no wicks = one side was fully in control.\n\n• Small body with wicks both sides (doji) = indecision. Not a signal on its own; it just says wait.\n\n• Engulfing candle = a candle that swallows the previous body; a shift in the balance of power.\n\nNever trade a candle pattern outside its context. A hammer in the middle of a range means nothing; the same hammer on valid daily support is a signal.\n\nAnd always wait for the candle to close. An unfinished candle can still become anything."
+    },
+    {
+      "key": "indicators",
+      "level": "intermediate",
+      "title": "9. Indicators and how to use them properly",
+      "body": "Indicators do not predict price. They summarise information already in the price, and all of them lag.\n\n• Moving averages (MA/EMA): trend direction. A short MA crossing a long one suggests a shift, but produces constant false signals in a range.\n\n• RSI: momentum. Above 70 is called overbought, below 30 oversold — yet in a strong trend RSI can sit above 70 for weeks. Shorting purely because RSI is high is a fast way to lose money. Its real value is divergence: price makes a higher high, RSI does not.\n\n• MACD: the relationship between two averages. Good for confirming a momentum shift, weak as a standalone entry.\n\n• ATR: average range. Use it to place stops directly — for example 1.5 × ATR beyond the level. This is arguably the single best use of any indicator.\n\n• Volume: the confirmer. A breakout on high volume is credible; on low volume it is usually a trap.\n\nDo not run more than three or four indicators. Ten indicators all saying the same thing creates false confidence, not more information."
+    },
+    {
+      "key": "confluence",
+      "level": "advanced",
+      "title": "10. Multi-timeframe confluence",
+      "body": "A symbol can be bullish on the 5-minute, bearish on the 4-hour and flat on the daily. All three are true. The question is which game you are playing.\n\nA three-layer method:\n\n1) Higher timeframe (daily or 4h): decides which direction is allowed. If the daily trend is up, today you only look for longs.\n\n2) Middle timeframe (1h): finds the entry zone — where price returns to valid support.\n\n3) Lower timeframe (15m): only for precise timing and a tighter stop.\n\nConfluence means several independent reasons pointing at the same spot: daily support + the 200 MA + RSI divergence + high volume. Four aligned reasons beat one reason repeated across four similar indicators.\n\nThis app's signal engine does exactly that: it weights each timeframe's vote, and when the weights disagree the output is WAIT."
+    },
+    {
+      "key": "plan",
+      "level": "advanced",
+      "title": "11. Trading plan and journal",
+      "body": "Without a written plan, every trade is an improvised emotional decision.\n\nBefore you open the platform, your plan should already state:\n• which symbols you trade\n• during which hours\n• the exact entry conditions\n• where the stop goes and on what basis\n• where the targets are and how you exit\n• maximum risk per trade and daily loss limit\n• the conditions under which you do not trade at all\n\nA journal is equally mandatory. Log every trade: date, symbol, direction, reason for entry, entry, stop, exit, result — and above all, did you follow the plan?\n\nThat last column decides everything. A profitable trade taken against the plan is a bad trade that got lucky, and the habit will cost you later.\n\nThis app's Trades page keeps that journal for you."
+    },
+    {
+      "key": "psychology",
+      "level": "advanced",
+      "title": "12. Trading psychology",
+      "body": "Analysis is 20% of the job. The other 80% is executing that analysis without emotion.\n\nCommon traps:\n\n• FOMO: jumping into a move whose main leg is already over. If your only reason is \"it's going up\", stay out.\n\n• Revenge trading: a bigger trade immediately after a loss to win it back. The surest way to turn a small loss into a disaster.\n\n• Moving the stop: price approaches your stop and you push it further \"to give it room\". A stop that moves is not a stop.\n\n• Cutting winners early and holding losers: precisely backwards. The root cause is wanting to be right rather than wanting to profit.\n\n• Overtrading: manufacturing setups when none exist. Patience is itself a position.\n\nThe fixes are simple but not easy: write the rules in advance, keep size small enough that no single trade can ruin your evening, take a break after consecutive losses, and judge performance monthly rather than daily."
+    },
+    {
+      "key": "using_app",
+      "level": "basic",
+      "title": "13. Using this app in practice",
+      "body": "A suggested workflow:\n\n1) Check the day's active symbols on the Markets page.\n\n2) On the Signals page press bulk scan. The maths engine works through every symbol one by one and ranks results by confidence. This step consumes no AI tokens.\n\n3) Click any symbol in the results table to open that signal's full detail: direction, entry, stop, targets, risk level and the reasoning.\n\n4) If you want, send that one signal to the AI from the same window for a deeper read.\n\n5) Before acting, look at the chart yourself on the Analysis page. A signal is a second opinion, not an instruction.\n\n6) If you decide to enter, record it as a paper trade and follow it on the Trades page.\n\nTwo important notes:\n\nConfidence measures how well the analytical factors agree — not the probability of profit. Confidence 80 means the indicators concur; it does not oblige the market to comply.\n\nA WAIT result is a complete, valuable outcome, not a failed analysis. Most of the time the best trade is no trade."
+    },
+    {
+      "key": "mistakes",
+      "level": "basic",
+      "title": "14. Ten mistakes beginners keep repeating",
+      "body": "1) Trading without a stop loss.\n\n2) High leverage to \"get there faster\". You get finished faster instead.\n\n3) Starting with real money before three months of paper practice.\n\n4) Trading with money you need. Financial pressure ruins decisions.\n\n5) Averaging into a losing position without a pre-written plan.\n\n6) Following Telegram signals without understanding their logic.\n\n7) Trading ten symbols at once. Focus beats variety.\n\n8) Changing strategy after every loss. No strategy can be judged on a sample of ten.\n\n9) Ignoring fees and funding. For frequent traders these decide profit or loss.\n\n10) Believing a better tool replaces discipline. It does not — not this app, not any other."
+    },
+    {
+      "key": "glossary",
+      "level": "basic",
+      "title": "15. Quick glossary",
+      "body": "Long: a position betting on a price rise\nShort: a position betting on a price fall\nLeverage: the multiplier between capital and position size\nMargin: collateral locked to keep a position open\nLiquidation: forced closure when margin runs out\nStop loss: automatic exit at a defined loss\nTake profit: automatic exit at a defined profit\nR/R: target reward divided by accepted risk\nFunding rate: periodic payment between longs and shorts on perpetuals\nSlippage: the gap between expected and actual fill price\nLiquidity: how easily you can trade without moving the price\nRange: a market with no clear trend, oscillating between levels\nDivergence: price and indicator pointing different ways\nATR: average true range, a measure of volatility\nSpread: the gap between best bid and best ask\nMarket depth: resting order volume at each price\nPaper trade: a simulated trade with no real money"
+    },
+    {
+      "key": "performance",
+      "level": "intermediate",
+      "title": "16. Reading your performance stats",
+      "body": "The performance tab under Reports shows what actually happened to the signals this app produced. It is the only honest measure of engine quality: a confidence score is just a claim until it is checked against outcomes.\n\nWin rate: the share of closed signals that reached their target. Open signals are excluded because they have no result yet. Always read the count underneath: a 100% win rate from three trades means nothing. Below roughly twenty closed trades, treat the number as noise.\n\nTotal R: profit and loss expressed as multiples of the initial risk. Raw percentages are not comparable across symbols — two percent on Bitcoin is not two percent on a volatile altcoin. R is the common unit. Hitting a stop-loss is by definition minus one R.\n\nProfit factor: gross gains divided by gross losses. Above one means net profitable. A value of 1.5 means you earned one and a half units of profit for every unit lost.\n\nThe most important section is the breakdown by confidence band. The expectation is simple: as confidence rises, win rate should rise too. If it does not — if the 70 to 79 band is no better than the 50 to 59 band — then the engine's confidence score is meaningless on your data and you should not rely on it.\n\nThe symbol and timeframe breakdowns show where the system performs well. If four-hour signals clearly beat fifteen-minute ones, shifting your focus is the rational response.\n\nTwo calculation rules worth knowing. First, if a price window touches both the target and the stop-loss, the app records a loss, because it cannot tell which came first and an optimistic assumption would inflate your statistics. Second, leverage is excluded from the percentages; they are raw price moves. At five times leverage your actual account result is five times these numbers."
+    },
+    {
+      "key": "watchlists",
+      "level": "basic",
+      "title": "17. Organising your watchlists",
+      "body": "A watchlist is the handful of symbols you actually follow. The market has well over a thousand pairs; watching all of them is neither possible nor useful. A trader who focuses on ten symbols learns how they behave, while one who looks at a new list every day knows none of them.\n\nTo add a symbol, click the star beside any row in Markets, All markets. To organise your lists, open the Watchlists tab.\n\nWhy several lists? Because you are not following those symbols for the same reason. One list for long-term positions you hold for months, another for volatile altcoins that are only relevant for a few days, perhaps one for symbols where you are waiting on a specific event. Throwing everything into one bag means re-sorting it in your head every time you look. A symbol can sit in several lists at once.\n\nManual ordering is deliberate, not a missing feature. Sorting by percentage change reshuffles the list every time a price ticks, so your eye never has a fixed place to land. When you arrange it yourself, you know the top row is what matters most. Use the Up and Down buttons; the order is saved.\n\nTake the notes seriously. Next to each symbol, write down why you added it: \"waiting for a break above 70k\" or \"strong support at 3200, abandon if it breaks\". Two weeks later you will come back to a bare symbol with no memory of the reason, and a trader who has forgotten the reason usually invents a new one from the current price, which is the definition of an emotional decision.\n\nThe Default list can be emptied but never deleted, because the star column on the Markets page always points at it."
+    }
+  ]
+}

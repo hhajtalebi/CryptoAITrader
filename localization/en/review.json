@@ -1,0 +1,25 @@
+{
+  "auto_enabled": "Automatically review closed signals",
+  "auto_hint": "When a signal closes, the AI reviews it in the background and records the lesson.",
+  "body": "Post-trade analysis",
+  "column": "Lesson",
+  "generate": "Review with AI",
+  "generating": "Reviewing with AI…",
+  "only_closed": "Only closed signals can be reviewed.",
+  "pending": "Not reviewed yet",
+  "regenerate": "Review again",
+  "reviewed_count": "{reviewed} of {closed} closed signals reviewed",
+  "stats_title": "Lessons learned",
+  "title": "AI review",
+  "unavailable": "Review unavailable: {error}",
+  "verdict": "Verdict",
+  "lesson": {
+    "BAD_TIMING": "Bad timing",
+    "GOOD_SETUP": "The decision was sound",
+    "LATE_ENTRY": "Late entry",
+    "NOISE": "No real edge",
+    "STOP_TOO_TIGHT": "Stop was too tight",
+    "TARGET_TOO_FAR": "Target was too far",
+    "WEAK_STRUCTURE": "Weak market structure"
+  }
+}

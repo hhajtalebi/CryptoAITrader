@@ -1,0 +1,30 @@
+{
+  "description": "To send password-recovery codes, the app uses your own e-mail account. This app has no server, so nothing is sent to a third-party service.",
+  "error": {
+    "auth": "The mail server rejected your username or password. Gmail requires an App Password, not your main password.",
+    "connection": "Could not reach the mail server; check the host, port and your internet connection",
+    "invalid_recipient": "The recipient address is not valid",
+    "not_configured": "E-mail settings are incomplete"
+  },
+  "gmail_hint": "Gmail needs an App Password, not your normal password: turn on 2-step verification in your Google security settings, then create a 16-character password under App Passwords.",
+  "not_configured_hint": "Until this section is filled in, recovery codes are shown inside the app instead of being e-mailed.",
+  "preset": "E-mail service",
+  "presets": {
+    "chmail": "Chmail (chmail.ir)",
+    "custom": "Manual",
+    "gmail": "Gmail",
+    "outlook": "Outlook",
+    "yahoo": "Yahoo",
+    "yandex": "Yandex"
+  },
+  "sender": "Sender address",
+  "sender_name": "Sender name",
+  "smtp_host": "SMTP server",
+  "smtp_password": "App password",
+  "smtp_port": "Port",
+  "smtp_tls": "TLS encryption",
+  "smtp_username": "Username (your e-mail)",
+  "test": "Test connection",
+  "test_ok": "Connected to the mail server successfully",
+  "title": "E-mail"
+}

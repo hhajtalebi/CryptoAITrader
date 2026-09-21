@@ -1,0 +1,22 @@
+{
+  "about_body": "Crypto AI Trader is a desktop tool for cryptocurrency market analysis and futures signal generation. It fetches real market data, computes technical indicators, and produces structured trading signals. It is an analysis tool, not a trading bot.",
+  "about_title": "About Crypto AI Trader",
+  "ai_body": "You can use a local model through Ollama with no API key and no cost, or any OpenAI-compatible service. Providers are tried in priority order, so if one fails the next is used automatically. The AI can only read data supplied by the application's tools — it can never invent prices.",
+  "ai_title": "AI providers",
+  "chat_body": "The AI Chat page lets you talk directly to the assistant. It has live access to your exchange data: prices, indicators, candles, order book depth and key levels. Every number it quotes was actually fetched from the market, and the tools it used are listed under each answer.\n\nThe assistant can propose an action (for example generating a signal). A button then appears below the conversation. Nothing runs automatically — until you click, nothing happens.\n\nPick a symbol and timeframe at the top so that when you say \"analyse it\", the assistant knows what you mean.",
+  "chat_title": "AI Chat",
+  "confidence_body": "Confidence expresses how strongly the analytical factors agree with each other. It is NOT a probability of profit and it is NOT a success rate. A confidence of 80 means the indicators point in the same direction — it does not mean the trade will win. Markets can invalidate any analysis.",
+  "confidence_title": "What confidence really means",
+  "disclaimer_body": "This application performs technical analysis and does NOT execute real trades. Nothing it produces is financial advice. Cryptocurrency futures trading carries a high risk of losing your capital. You alone are responsible for any decision you make.",
+  "disclaimer_title": "Important disclaimer",
+  "free_models_body": "You do not need to pay to use the AI. There are three free routes:\n\n1) Ollama on your own machine: completely free, no key, no data leaves your computer. Install it from ollama.com and pull a model (e.g. ollama pull qwen2.5).\n\n2) Providers with a real free tier such as Groq and Google Gemini.\n\n3) OpenRouter: any model whose name ends in :free costs nothing.\n\nIn Settings → AI, the \"Free models only\" option is on by default so you never pay by accident. See docs/AI_SETUP_FA.md for the full guide.",
+  "free_models_title": "Free models",
+  "risk_body": "Stop losses are placed beyond real structural levels or at a multiple of ATR, never at arbitrary round numbers. The risk engine rejects setups whose risk/reward is too low, whose stop is tighter than one ATR, or whose stop distance exceeds your limit. A rejected setup becomes WAIT.",
+  "risk_title": "Risk management",
+  "security_body": "API keys are stored in the Windows Credential Manager through the keyring library, never in the database, never in the source code, and never in log files. Log output is filtered to mask anything that looks like a credential.",
+  "security_title": "Security of your keys",
+  "signals_body": "Signals come from a rule-based engine that combines indicators, market structure and support/resistance across several timeframes. Independent strategies vote, the votes are weighted, and a risk engine reviews the result. AI is only an optional explanation layer — it never changes the direction, entry, stop loss or targets.",
+  "signals_title": "How signals are produced",
+  "subtitle": "How this application works",
+  "tab_guide": "App guide"
+}

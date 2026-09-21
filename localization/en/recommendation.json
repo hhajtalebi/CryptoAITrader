@@ -1,0 +1,11 @@
+{
+  "title": "AI recommendation",
+  "action_buy": "Buy",
+  "action_sell": "Sell",
+  "action_wait": "Wait for now",
+  "confidence": "{percent}% confidence",
+  "column": "Recommendation",
+  "none": "The model gave no explicit recommendation",
+  "hint": "This recommendation reflects the analysis at this moment and does not replace your own decision.",
+  "superseded": "No longer valid"
+}

@@ -1,0 +1,17 @@
+{
+  "title": "Scorecard",
+  "intro": "Every signal publishes a price band with 80% confidence. This table shows how often the real price actually landed inside that band — the only honest test of whether the confidence numbers mean anything.",
+  "refresh": "Recalculate",
+  "no_data": "No matured forecasts to score yet.",
+  "col_horizon": "Horizon",
+  "col_checked": "Checked",
+  "col_hits": "Inside band",
+  "col_rate": "Hit rate",
+  "col_miss": "Average miss",
+  "verdict_calibrated": "Bands are well calibrated: {rate}% hit rate against a {target}% target (over {checked} forecasts).",
+  "verdict_too_narrow": "Bands are too narrow: {rate}% hit rate is below the {target}% target (over {checked} forecasts). The system is more confident than it should be.",
+  "verdict_too_wide": "Bands are too wide: {rate}% hit rate exceeds the {target}% target (over {checked} forecasts). Correct, but too vague to trade.",
+  "verdict_insufficient_data": "Not enough samples ({checked} forecasts). At least 20 are needed for a statistical verdict.",
+  "pending_note": "{pending} horizons have not matured yet and were not counted.",
+  "checking": "Calculating the scorecard…"
+}

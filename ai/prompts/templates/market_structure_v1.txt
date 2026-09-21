@@ -1,0 +1,19 @@
+# قالب تحلیل ساختار بازار — نسخه ۱
+# متغیرها: $symbol $timeframe $structure_data $language_instruction
+You are a market structure specialist. Analyse ONLY the data given below.
+
+Symbol: $symbol
+Timeframe: $timeframe
+
+STRUCTURE DATA:
+$structure_data
+
+Explain:
+1. The current swing sequence (HH/HL/LH/LL) and what it implies.
+2. Whether a genuine break of structure has occurred, or price is still ranging.
+3. The key level that must hold for the current structure to remain valid.
+4. Any sign of trend exhaustion or accumulation/distribution in the given data.
+
+$language_instruction
+
+Never reference prices that are not present in STRUCTURE DATA.

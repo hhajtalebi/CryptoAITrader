@@ -1,0 +1,11 @@
+{
+  "error": {
+    "account_not_found": "Exchange account not found.",
+    "no_credentials": "No API credentials are stored for this account.",
+    "credentials_required": "An API key and secret are required.",
+    "verified": "Credentials verified successfully.",
+    "connection_failed": "Could not connect ({reason}). Check your internet connection and the exchange status.",
+    "toobit_rejected": "Toobit rejected the credentials. Check the API key and secret, and make sure the key has read permission and its IP restriction allows this computer.",
+    "bitpin_rejected": "Bitpin rejected the credentials. Check the key and secret, and make sure this computer's IP address is in the key's allow-list in your Bitpin panel."
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "ai_provider": "ارائه‌دهنده هوش مصنوعی",
+  "block_overview": "وضعیت و خلاصهٔ بازار",
+  "block_signals": "آخرین سیگنال‌ها",
+  "block_stats": "کارت‌های آمار",
+  "block_ticker": "نوار قیمت زنده",
+  "connection": "اتصال",
+  "exchange": "صرافی",
+  "last_update": "آخرین به‌روزرسانی",
+  "market_overview": "نمای کلی بازار",
+  "no_watchlist": "فهرست پیگیری شما خالی است. از صفحه بازارها نماد اضافه کنید.",
+  "open_detail": "نمایش جزئیات",
+  "recent_signals": "آخرین سیگنال‌ها",
+  "stats": {
+    "market_cap": "ارزهای صعودی",
+    "volume": "حجم ۲۴ ساعته",
+    "signals_today": "سیگنال‌های امروز",
+    "win_rate": "نرخ برد",
+    "gainers_caption": "از کل بازارهای زیر نظر"
+  },
+  "subtitle": "نمای کلی بازار و آخرین تحلیل‌ها",
+  "system_status": "وضعیت سامانه",
+  "watchlist": "فهرست پیگیری"
+}

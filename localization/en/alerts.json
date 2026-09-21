@@ -1,0 +1,19 @@
+{
+  "title": "Alerts",
+  "fired": "Alert: {detail}",
+  "enabled": "Enable alerts",
+  "add": "Add alert",
+  "remove": "Remove",
+  "rearm": "Re-arm",
+  "kind_price": "Price alert",
+  "kind_signal": "Signal alert",
+  "above": "Above",
+  "below": "Below",
+  "value": "Price",
+  "min_confidence": "Minimum confidence",
+  "state_armed": "Armed",
+  "state_fired": "Fired",
+  "empty": "No alerts defined yet.",
+  "invalid": "Alert not created: {reason}",
+  "added": "Alert added."
+}

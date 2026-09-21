@@ -1,0 +1,19 @@
+{
+  "title": "Chart",
+  "no_data": "No data to display — pick a symbol and timeframe, then run the analysis",
+  "loading": "Loading candles…",
+  "price": "Price",
+  "volume": "Volume",
+  "candles": "Candles",
+  "overlays": "Overlays",
+  "levels": "Key levels",
+  "show_volume": "Show volume",
+  "show_levels": "Show levels",
+  "reset_zoom": "Reset zoom",
+  "candle_count": "{count} candles",
+  "type_candles": "Candles",
+  "type_line": "Line",
+  "type_area": "Area",
+  "fit": "Fit screen",
+  "live_price": "Live price"
+}

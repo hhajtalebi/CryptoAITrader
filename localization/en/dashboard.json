@@ -1,0 +1,24 @@
+{
+  "ai_provider": "AI provider",
+  "block_overview": "Status and market overview",
+  "block_signals": "Recent signals",
+  "block_stats": "Stat cards",
+  "block_ticker": "Live ticker",
+  "connection": "Connection",
+  "exchange": "Exchange",
+  "last_update": "Last update",
+  "market_overview": "Market overview",
+  "no_watchlist": "Your watchlist is empty. Add symbols from the Markets page.",
+  "open_detail": "Show detail",
+  "recent_signals": "Recent signals",
+  "stats": {
+    "market_cap": "Gainers",
+    "volume": "24h Volume",
+    "signals_today": "Signals Today",
+    "win_rate": "Win Rate",
+    "gainers_caption": "of watched markets"
+  },
+  "subtitle": "Market overview and latest analysis",
+  "system_status": "System status",
+  "watchlist": "Watchlist"
+}
