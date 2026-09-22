@@ -1,0 +1,91 @@
+{
+  "subtitle": "The 13-horizon ladder from 1 minute to 7 days — a probability distribution, never a single number",
+  "refresh": "Compute report",
+  "computing": "Computing…",
+  "no_symbol": "No symbol selected",
+  "empty": "No report yet. Pick a symbol on the Analysis page and press “Compute report”. Every number comes from quantitative models on real data; nothing is invented.",
+  "no_data": "Not enough data.",
+  "horizons_title": "Horizon ladder",
+  "horizons_hint": "Each horizon: direction, probability (%), P10–P90 range and method. Horizons without enough history are reported as disabled.",
+  "direction": {
+    "bullish": "Bullish",
+    "bearish": "Bearish",
+    "neutral": "Neutral",
+    "uncertain": "Uncertain"
+  },
+  "range_value": "10–90% range: {low} to {high}",
+  "confidence_short": "Conf",
+  "samples": "Samples",
+  "agreement": "Model agreement",
+  "conflict": "Model conflict",
+  "volatility_short": "Vol",
+  "method": {
+    "empirical": "Empirical",
+    "analytic": "Analytic",
+    "blended": "Blended"
+  },
+  "disabled_row": "{horizon}: disabled — {reason}",
+  "market_title": "Market state",
+  "stage_row": "Market stage: {stage} ({confidence}%)",
+  "regime_row": "{tf}: {regime} (dir {dir})",
+  "alignment_row": "Timeframe alignment: {value}",
+  "alignment": {
+    "aligned": "Aligned",
+    "mixed": "Mixed",
+    "conflicted": "Conflicted"
+  },
+  "data_quality": "Data quality: {value}%",
+  "last_price": "Last price: {price}",
+  "stage": {
+    "ACCUMULATION": "Accumulation",
+    "MARKUP": "Markup",
+    "DISTRIBUTION": "Distribution",
+    "MARKDOWN": "Markdown",
+    "RANGE": "Range",
+    "UNKNOWN": "Unknown"
+  },
+  "regime": {
+    "strong_trend_up": "Strong uptrend",
+    "weak_trend": "Weak trend",
+    "range": "Range",
+    "breakdown": "Breakdown",
+    "trend_reversal": "Trend reversal",
+    "distribution": "Distribution",
+    "strong_trend_down": "Strong downtrend"
+  },
+  "scenarios_title": "Primary-horizon scenarios",
+  "primary_horizon": "Primary horizon: {horizon}",
+  "scenario_row": "{name}: {probability}% — {low} to {high}",
+  "scenario": {
+    "bull": "Bull",
+    "base": "Base",
+    "bear": "Bear"
+  },
+  "event_pressure": "Event pressure: {value}",
+  "warnings_title": "Warnings & anomalies",
+  "no_warnings": "No active warnings.",
+  "breakout_state": "Breakout: {state}",
+  "false_breakout": "False-breakout risk: {risk}",
+  "changed_title": "What changed?",
+  "no_change_data": "Two reports are needed for a comparison.",
+  "probability_delta": "Probability change: {value}",
+  "direction_changed": "The predicted direction flipped.",
+  "factor_row": "{name}: {before} → {after} ({direction})",
+  "factor_dir": {
+    "up": "up",
+    "down": "down"
+  },
+  "accuracy_title": "Recorded accuracy",
+  "no_resolved": "No resolved predictions yet; predictions are scored against real prices after their horizon elapses.",
+  "accuracy_row": "Resolved: {count} — direction {dir}% — range {rng}% — Brier {brier}",
+  "health_row": "{model}: {acc}% ({status})",
+  "health": {
+    "good": "Healthy",
+    "watch": "Watch",
+    "retraining_suggested": "Retraining suggested",
+    "insufficient_data": "Insufficient data"
+  },
+  "timeline_title": "Prediction timeline",
+  "no_timeline": "No timeline recorded yet.",
+  "timeline_row": "{when} — {direction} at {probability}%"
+}

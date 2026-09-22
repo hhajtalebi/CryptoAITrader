@@ -113,11 +113,14 @@ class MarketToolset:
         risk_parameters: RiskParameters | None = None,
         default_candle_limit: int = 200,
         signal_engine: Any = None,
+        prediction_engine: Any = None,
     ) -> None:
         self._market = market_engine
         self._indicators = indicator_engine
         self._risk = risk_parameters or RiskParameters()
         self._default_limit = default_candle_limit
+        # موتور هوش پیش‌بینی — اختیاری تا بدون آن هم ابزارها کار کنند
+        self._prediction_engine = prediction_engine
         # موتور سیگنال به‌عنوان یک ابزار در اختیار مدل.
         #
         # پیش‌تر مدل فقط دادهٔ خام داشت و باید کل تحلیل را خودش
@@ -140,6 +143,8 @@ class MarketToolset:
             "calculate_risk": self.calculate_risk,
             "get_engine_signal": self.get_engine_signal,
             "forecast_next_timeframe": self.forecast_next_timeframe,
+            "get_prediction_report": self.get_prediction_report,
+            "get_prediction_accuracy": self.get_prediction_accuracy,
         }
 
     async def get_engine_signal(
@@ -190,6 +195,48 @@ class MarketToolset:
             symbol=symbol, timeframe=timeframe, candles=candles
         )
         return result.as_dict()
+
+    async def get_prediction_report(self, symbol: str) -> dict[str, Any]:
+        """
+        گزارش کامل موتور هوش پیش‌بینی برای یک نماد.
+
+        همه‌چیز از داده و مدل می‌آید: رژیم هر تایم‌فریم، توزیع چندکِ
+        افق‌ها (۱ دقیقه تا ۷ روز)، سناریوها، هشدارها، توافق مدل‌ها و
+        «چه عوض شد». LLM این داده را توضیح می‌دهد — عدد از اینجا می‌آید.
+        افق‌های بدون داده با دلیل «disabled» برمی‌گردند.
+        """
+        if self._prediction_engine is None:
+            raise RuntimeError("The predictive engine is not available to the toolset")
+        report = await self._prediction_engine.assess(symbol.upper().strip())
+        if report is None:
+            return {
+                "symbol": symbol,
+                "available": False,
+                "reason": "insufficient_market_data",
+            }
+        payload = report.to_dict()
+        payload["available"] = True
+        payload["note"] = (
+            "All numbers come from quant models on real data; explain, do not invent. "
+            "Disabled horizons lack sufficient history and must be reported as such."
+        )
+        return payload
+
+    async def get_prediction_accuracy(self, symbol: str) -> dict[str, Any]:
+        """
+        عملکرد ثبت‌شدهٔ موتور پیش‌بینی: دقت افق‌ها و سلامت مدل‌ها.
+
+        آمار فقط از پیش‌بینی‌های «حل‌شده با قیمت واقعی» می‌آید؛ پیش‌بینی
+        باز شمرده نمی‌شود.
+        """
+        if self._prediction_engine is None:
+            raise RuntimeError("The predictive engine is not available to the toolset")
+        payload = await self._prediction_engine.accuracy_snapshot(symbol.upper().strip())
+        payload["note"] = (
+            "Accuracy comes from resolved predictions compared with real prices, "
+            "never from open (unresolved) ones."
+        )
+        return payload
 
     def set_risk_parameters(self, parameters: RiskParameters) -> None:
         """به‌روزرسانی پارامترهای ریسک از تنظیمات کاربر."""
@@ -534,6 +581,22 @@ class MarketToolset:
                 "(e.g. from 15m data: the next 15m, 1h and 4h). Returns lower/upper "
                 "bounds derived from measured volatility, never a single price.",
                 {"symbol": symbol_param, "timeframe": timeframe_param},
+            ),
+            ToolDefinition(
+                "get_prediction_report",
+                "Full predictive intelligence report for a symbol: multi-timeframe "
+                "regimes, quantile distributions (P10..P90) per horizon from 1 minute "
+                "to 7 days, scenarios, early warnings, model agreement, what-changed "
+                "and recorded accuracy. Horizons without enough data come back "
+                "explicitly disabled with the reason.",
+                {"symbol": symbol_param},
+            ),
+            ToolDefinition(
+                "get_prediction_accuracy",
+                "Recorded prediction accuracy and model health for a symbol, computed "
+                "only from predictions already resolved against real prices "
+                "(direction accuracy, range accuracy, Brier score, per-model health).",
+                {"symbol": symbol_param},
             ),
             ToolDefinition(
                 "calculate_indicator",

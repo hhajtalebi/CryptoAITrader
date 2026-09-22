@@ -47,6 +47,8 @@
     "forecast_next_timeframe": "Next-timeframe forecast",
     "get_current_price": "Live price",
     "get_engine_signal": "Signal engine opinion",
+    "get_prediction_report": "Prediction intelligence report",
+    "get_prediction_accuracy": "Recorded prediction accuracy",
     "get_multi_timeframe_data": "Multi-timeframe data",
     "get_ohlcv": "Price candles",
     "get_orderbook": "Order book depth",

@@ -58,14 +58,15 @@ def window(qt_app: QApplication, translator: Translator) -> MainWindow:
 # ---------------------------------------------------------------------------
 # پنجرهٔ اصلی
 # ---------------------------------------------------------------------------
-def test_window_exposes_ten_pages(window: MainWindow) -> None:
-    """ده صفحهٔ استخراج‌شده از طرح‌ها باید موجود باشند."""
+def test_window_exposes_core_pages(window: MainWindow) -> None:
+    """یازده صفحهٔ برنامه باید موجود باشند (پیش‌بینی از v1.11.0)."""
     keys = [key for key, _ in window.PAGES]
     assert keys == [
         "nav.dashboard",
         "nav.markets",
         "nav.analysis",
         "nav.signals",
+        "nav.prediction",
         "nav.chat",
         "nav.trades",
         "nav.wallet",
@@ -73,7 +74,7 @@ def test_window_exposes_ten_pages(window: MainWindow) -> None:
         "nav.settings",
         "nav.help",
     ]
-    assert window.stack.count() == 10
+    assert window.stack.count() == 11
 
 
 def test_every_page_is_reachable(window: MainWindow) -> None:
@@ -85,8 +86,9 @@ def test_every_page_is_reachable(window: MainWindow) -> None:
 
 def test_page_index_lookup(window: MainWindow) -> None:
     """جستجوی نمایهٔ صفحه بر پایهٔ کلید."""
-    assert window.page_index("nav.wallet") == 6
-    assert window.page_index("nav.trades") == 5
+    assert window.page_index("nav.wallet") == 7
+    assert window.page_index("nav.trades") == 6
+    assert window.page_index("nav.prediction") == 4
     # کلید ناشناس نباید خطا بدهد
     assert window.page_index("nav.nonexistent") == 0
 
@@ -109,7 +111,7 @@ def test_focus_mode_hides_chrome_but_keeps_pages(window: MainWindow) -> None:
     """
     window.set_focus_mode(True)
     assert window.sidebar.width() < 100
-    assert window.stack.count() == 10
+    assert window.stack.count() == 11
 
     window.set_focus_mode(False)
     assert window.sidebar.width() > 200
@@ -173,12 +175,14 @@ def test_language_switch_updates_navigation(window: MainWindow) -> None:
     window.tr_.set_language("en")
     window.retranslate()
     assert window.sidebar._labels[0] == "Dashboard"
-    assert window.sidebar._labels[6] == "Wallet"
+    assert window.sidebar._labels[4] == "Predictions"
+    assert window.sidebar._labels[7] == "Wallet"
 
     window.tr_.set_language("fa")
     window.retranslate()
     assert window.sidebar._labels[0] == "داشبورد"
-    assert window.sidebar._labels[5] == "تاریخچه معاملات"
+    assert window.sidebar._labels[4] == "پیش‌بینی"
+    assert window.sidebar._labels[6] == "تاریخچه معاملات"
 
 
 # ---------------------------------------------------------------------------

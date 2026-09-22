@@ -139,10 +139,15 @@ def signals_page(qt_application: Any) -> Any:
     from localization.translator import Translator
     from ui.pages.signals_page import SignalsPage
     from ui.themes.catalog import THEME_CATALOG
-    from ui.themes.stylesheet import build_stylesheet
+    from ui.themes import ThemeManager
 
-    previous = qt_application.styleSheet()
-    qt_application.setStyleSheet(build_stylesheet(THEME_CATALOG["glass_dark"]))
+    # مسیر واقعی برنامه: ThemeManager هم قلم و هم شیوه‌نامه را با هم
+    # می‌گذارد. فقط شیوه‌نامه گذاشتن ناسازگار است — قلم وزیرمتن که یک
+    # بار در QFontDatabase بار شود متریکِ «font-family» شیوه‌نامه عوض
+    # می‌شود و ارتفاع دکمه با ارتفاع ردیف جدول نمی‌خواند.
+    previous_font = qt_application.font()
+    previous_sheet = qt_application.styleSheet()
+    ThemeManager().apply(qt_application, "glass_dark")
     page = SignalsPage(Translator("fa"))
     page.apply_theme(THEME_CATALOG["glass_dark"])
     page.resize(1250, 900)
@@ -152,7 +157,8 @@ def signals_page(qt_application: Any) -> Any:
         yield page
     finally:
         page.close()
-        qt_application.setStyleSheet(previous)
+        qt_application.setFont(previous_font)
+        qt_application.setStyleSheet(previous_sheet)
 
 
 SCAN_ROWS = [

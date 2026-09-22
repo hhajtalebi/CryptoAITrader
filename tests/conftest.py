@@ -137,6 +137,39 @@ class FakeMarketEngine:
         return self._data[timeframe][-limit:]
 
 
+@pytest.fixture(autouse=True)
+def _isolate_qt_app_look():
+    """
+    بازگرداندن فونت و شیوه‌نامهٔ سطح برنامه پس از هر آزمون.
+
+    چرا: `apply_default_font` فونت QApplication را با قلم جاسازی‌شدهٔ
+    برنامه (وزیرمتن) عوض می‌کند و هیچ آزمونی آن را برنمی‌گرداند. با
+    متریک قلمِ بزرگ‌تر، آزمون‌های بعدی که اندازهٔ ویجت می‌سنجند
+    (`test_v193_page_scrolling`، دکمهٔ تحلیل در `test_v172`) به‌درستی
+    شکست می‌خوردند — فقط وقتی آزمونِ تم‌محور پیش از آن‌ها اجرا شده
+    باشد. این جداسازی همان نقش پاک‌سازیِ `destroy_window` را برای
+    وضعیتِ سراسریِ «ظاهر» بازی می‌کند.
+
+    اگر QApplication ساخته نشده باشد (آزمون‌های بدون UI) هیچ کاری
+    نمی‌کند؛ فقط `instance()` می‌پرسد و چیزی نمی‌سازد.
+    """
+    try:
+        from PySide6.QtWidgets import QApplication
+    except ImportError:  # pragma: no cover - محیط بدون Qt
+        yield
+        return
+
+    app = QApplication.instance()
+    if app is None:
+        yield
+        return
+    font = app.font()
+    stylesheet = app.styleSheet()
+    yield
+    app.setFont(font)
+    app.setStyleSheet(stylesheet)
+
+
 @pytest.fixture(scope="session")
 def qt_application():
     """
