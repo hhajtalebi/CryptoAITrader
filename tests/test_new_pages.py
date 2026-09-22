@@ -12,6 +12,7 @@ import pytest
 from PySide6.QtWidgets import QApplication
 
 from localization import Translator
+from tests.conftest import destroy_window
 from ui.pages import TradesPage, WalletPage
 from ui.themes import THEME_CATALOG, ThemeManager, get_theme
 from ui.windows import MainWindow
@@ -37,10 +38,21 @@ def translator() -> Translator:
 
 @pytest.fixture()
 def window(qt_app: QApplication, translator: Translator) -> MainWindow:
-    """پنجرهٔ اصلی با پوستهٔ پیش‌فرض."""
+    """
+    پنجرهٔ اصلی با پوستهٔ پیش‌فرض.
+
+    پس از هر آزمون پنجره **قطعی** حذف می‌شود، نه فقط `deleteLater`.
+    دلیلش در `conftest.destroy_window` نوشته شده؛ خلاصه‌اش این است که
+    درخت ویجت نشتی‌شده باعث می‌شد `setStyleSheet` آزمون بعدی هر بار
+    کندتر شود و این فایل از سقف زمانی رد برود.
+    """
     manager = ThemeManager()
     manager.apply(qt_app, "glass_dark")
-    return MainWindow(translator, manager)
+    main_window = MainWindow(translator, manager)
+    try:
+        yield main_window
+    finally:
+        destroy_window(main_window, qt_app)
 
 
 # ---------------------------------------------------------------------------

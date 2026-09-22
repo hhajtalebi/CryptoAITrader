@@ -2,7 +2,7 @@
 
 **Professional desktop app for crypto market analysis and futures signal generation**
 
-Version 1.0.0 · Windows 10/11 · Python 3.12+ · Persian & English
+Version 1.9.23 · Windows 10/11 · Python 3.11+ (tested up to 3.13) · Persian & English
 
 [راهنمای فارسی](README.md)
 
