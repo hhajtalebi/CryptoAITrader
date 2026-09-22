@@ -81,7 +81,7 @@ MARKET_ROW_LIMIT = 300
 PRICE_HISTORY_POINTS = 24
 
 #: فاصله زمانی به‌روزرسانی قیمت‌های زنده روی صفحه (میلی‌ثانیه)
-LIVE_UI_INTERVAL = 1000
+LIVE_UI_INTERVAL = 500
 
 #: فاصله زمانی تازه‌سازی نرخ تومان (میلی‌ثانیه)
 FIAT_REFRESH_INTERVAL = 300_000
@@ -104,15 +104,20 @@ AUTO_SCAN_TICK_MS = 15_000
 #: می‌شود و هزینه‌اش ناچیز است؛ ولی فاصلهٔ واقعی را کاربر تعیین می‌کند
 #: و این تیک صرفاً موعد را می‌سنجد.
 OUTCOME_TICK_MS = 30_000
-# فاصلهٔ پایش معاملات باز. ۱۰ ثانیه تعادل میان «زنده بودن» و فشار روی
-# API صرافی است؛ معامله‌گر باید سود/زیانش را در حال تغییر ببیند.
-TRADE_MONITOR_TICK_MS = 10_000
-# تازه‌سازی نمودار تحلیل. ۱۵ ثانیه برای تایم‌فریم‌های معمول کافی است و
-# نمودار را «زنده» نشان می‌دهد بدون اینکه سهمیهٔ صرافی را بسوزاند.
-LIVE_CHART_TICK_MS = 15_000
+# فاصلهٔ پایش معاملات باز. قیمت از کش خوانده می‌شود؛ REST فقط وقتی
+# کش کهنه باشد. دو ثانیه برای بستن سریع اسکالپ کافی است.
+TRADE_MONITOR_TICK_MS = 2_000
+# تازه‌سازی کندل‌ها. قیمت لحظه‌ای جداگانه و بدون redraw کامل می‌آید.
+LIVE_CHART_TICK_MS = 8_000
 
 #: تیک قیمت زنده — سبک و پرتکرار، فقط یک عدد می‌گیرد
-LIVE_PRICE_TICK_MS = 3_000
+LIVE_PRICE_TICK_MS = 1_000
+
+#: نگه داشتن اتصال و تلاش دوبارهٔ سوکت
+KEEPALIVE_TICK_MS = 15_000
+
+#: دفترچهٔ نتیجه، فقط اگر کاربر خودش خودکار را روشن کرده باشد
+SCORECARD_TICK_MS = 3_600_000
 
 
 class MainController(QObject):
@@ -315,6 +320,8 @@ class MainController(QObject):
                 lambda _days: self._refresh_outcome_view()
             )
         self.reports.scorecard_refresh_requested.connect(self.refresh_scorecard)
+        if hasattr(self.reports, "scorecard_auto_changed"):
+            self.reports.scorecard_auto_changed.connect(self.save_scorecard_auto)
         self.settings_page.save_button.clicked.connect(self.save_settings)
         self.settings_page.backup_button.clicked.connect(self.create_backup)
         self.settings_page.restore_button.clicked.connect(self.restore_backup)
@@ -462,6 +469,12 @@ class MainController(QObject):
         self.start_outcome_tracker()
         self.start_trade_monitor()
         self.start_live_chart()
+        self.start_connection_keepalive()
+        self.start_scorecard_timer()
+        if hasattr(self.reports, "set_scorecard_auto"):
+            self.reports.set_scorecard_auto(
+                self.app.settings.get_bool("signals.scorecard_auto", False)
+            )
         self.refresh_watchlist_panel(keep_selection=False)
         self._refresh_outcome_view(quiet=True)
         self._refresh_timer.start()
@@ -503,13 +516,60 @@ class MainController(QObject):
         این متد ناهمگام است، پس باید در حلقه پس‌زمینه اجرا شود؛ صدا زدن
         مستقیم آن فقط یک coroutine بی‌استفاده می‌سازد.
         """
-        if self._live_feed is None:
+        if self._live_feed is None and self.app.market is None:
             return
+        symbols = self._stream_symbols()
+        symbol = ""
+        timeframe = ""
+        try:
+            symbol = self.analysis.symbol_combo.currentText().strip().upper()
+            timeframe = self.analysis.timeframe_combo.currentText().strip()
+        except Exception:  # noqa: BLE001 - نبود ویجت نباید جریان را بشکند
+            symbol = ""
         self.runner.submit(
             "streamed-symbols",
-            self._live_feed.set_streamed_symbols(self._watchlist_symbols()),
+            self._sync_streams(symbols, symbol, timeframe),
             on_error=lambda message, exc=None: logger.debug("Streaming update failed: %s", message),
         )
+
+    def _stream_symbols(self) -> list[str]:
+        """نماد تحلیل، فهرست پیگیری و معامله‌های باز — برای سوکت."""
+        symbols: list[str] = []
+        try:
+            current = self.analysis.symbol_combo.currentText().strip().upper()
+        except Exception:  # noqa: BLE001
+            current = ""
+        if current:
+            symbols.append(current)
+        symbols.extend(self._watchlist_symbols())
+        engine = getattr(self, "_auto_trader_engine", None)
+        if engine is not None:
+            for trade in getattr(engine, "open_trades", []) or []:
+                symbol = str(getattr(trade, "symbol", "") or "").strip().upper()
+                if symbol:
+                    symbols.append(symbol)
+        try:
+            for row in self.app.trade_repository.open_trades(self.app.auth.user_id):
+                symbol = str((row or {}).get("symbol") or "").strip().upper()
+                if symbol:
+                    symbols.append(symbol)
+        except Exception:  # noqa: BLE001
+            logger.debug("Open-trade symbols unavailable", exc_info=True)
+        return [item for item in symbols if item]
+
+    async def _sync_streams(
+        self,
+        symbols: list[str],
+        symbol: str,
+        timeframe: str,
+    ) -> None:
+        """به‌روزرسانی اشتراک سوکت. ویجت‌ها را لمس نمی‌کند."""
+        if self._live_feed is not None:
+            await self._live_feed.set_streamed_symbols(symbols)
+        market = self.app.market
+        if market is None or not symbol or not hasattr(market, "subscribe_symbol"):
+            return
+        await market.subscribe_symbol(symbol, timeframe or None)
 
     def _on_price_update(self, updates: Any) -> None:
         """
@@ -1748,15 +1808,23 @@ class MainController(QObject):
         self._price_timer.start()
 
     def _live_price_tick(self) -> None:
-        """گرفتن آخرین قیمت و نشاندن آن روی نمودار تحلیل."""
+        """گرفتن آخرین قیمت و نشاندن آن روی نمودار، بدون redraw کندل‌ها."""
         if not self.app.settings.get_bool("analysis.live_chart", True):
             return
         if not self.analysis.isVisible() or self.app.market is None:
             return
-        if not self.app.market.is_online or getattr(self, "_price_busy", False):
-            return
         symbol = self.analysis.symbol_combo.currentText().strip().upper()
         if not symbol:
+            return
+        cached = self._cached_symbol_price(symbol, max_age=30.0)
+        if cached > 0:
+            self.analysis.set_live_price(cached)
+            self._remember_price(symbol, cached)
+        if self._cached_symbol_price(symbol, max_age=1.5) > 0:
+            return
+        if not self._market_reachable() or getattr(self, "_price_busy", False):
+            if cached <= 0:
+                self._note_market_offline()
             return
         self._price_busy = True
 
@@ -1768,6 +1836,8 @@ class MainController(QObject):
             """نشاندن قیمت تازه روی برچسب و خط قیمت."""
             if price > 0:
                 self.analysis.set_live_price(price)
+                self._remember_price(symbol, float(price))
+                self._note_market_online()
 
         self.runner.submit(
             "live-price",
@@ -1787,18 +1857,25 @@ class MainController(QObject):
             return
         if getattr(self, "_chart_busy", False) or self.app.market is None:
             return
-        if not self.app.market.is_online:
-            self._note_market_offline()
-            return
         symbol = self.analysis.symbol_combo.currentText().strip().upper()
         timeframe = self.analysis.timeframe_combo.currentText()
         if not symbol:
             return
+        if not self._market_reachable():
+            peeked = self._peek_chart(symbol, timeframe)
+            if peeked:
+                self.analysis.set_chart_data(peeked, timeframe, symbol)
+                return
+            self._note_market_offline()
+            return
         self._chart_busy = True
 
         async def fetch() -> list[Any]:
-            """گرفتن تازه‌ترین کندل‌ها."""
-            return await self.app.market.get_candles(symbol, timeframe, limit=300)
+            """گرفتن تازه‌ترین کندل‌ها. اگر REST نیامد، کش کافی است."""
+            try:
+                return await self.app.market.get_candles(symbol, timeframe, limit=300)
+            except Exception:  # noqa: BLE001
+                return self._peek_chart(symbol, timeframe)
 
         def apply(candles: list[Any]) -> None:
             """کشیدن دوبارهٔ نمودار بدون دست‌زدن به جدول اندیکاتورها."""
@@ -1836,7 +1913,7 @@ class MainController(QObject):
         # بازار همیشه زنده نیست. وقتی اتصال قطع است، قیمت قدیمی را
         # به‌عنوان قیمت روز جا نمی‌زنیم و معامله را هم با آن نمی‌بندیم:
         # بستن خودکار بر پایهٔ قیمت کهنه، ضرر واقعی می‌سازد.
-        if self.app.market is None or not self.app.market.is_online:
+        if self.app.market is None or not self._market_reachable():
             self._note_market_offline()
             return
         try:
@@ -1854,14 +1931,23 @@ class MainController(QObject):
             return
         symbols = sorted({p.symbol for p in positions})
         self._trade_monitor_busy = True
+        fee_by_id = {
+            int(row.get("id") or 0): self._exit_fee(row)
+            for row in records
+            if isinstance(row, dict)
+        }
 
         async def fetch() -> dict[str, float]:
-            """گرفتن قیمت لحظه‌ای نمادهای درگیر."""
+            """اول کش تازه، و فقط اگر کهنه بود REST."""
             prices: dict[str, float] = {}
             market = self.app.market
-            if market is None:
-                return prices
             for symbol in symbols:
+                cached = self._cached_symbol_price(symbol, max_age=5.0)
+                if cached > 0:
+                    prices[symbol] = cached
+                    continue
+                if market is None:
+                    continue
                 try:
                     price = await market.get_current_price(symbol)
                 except Exception:  # noqa: BLE001 - یک نماد نباید بقیه را ببرد
@@ -1891,7 +1977,10 @@ class MainController(QObject):
             for trade_id, price, reason in closures:
                 try:
                     self.app.trade_repository.close_trade(
-                        int(trade_id), exit_price=float(price), note=reason
+                        int(trade_id),
+                        exit_price=float(price),
+                        fee=float(fee_by_id.get(int(trade_id), 0.0)),
+                        note=reason,
                     )
                     self._toast(
                         self.tr_.tr(f"trades.closed_{reason}"), level="success"
@@ -4898,10 +4987,13 @@ class MainController(QObject):
         from trading.scalp_service import ScalpService
 
         service = ScalpService(self.app)
-        config = service.build_trader_config()
+        config = self._auto_trade_config()
 
         async def price_source(symbol: str) -> float:
-            """آخرین قیمت واقعی بازار."""
+            """اول کش زنده، بعد REST."""
+            cached = self._cached_symbol_price(symbol, max_age=5.0)
+            if cached > 0:
+                return cached
             return float(await self.app.market.get_current_price(symbol))
 
         # کاربر خواست معاملهٔ خودکار روی **همهٔ ارزها** تحلیل کند و هر
@@ -4923,12 +5015,16 @@ class MainController(QObject):
             candidates = await service.scan()
             return [c for c in candidates if service.feasibility(c)[0]]
 
+        from trading.execution import build_gateway
+
+        exchange = str(self.app.settings.get("exchange.active", "lbank") or "lbank")
         engine = AutoTrader(
             config=config,
             price_source=price_source,
             repository=self.app.trade_repository,
             candidate_source=candidate_source,
-            user_id=getattr(getattr(self, "_current_user", None), "id", None),
+            gateway=build_gateway(exchange),
+            user_id=self.app.auth.user_id,
         )
         engine.add_listener(self._on_auto_trade_event)
         self._auto_trader_engine = engine
@@ -4939,15 +5035,17 @@ class MainController(QObject):
         ذخیرهٔ عددهای دستی معاملهٔ خودکار از صفحهٔ معاملات.
 
         همان کلیدهای `scalp.*` نوشته می‌شوند که صفحهٔ تنظیمات هم
-        می‌نویسد، پس دو جا از هم جدا نمی‌افتند. موتور در حال اجرا هم
-        دور بعد عددهای تازه را می‌خواند چون `build_trader_config` هر
-        بار از تنظیم‌ها خوانده می‌شود.
+        می‌نویسد. اگر موتور در حال اجرا باشد، عددهای تازه همان لحظه
+        با `apply_config` اعمال می‌شوند؛ وگرنه تا شروع بعدی بی‌اثرند.
         """
         try:
             self.app.settings.set_many(dict(values))
         except Exception as exc:  # noqa: BLE001
             self._on_error(self.tr_.tr("common.state.error"), exc)
             return
+        engine = getattr(self, "_auto_trader_engine", None)
+        if engine is not None:
+            engine.apply_config(self._auto_trade_config())
         self.refresh_auto_config()
         self._toast(self.tr_.tr("trades.auto.settings_saved"), level="success")
 
@@ -4961,6 +5059,9 @@ class MainController(QObject):
             "scalp.max_concurrent",
             "scalp.min_confidence",
             "scalp.candidate_source",
+            "scalp.mode",
+            "scalp.live_confirmation",
+            "scalp.poll_seconds",
         )
         values = {key: self.app.settings.get(key) for key in keys}
         if hasattr(self.trades, "load_auto_settings"):
@@ -5061,6 +5162,8 @@ class MainController(QObject):
             )
             detail = f"{len(engine.open_trades)} / {engine.config.max_concurrent}"
             detail = self.tr_.tr("trades.auto.running") + f" • {detail}"
+        if not detail:
+            detail = self._auto_economics_text()
         self.trades.set_auto_state(running, detail)
 
     def toggle_auto_trading(self, start: bool) -> None:
@@ -5112,7 +5215,11 @@ class MainController(QObject):
             if price <= 0:
                 self.status(self.tr_.tr("common.state.no_data"))
                 return
-            self.app.trade_repository.close_trade(int(trade_id), exit_price=price)
+            self.app.trade_repository.close_trade(
+                int(trade_id),
+                exit_price=price,
+                fee=self._exit_fee(record),
+            )
             self._toast(self.tr_.tr("trades.closed"), level="success")
             self.refresh_trades()
             self.refresh_wallet()
@@ -5585,6 +5692,157 @@ class MainController(QObject):
                 return pair_price * bridge_price
         return 0.0
 
+
+
+    def _remember_price(self, symbol: str, price: float) -> None:
+        """نگه داشتن آخرین قیمت، حتی اگر پایش معاملات هنوز شروع نشده باشد."""
+        if not hasattr(self, "_live_prices"):
+            self._live_prices = {}
+        if price > 0:
+            self._live_prices[str(symbol).upper()] = float(price)
+
+    def _auto_economics_text(self) -> str:
+        """یک خط کارمزد و هدف خالص برای برچسب وضعیت موجود."""
+        try:
+            from trading.micro_plan import plan_levels
+
+            config = self._auto_trade_config()
+            plan = plan_levels(
+                config.margin_per_trade,
+                config.leverage,
+                config.target_profit,
+                config.max_loss,
+                config.fee_rate,
+            )
+            return self.tr_.tr(
+                "trades.auto.economics",
+                notional=f"{plan.notional:.0f}",
+                fee=f"{plan.round_trip_fee:.2f}",
+                target=f"{plan.net_target:.2f}",
+                gross=f"{plan.gross_target:.2f}",
+            )
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _auto_trade_config(self) -> Any:
+        """پیکربندی موتور خودکار از تنظیم‌های ذخیره‌شده."""
+        from trading.scalp_service import ScalpService
+
+        return ScalpService(self.app).build_trader_config()
+
+    def _market_reachable(self) -> bool:
+        """آنلاین اگر REST سالم باشد یا قیمت تازه از سوکت آمده باشد."""
+        market = self.app.market
+        if market is not None and market.is_online:
+            return True
+        feed = getattr(self, "_live_feed", None)
+        if feed is not None and feed.is_fresh:
+            return True
+        if market is not None and getattr(market, "_live_tickers", None):
+            return True
+        return False
+
+    def _cached_symbol_price(self, symbol: str, max_age: float = 8.0) -> float:
+        """قیمت کش‌شده. تیکری که زمان دیده‌شدن ندارد کهنه حساب نمی‌شود."""
+        target = str(symbol or "").strip().upper()
+        if not target:
+            return 0.0
+        now = datetime.now(UTC)
+        feed = getattr(self, "_live_feed", None)
+        if feed is not None:
+            update = feed.get(target) or feed.get(symbol)
+            if update is not None:
+                price = float(getattr(update, "price", 0) or 0)
+                updated = getattr(update, "updated_at", None)
+                if price > 0:
+                    if updated is None:
+                        return price
+                    try:
+                        age = (now - updated).total_seconds()
+                    except TypeError:
+                        return price
+                    if age <= max_age:
+                        return price
+        market = self.app.market
+        live_map = getattr(market, "_live_tickers", {}) if market is not None else {}
+        live = live_map.get(target) or live_map.get(symbol)
+        if live is not None:
+            price = float(getattr(live, "last_price", 0) or 0)
+            seen = int(getattr(live, "timestamp", 0) or 0)
+            if price > 0 and seen <= 0:
+                return price
+            if price > 0 and seen > 0:
+                stamp = seen / 1000.0 if seen > 10_000_000_000 else float(seen)
+                if now.timestamp() - stamp <= max_age:
+                    return price
+        return 0.0
+
+    def _peek_chart(self, symbol: str, timeframe: str) -> list[Any]:
+        """کندل کش‌شده، بدون درخواست شبکه."""
+        market = self.app.market
+        if market is None or not hasattr(market, "peek_candles"):
+            return []
+        try:
+            return list(market.peek_candles(symbol, timeframe, 300) or [])
+        except Exception:  # noqa: BLE001
+            return []
+
+    def _exit_fee(self, record: Any) -> float:
+        """کارمزد خروج از روی ارزش موقعیت. ورود جداگانه ذخیره شده است."""
+        from trading.micro_plan import exit_fee_from_notional
+
+        def _get(name: str) -> float:
+            if record is None:
+                return 0.0
+            raw = record.get(name) if isinstance(record, dict) else getattr(record, name, 0)
+            try:
+                return float(raw or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        rate = float(self.app.settings.get("scalp.taker_fee_rate", 0.0006) or 0.0)
+        return exit_fee_from_notional(_get("quantity") * _get("entry_price"), rate)
+
+    def start_connection_keepalive(self) -> None:
+        """هر ۱۵ ثانیه پینگ و تلاش دوبارهٔ سوکت."""
+        self._keepalive_timer = QTimer(self.window)
+        self._keepalive_timer.setInterval(KEEPALIVE_TICK_MS)
+        self._keepalive_timer.timeout.connect(self._connection_keepalive)
+        self._keepalive_timer.start()
+
+    def _connection_keepalive(self) -> None:
+        """نگه داشتن اتصال روی نخ شبکه."""
+        market = self.app.market
+        if market is None or not hasattr(market, "keepalive"):
+            return
+        if "market-keepalive" in set(self.runner.active_keys()):
+            return
+        self.runner.submit(
+            "market-keepalive",
+            market.keepalive(),
+            on_success=lambda *_: self._update_streamed_symbols(),
+            on_error=lambda *_: None,
+        )
+
+    def start_scorecard_timer(self) -> None:
+        """زمان‌بند ساعتی دفترچه. تا وقتی تیک روشن نباشد هیچ درخواستی نمی‌رود."""
+        self._scorecard_timer = QTimer(self.window)
+        self._scorecard_timer.setInterval(SCORECARD_TICK_MS)
+        self._scorecard_timer.timeout.connect(self._scorecard_tick)
+        self._scorecard_timer.start()
+
+    def _scorecard_tick(self) -> None:
+        """اجرای دفترچه فقط با اجازهٔ صریح کاربر."""
+        if not self.app.settings.get_bool("signals.scorecard_auto", False):
+            return
+        if "forecast-scorecard" in set(self.runner.active_keys()):
+            return
+        self.refresh_scorecard()
+
+    def save_scorecard_auto(self, enabled: bool) -> None:
+        """ذخیرهٔ تیک به‌روزرسانی خودکار دفترچه."""
+        self.app.settings.set("signals.scorecard_auto", bool(enabled))
+
     def _last_price(self, symbol: str) -> float:
         """
         آخرین قیمت شناخته‌شدهٔ یک نماد.
@@ -5602,6 +5860,9 @@ class MainController(QObject):
         if not symbol:
             return 0.0
         target = symbol.upper()
+        cached_live = self._cached_symbol_price(target, max_age=30.0)
+        if cached_live > 0:
+            return cached_live
 
         for row in getattr(self.markets, "_all_rows", []) or []:
             if str(row.get("symbol", "")).upper() == target:

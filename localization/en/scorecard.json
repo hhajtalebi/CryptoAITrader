@@ -13,5 +13,6 @@
   "verdict_too_wide": "Bands are too wide: {rate}% hit rate exceeds the {target}% target (over {checked} forecasts). Correct, but too vague to trade.",
   "verdict_insufficient_data": "Not enough samples ({checked} forecasts). At least 20 are needed for a statistical verdict.",
   "pending_note": "{pending} horizons have not matured yet and were not counted.",
-  "checking": "Calculating the scorecard…"
+  "checking": "Calculating the scorecard…",
+  "auto": "Refresh automatically every hour"
 }

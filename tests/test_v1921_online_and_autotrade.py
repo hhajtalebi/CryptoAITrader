@@ -21,6 +21,7 @@ from trading.confidence_source import (
     ConfidenceCandidate,
     ConfidenceCandidateSource,
 )
+from trading.auto_trader import HARD_MAX_LEVERAGE
 from ui.pages.trades_page import TradesPage
 
 
@@ -394,4 +395,4 @@ class TestManualAutoTradeControls:
         """سقف اهرم همان سقف سخت موتور است."""
         page.auto_leverage_input.setValue(999)
 
-        assert page.auto_leverage_input.value() <= 25
+        assert page.auto_leverage_input.value() <= HARD_MAX_LEVERAGE

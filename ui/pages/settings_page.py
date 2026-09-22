@@ -1180,7 +1180,21 @@ class SettingsPage(BasePage):
         self._add_row(layout, "settings.markets_interval", self.markets_interval_spin)
         self._add_row(layout, "settings.http_timeout", self.http_timeout_spin)
         self._add_row(layout, "settings.max_retries", self.max_retries_spin)
-        return widget
+
+        self.speed_profile_combo = QComboBox()
+        for key in ("fast", "balanced", "deep"):
+            self.speed_profile_combo.addItem(self.tr_.tr(f"settings.speed_{key}"), key)
+        index = self.speed_profile_combo.findData("balanced")
+        if index >= 0:
+            self.speed_profile_combo.setCurrentIndex(index)
+        self._add_row(layout, "settings.speed_profile", self.speed_profile_combo)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(widget)
+        return scroll
 
     def _build_security(self) -> QWidget:
         """
@@ -1710,6 +1724,10 @@ class SettingsPage(BasePage):
             index = self.signal_mode_combo.findData(values["ai.signal_mode"])
             if index >= 0:
                 self.signal_mode_combo.setCurrentIndex(index)
+        if "ai.speed_profile" in values and hasattr(self, "speed_profile_combo"):
+            index = self.speed_profile_combo.findData(str(values["ai.speed_profile"]))
+            if index >= 0:
+                self.speed_profile_combo.setCurrentIndex(index)
 
     def collect_values(self) -> dict[str, Any]:
         """
@@ -1745,6 +1763,7 @@ class SettingsPage(BasePage):
             "ui.show_toman": self.show_toman_check.isChecked(),
             # هوش مصنوعی و سیگنال
             "ai.signal_mode": self.signal_mode_combo.currentData(),
+            "ai.speed_profile": self.speed_profile_combo.currentData(),
             "update.source": self.update_source_input.text().strip(),
             "update.auto_check": self.update_auto_check.isChecked(),
             "ai.narrative_enabled": self.narrative_check.isChecked(),

@@ -357,8 +357,8 @@ class TestHardCaps:
     """محافظ در برابر یک صفر اضافی هنگام تایپ."""
 
     def test_leverage_is_capped(self) -> None:
-        """اهرم ۱۲۵ یعنی ۰٫۸٪ حرکت مخالف، کل پول را می‌برد."""
-        assert AutoTradeConfig(leverage=125).validated().leverage == HARD_MAX_LEVERAGE
+        """عددی بالاتر از سقف سخت باید به همان سقف برگردد."""
+        assert AutoTradeConfig(leverage=500).validated().leverage == HARD_MAX_LEVERAGE
 
     def test_concurrency_is_capped(self) -> None:
         """تعداد معاملهٔ همزمان سقف سخت دارد."""
