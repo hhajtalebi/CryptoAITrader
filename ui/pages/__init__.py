@@ -11,6 +11,7 @@ from ui.pages.chat_page import ChatBubble, ChatPage
 from ui.pages.dashboard_page import DashboardPage
 from ui.pages.help_page import HelpPage
 from ui.pages.markets_page import MarketsPage
+from ui.pages.prediction_page import PredictionPage
 from ui.pages.reports_page import ReportsPage
 from ui.pages.settings_page import SettingsPage
 from ui.pages.signals_page import SignalsPage
@@ -23,6 +24,7 @@ __all__ = [
     "MarketsPage",
     "AnalysisPage",
     "SignalsPage",
+    "PredictionPage",
     "ChatPage",
     "ChatBubble",
     "TradesPage",

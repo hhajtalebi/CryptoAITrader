@@ -186,6 +186,7 @@ class MainController(QObject):
 
         # ---- سرویس‌های زنده ----
         self._live_feed: Any = None
+        self._connection_supervisor: Any = None
         self._fiat: Any = None
         self._toman_rate: float | None = None
         self._toman_source: str = ""
@@ -199,6 +200,7 @@ class MainController(QObject):
         self.markets = window.pages["nav.markets"]
         self.analysis = window.pages["nav.analysis"]
         self.signals = window.pages["nav.signals"]
+        self.prediction = window.pages["nav.prediction"]
         self.chat = window.pages["nav.chat"]
         self.reports = window.pages["nav.reports"]
         #: نمای عملکرد، زبانهٔ دوم صفحهٔ گزارش‌ها
@@ -236,6 +238,10 @@ class MainController(QObject):
     # ------------------------------------------------------------------
     def _connect(self) -> None:
         """اتصال دکمه‌های صفحات به کنش‌ها."""
+        self.prediction.refresh_requested.connect(self.run_prediction_report)
+        self.analysis.symbol_combo.currentTextChanged.connect(
+            self._sync_prediction_symbol
+        )
         self.dashboard.refresh_button.clicked.connect(self.refresh_dashboard)
         self.markets.refresh_button.clicked.connect(self.refresh_markets)
         self.markets.watchlist_button.clicked.connect(self.add_to_watchlist)
@@ -424,6 +430,10 @@ class MainController(QObject):
             loop = self.runner._loop  # noqa: SLF001 - دسترسی عمدی برای خاموشی
             if loop is not None:
                 try:
+                    if self._connection_supervisor is not None:
+                        asyncio.run_coroutine_threadsafe(
+                            self._connection_supervisor.stop(), loop
+                        ).result(timeout=5)
                     asyncio.run_coroutine_threadsafe(self._live_feed.stop(), loop).result(timeout=5)
                 except Exception:  # noqa: BLE001 - خاموشی نباید خطا بدهد
                     logger.warning("Live feed did not stop cleanly")
@@ -497,6 +507,7 @@ class MainController(QObject):
             return
 
         from market.live_feed import LivePriceFeed
+        from market.resilience import ConnectionSupervisor
 
         self._live_feed = LivePriceFeed(self.app.market)
         self._live_feed.add_listener(self._on_price_update)
@@ -508,6 +519,17 @@ class MainController(QObject):
             on_error=lambda message, exc=None: logger.warning("Live feed failed: %s", message),
         )
         logger.info("Live price feed starting")
+
+        # نگهبان اتصال: اگر وظیفهٔ فید به دلیلی بمیرد، خودش زنده‌اش
+        # می‌کند و وضعیت سه‌حالته صادقانه می‌دهد — قلب «همیشه آنلاین».
+        self._connection_supervisor = ConnectionSupervisor(
+            self._live_feed, event_bus=getattr(self.app, "events", None)
+        )
+        self.runner.submit(
+            "connection-supervisor",
+            self._connection_supervisor.start(),
+            on_error=lambda message, exc=None: logger.warning("Connection supervisor failed: %s", message),
+        )
 
     def _update_streamed_symbols(self) -> None:
         """
@@ -638,13 +660,24 @@ class MainController(QObject):
         وب‌سوکت؛ افتادن وب‌سوکت تا وقتی REST جواب می‌دهد یعنی هنوز آنلاین.
         """
         online = False
-        if self._live_feed is not None:
+        state = ""
+        # نگهبان اتصال وضعیت سه‌حالتهٔ صادقانه می‌دهد؛ فقط وقتی نیست که
+        # فید هنوز راه نیفتاده باشد (fallback همان منطق قبلی است).
+        if self._connection_supervisor is not None:
+            state = str(getattr(self._connection_supervisor.state, "value", "online"))
+            online = state == "online"
+        elif self._live_feed is not None:
             online = bool(self._live_feed.is_fresh)
         elif self.app.market is not None:
             online = bool(self.app.market.is_online)
 
-        label = self.tr_.tr("common.online") if online else self.tr_.tr("common.offline")
-        role = "bullish" if online else "bearish"
+        if state == "degraded":
+            # حلقه‌ها زنده‌اند ولی داده کهنه است — در حال بازاتصال، نه آفلاین
+            label = self.tr_.tr("common.reconnecting")
+            role = "neutral"
+        else:
+            label = self.tr_.tr("common.online") if online else self.tr_.tr("common.offline")
+            role = "bullish" if online else "bearish"
         if online:
             self._note_market_online()
         self.dashboard.set_connection_status(label, role)
@@ -1291,6 +1324,57 @@ class MainController(QObject):
             on_success=apply,
             on_error=self._on_error,
             on_finished=lambda: self.analysis.set_busy(False),
+        )
+
+    def _sync_prediction_symbol(self, symbol: str) -> None:
+        """نماد صفحهٔ پیش‌بینی همگام با نماد تحلیل بماند."""
+        self.prediction.set_symbol((symbol or "").strip().upper())
+
+    def run_prediction_report(self) -> None:
+        """
+        اجرای موتور هوش پیش‌بینی روی نماد فعلی.
+
+        گزارش کامل (نردبان ۱۳ افق، رژیم‌ها، سناریوها، دقت) در نخِ
+        پس‌زمینه ساخته می‌شود و فقط نتیجه روی صفحه می‌نشیند.
+        """
+        symbol = self.analysis.symbol_combo.currentText().strip().upper()
+        if not symbol:
+            self.status(self.tr_.tr("markets.select_symbol_first"))
+            return
+        if self.app.market is None:
+            self.status(self.tr_.tr("errors.not_connected"))
+            return
+
+        self.prediction.set_symbol(symbol)
+        self.prediction.set_busy(True)
+        self.status(self.tr_.tr("prediction.computing"))
+
+        async def compute() -> dict[str, Any] | None:
+            """ساخت گزارش در حلقهٔ ناهمگام — هیچ عددی در UI ساخته نمی‌شود."""
+            engine = self.app.prediction_engine
+            if engine is None:
+                return None
+            report = await engine.assess(symbol)
+            return report.to_dict() if report is not None else None
+
+        def apply(payload: dict[str, Any] | None) -> None:
+            """نمایش گزارش یا اعلام صادقانهٔ نبودِ داده."""
+            self.prediction.update_report(payload)
+            if payload is None:
+                self.status(self.tr_.tr("prediction.no_data"))
+            else:
+                self.status(
+                    "{} — {}".format(
+                        symbol, self.tr_.tr("prediction.horizons_title")
+                    )
+                )
+
+        self.runner.submit(
+            "prediction",
+            compute(),
+            on_success=apply,
+            on_error=self._on_error,
+            on_finished=lambda: self.prediction.set_busy(False),
         )
 
     def _run_ai_analysis(self, symbol: str, timeframe: str) -> None:

@@ -57,6 +57,40 @@ def _engine_wait() -> TradingSignal:
     )
 
 
+def _settings(timeout: int = 45):
+    """
+    شیء تنظیمات ساختگی، با هر دو متدی که قرارداد واقعی دارد.
+
+    چرا `get` لازم است و نه فقط `get_int`:
+        از نسخهٔ ۱.۹.۲۲ مهلت از راه پروفایل سرعت خوانده می‌شود
+        (`Application.signal_ai_timeout` → `ai.speed_profile.
+        signal_timeout_seconds`) و آن ماژول با `settings.get(...)` کار
+        می‌کند. فیکِ قدیمی فقط `get_int` داشت، پس `_read` در
+        `ai/speed_profile.py` هیچ getter‌ای پیدا نمی‌کرد و به پیش‌فرض
+        پروفایل «متعادل» (۴۵ ثانیه) برمی‌گشت. نتیجه این بود که آزمون
+        «سقف زمان اعمال نشد» شکست می‌خورد در حالی که **کد محصول درست
+        کار می‌کرد** — مهلت واقعاً اعمال می‌شد، فقط عددش از جای دیگری
+        می‌آمد.
+
+    این فیک قرارداد واقعی را بازتاب می‌دهد تا آزمون رفتار را بسنجد، نه
+    اینکه تصادفاً به یک مسیر داخلی گره بخورد.
+    """
+
+    class Settings:
+        def get(self, key, default=None):  # noqa: ANN001, ANN202
+            # پروفایل سرعت نخست نام پروفایل را می‌پرسد؛ «متعادل» یعنی
+            # عددهای ذخیره‌شدهٔ کاربر مقدم‌اند — همان چیزی که این آزمون
+            # می‌خواهد بسنجد.
+            if key == "ai.speed_profile":
+                return "balanced"
+            return timeout
+
+        def get_int(self, key, default=0):  # noqa: ANN001, ANN202
+            return timeout
+
+    return Settings()
+
+
 def _app(decision: AnalysisResult | None, timeout: int = 45) -> Application:
     """برنامه‌ای که فقط برای آزمودن نگاشت تصمیم ساخته می‌شود."""
     app = Application.__new__(Application)
@@ -65,12 +99,8 @@ def _app(decision: AnalysisResult | None, timeout: int = 45) -> Application:
         async def generate_signal(self, request):  # noqa: ANN001, ANN202
             return decision
 
-    class Settings:
-        def get_int(self, key, default=0):  # noqa: ANN001, ANN202
-            return timeout
-
     app.ai_analyst = lambda: Analyst()
-    app.settings = Settings()
+    app.settings = _settings(timeout)
     return app
 
 
@@ -233,12 +263,10 @@ class TestManualSignalSpeed:
                 await asyncio.sleep(10)
                 return _decision()
 
-        class Settings:
-            def get_int(self, key, default=0):  # noqa: ANN001, ANN202
-                return 1  # یک ثانیه
-
         app.ai_analyst = lambda: SlowAnalyst()
-        app.settings = Settings()
+        # مهلت یک ثانیه. مدل ده ثانیه می‌خوابد، پس اگر سقف واقعاً اعمال
+        # شود این آزمون باید حدود یک ثانیه طول بکشد، نه ده ثانیه.
+        app.settings = _settings(1)
 
         started = asyncio.run(_timed(app))
 

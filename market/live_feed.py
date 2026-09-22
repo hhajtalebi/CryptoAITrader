@@ -123,6 +123,18 @@ class LivePriceFeed:
         return self._running
 
     @property
+    def poll_alive(self) -> bool:
+        """
+        آیا حلقهٔ نظرسنجی واقعاً زنده است.
+
+        چرا جدا از `running`؟ پرچم `running` فقط یک بولین است؛ اگر وظیفهٔ
+        نظرسنجی به دلیلی بمیرد، پرچم روشن می‌ماند و برنامه بی‌صدا «آنلاینِ
+        یخ‌زده» می‌شود. نگهبان اتصال (market/resilience.py) با همین
+        ویژگی جانِ واقعی حلقه را می‌سنجد.
+        """
+        return self._poll_task is not None and not self._poll_task.done()
+
+    @property
     def is_fresh(self) -> bool:
         """
         آیا داده تازه است.

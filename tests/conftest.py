@@ -137,6 +137,39 @@ class FakeMarketEngine:
         return self._data[timeframe][-limit:]
 
 
+@pytest.fixture(autouse=True)
+def _isolate_qt_app_look():
+    """
+    بازگرداندن فونت و شیوه‌نامهٔ سطح برنامه پس از هر آزمون.
+
+    چرا: `apply_default_font` فونت QApplication را با قلم جاسازی‌شدهٔ
+    برنامه (وزیرمتن) عوض می‌کند و هیچ آزمونی آن را برنمی‌گرداند. با
+    متریک قلمِ بزرگ‌تر، آزمون‌های بعدی که اندازهٔ ویجت می‌سنجند
+    (`test_v193_page_scrolling`، دکمهٔ تحلیل در `test_v172`) به‌درستی
+    شکست می‌خوردند — فقط وقتی آزمونِ تم‌محور پیش از آن‌ها اجرا شده
+    باشد. این جداسازی همان نقش پاک‌سازیِ `destroy_window` را برای
+    وضعیتِ سراسریِ «ظاهر» بازی می‌کند.
+
+    اگر QApplication ساخته نشده باشد (آزمون‌های بدون UI) هیچ کاری
+    نمی‌کند؛ فقط `instance()` می‌پرسد و چیزی نمی‌سازد.
+    """
+    try:
+        from PySide6.QtWidgets import QApplication
+    except ImportError:  # pragma: no cover - محیط بدون Qt
+        yield
+        return
+
+    app = QApplication.instance()
+    if app is None:
+        yield
+        return
+    font = app.font()
+    stylesheet = app.styleSheet()
+    yield
+    app.setFont(font)
+    app.setStyleSheet(stylesheet)
+
+
 @pytest.fixture(scope="session")
 def qt_application():
     """
@@ -150,3 +183,47 @@ def qt_application():
 
     application = QApplication.instance() or QApplication([])
     return application
+
+
+def destroy_window(window, app=None) -> None:
+    """
+    حذف قطعی یک پنجره و کل درخت ویجت‌هایش.
+
+    چرا `close()` و `deleteLater()` به‌تنهایی کافی نیستند:
+        `deleteLater()` فقط یک رویداد `DeferredDelete` در صف می‌گذارد و
+        `processEvents()` آن را پردازش **نمی‌کند** — Qt پردازش «حذف
+        معوق» را به سطح حلقهٔ رویداد گره زده است. باید صریح
+        `sendPostedEvents(None, QEvent.DeferredDelete)` صدا زده شود.
+
+        نتیجهٔ پاک‌سازی ناقص این بود که درخت ویجت هر آزمون زنده
+        می‌ماند و چون `QApplication.setStyleSheet` هر ویجت برنامه را
+        دوباره پولیش می‌کند، هزینهٔ ساخت پنجرهٔ آزمون بعدی با تعداد
+        ویجت‌های نشتی‌شده رشد می‌کرد. اندازه‌گیری واقعی با چهار ساخت
+        پیاپی `MainWindow`:
+
+            هیچ                                رشد ۱۹۴۲ ویجت در هر نوبت
+            close + deleteLater + processEvents    رشد ۱۹۴۲ (بی‌اثر)
+            close + deleteLater + sendPostedEvents رشد ۱۱۰، زمان ساخت ثابت
+
+        همین انباشت باعث می‌شد `test_new_pages.py` از سقف ۶۰۰ ثانیه رد
+        شود و `test_exchange_login_flow.py` برای ۹ آزمون ۲۱۵ ثانیه
+        بگیرد، در حالی که هر آزمون به‌تنهایی چند ثانیه است.
+
+    این تابع در کد محصول لازم نیست: `main.py` فقط یک بار پنجره می‌سازد
+    و پس از بستن آن فرایند تمام می‌شود. جای درستش همین‌جاست، چون مشکل
+    از تکرار ساخت پنجره در یک فرایند بلند می‌آید.
+    """
+    from PySide6.QtCore import QEvent
+    from PySide6.QtWidgets import QApplication
+
+    if window is None:
+        return
+    target = app or QApplication.instance()
+    try:
+        window.close()
+        window.deleteLater()
+    except RuntimeError:
+        return  # شیء C++ پیش‌تر حذف شده است
+    if target is not None:
+        target.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        target.processEvents()

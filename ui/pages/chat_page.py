@@ -259,6 +259,8 @@ TOOL_NAME_KEYS: tuple[str, ...] = (
     "calculate_risk",
     "get_engine_signal",
     "forecast_next_timeframe",
+    "get_prediction_report",
+    "get_prediction_accuracy",
     "omniroute_status",
     "omniroute_models",
 )

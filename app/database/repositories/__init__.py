@@ -16,6 +16,7 @@ from app.database.repositories.provider_repository import (
     ExchangeProviderRepository,
 )
 from app.database.repositories.outcome_repository import SignalOutcomeRepository
+from app.database.repositories.prediction_repository import PredictionRepository
 from app.database.repositories.review_repository import SignalReviewRepository
 from app.database.repositories.settings_repository import SettingsRepository
 from app.database.repositories.signal_repository import SignalRepository
@@ -38,6 +39,7 @@ __all__ = [
     "ChatRepository",
     "SignalRepository",
     "SignalOutcomeRepository",
+    "PredictionRepository",
     "SignalReviewRepository",
     "ExchangeProviderRepository",
     "AIProviderRepository",

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "crypto-ai-trader"
-version = "1.9.22"
+version = "2.0.0"
 description = "نرم‌افزار دسکتاپ تحلیل بازار ارز دیجیتال و تولید سیگنال Futures با کمک هوش مصنوعی"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -33,6 +33,14 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0.0,<10.0", "pytest-asyncio>=0.23.0,<2.0", "pyinstaller>=6.6.0,<8.0"]
+# موتور هوش پیش‌بینی (فاز ۵ سند PREDICTIVE_ENGINE_FA): آنسامبل مدل‌ها.
+# اختیاری است چون مدل آماری پایه بدون این‌ها هم کار می‌کند؛ نصب‌کنندهٔ
+# ویندوز باید [.ml] را نصب کند تا LSTM/GBM فعال شوند.
+ml = [
+  "torch>=2.2.0,<3.0",
+  "xgboost>=2.0.0,<3.0",
+  "lightgbm>=4.3.0,<5.0",
+]
 
 [project.scripts]
 crypto-ai-trader = "main:main"

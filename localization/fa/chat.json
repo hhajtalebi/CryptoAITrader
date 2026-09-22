@@ -47,6 +47,8 @@
     "forecast_next_timeframe": "پیش‌بینی تایم‌فریم بعدی",
     "get_current_price": "قیمت لحظه‌ای",
     "get_engine_signal": "نظر موتور سیگنال",
+    "get_prediction_report": "گزارش هوش پیش‌بینی",
+    "get_prediction_accuracy": "دقت ثبت‌شدهٔ پیش‌بینی",
     "get_multi_timeframe_data": "داده چند تایم‌فریم",
     "get_ohlcv": "کندل‌های قیمت",
     "get_orderbook": "عمق بازار",

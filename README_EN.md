@@ -2,7 +2,7 @@
 
 **Professional desktop app for crypto market analysis and futures signal generation**
 
-Version 1.0.0 · Windows 10/11 · Python 3.12+ · Persian & English
+Version 2.0.0 · Windows 10/11 · Python 3.11+ (tested up to 3.13) · Persian & English
 
 [راهنمای فارسی](README.md)
 
@@ -28,6 +28,7 @@ This is an **analysis tool**, not financial advice and not a trading bot.
 | **Signal engine** | `LONG` / `SHORT` / `WAIT` with entry, stop loss, three targets, R/R, and suggested leverage |
 | **Risk engine** | Structural or ATR-based stops, stop-distance clamping, rejection of low-quality setups |
 | **AI analysis (optional)** | Multi-timeframe narrative from a local model (Ollama) or any OpenAI-compatible endpoint |
+| **Predictive intelligence (new in 2.0)** | A 13-horizon ladder (1m to 7d) with probability distributions (P10…P90), market regimes, scenarios, and accuracy scored against real prices |
 | **Reports** | CSV, Excel, JSON, PDF, and HTML export |
 | **Backup** | Manual backups plus automatic ones before every migration, with restore |
 | **Bilingual** | Persian (RTL) and English (LTR), switchable at runtime |
@@ -96,6 +97,7 @@ python main.py --log-level DEBUG    # Verbose logging
 | **Markets** | Full market list with search and watchlist. Double-click a row to analyse that symbol |
 | **Analysis** | Candlestick chart with volume, moving averages, key levels, indicator table, AI narrative |
 | **Signals** | Multi-timeframe signal generation and full history |
+| **Predictions** | The predictive intelligence report: horizons, regimes, scenarios, warnings, what changed, and recorded accuracy |
 | **Reports** | Build a report over a date range and export it in five formats |
 | **Settings** | Language, theme, exchange, AI, risk parameters, backup and restore |
 | **Help** | Concept explanations and FAQ |

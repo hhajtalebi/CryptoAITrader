@@ -39,6 +39,7 @@ from app.database.repositories import (
     ExchangeAccountRepository,
     PaperTradeRepository,
     SettingsRepository,
+    PredictionRepository,
     SignalOutcomeRepository,
     SignalRepository,
     SymbolRepository,
@@ -100,6 +101,8 @@ class Application:
         #: شناسهٔ آخرین سیگنال ذخیره‌شده (برای تحلیل دوباره از رابط کاربری)
         self._last_signal_id: int = 0
         self.outcome_repository = SignalOutcomeRepository(self.database)
+        # موتور هوش پیش‌بینی (v1.11.0): رکوردهای ۱۳ افق + حل با قیمت واقعی
+        self.prediction_repository = PredictionRepository(self.database)
         self.review_repository = SignalReviewRepository(self.database)
         self.chat_repository = ChatRepository(self.database)
         self.ai_provider_repository = AIProviderRepository(self.database)
@@ -160,12 +163,63 @@ class Application:
         self._ai_toolset: Any = None
         self._autonomous_agent: Any = None
         self._chat_agent: Any = None
+        # موتور هوش پیش‌بینی — تنبل، مثل اجزای AI
+        self._prediction_engine: Any = None
 
         logger.info("%s v%s composition root initialised", APP_NAME, APP_VERSION)
 
     # ------------------------------------------------------------------
     # تنظیمات
     # ------------------------------------------------------------------
+    @property
+    def prediction_engine(self) -> Any | None:
+        """
+        موتور هوش پیش‌بینی (تنبل) — پس از نخستین فراخوانی کش می‌شود.
+
+        منبع کندل، موتور بازارِ «فعلی» است؛ اگر کاربر صرافی عوض کند
+        `invalidate_prediction_engine` نمونه را می‌سازد تا با منبع تازه
+        ساخته شود. ذخیره‌سازی روی `prediction_repository` انجام می‌شود و
+        حل افق‌ها با کندل‌های واقعیِ دیتابیس، نه دادهٔ جعلی.
+        """
+        if self._prediction_engine is not None:
+            return self._prediction_engine
+        if self.market is None:
+            return None
+
+        from signals.prediction.engine import PredictiveIntelligenceEngine
+        from signals.prediction.store import PredictionStore
+
+        def lookup_price(symbol: str, at: Any) -> float | None:
+            """قیمت واقعی در لحظهٔ سرآمدن افق — از کندل‌های ذخیره‌شده."""
+            from datetime import timedelta  # noqa: PLC0415
+
+            try:
+                at_naive = at.replace(tzinfo=None) if at.tzinfo else at
+                candidates = self.candle_repository.get_candles(
+                    self.market.exchange_name, symbol, "1h", 800
+                )
+                # نزدیک‌ترین کندلِ «بسته‌شده قبل یا در» لحظهٔ هدف
+                eligible = [c for c in candidates if c.timestamp <= at_naive.timestamp()]
+                if not eligible:
+                    return None
+                candle = eligible[-1]
+                return float(candle.close)
+            except Exception:  # noqa: BLE001 - نباید حل افق را بکشد
+                return None
+
+        store = PredictionStore(self.prediction_repository, price_lookup=lookup_price)
+        self._prediction_engine = PredictiveIntelligenceEngine(
+            self.market.get_candles,
+            store=store,
+            settings=self.settings,
+        )
+        logger.info("Predictive intelligence engine initialised")
+        return self._prediction_engine
+
+    def invalidate_prediction_engine(self) -> None:
+        """بازسازی موتور پیش‌بینی — مثلاً پس از تغییر صرافی فعال."""
+        self._prediction_engine = None
+
     def risk_parameters(self) -> RiskParameters:
         """خواندن پارامترهای ریسک از تنظیمات کاربر."""
         try:
@@ -247,6 +301,7 @@ class Application:
         await engine.start()
 
         self.market = engine
+        self.invalidate_prediction_engine()
         # موتور سیگنال به موتور بازار گره خورده است و باید دوباره ساخته
         # شود، وگرنه سیگنال‌ها از صرافی قبلی تغذیه می‌شوند.
         self.signals = SignalEngine(
@@ -353,6 +408,7 @@ class Application:
             self.indicators,
             risk_parameters=self.risk_parameters(),
             signal_engine=self.signals,
+            prediction_engine=self.prediction_engine,
         )
         # ابزارهای دروازه همیشه در دسترس‌اند، حتی وقتی سرویس فعال OmniRoute
         # نیست: در آن حالت ابزار صادقانه می‌گوید «پیکربندی نشده» و کاربر

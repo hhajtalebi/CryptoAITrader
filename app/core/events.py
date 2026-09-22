@@ -32,6 +32,8 @@ class EventType(str, Enum):
     EXCHANGE_CONNECTED = "exchange.connected"
     EXCHANGE_DISCONNECTED = "exchange.disconnected"
     EXCHANGE_RECONNECTING = "exchange.reconnecting"
+    #: گذار وضعیت اتصال کل سیستم از نگاه نگهبان (online/degraded/offline)
+    CONNECTIVITY_CHANGED = "system.connectivity_changed"
 
     # داده بازار
     TICKER_UPDATED = "market.ticker_updated"

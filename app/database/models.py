@@ -666,3 +666,52 @@ class PaperTradeRecord(Base, TimestampMixin):
     closed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     note: Mapped[str] = mapped_column(Text, default="", nullable=False)
     extra: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+
+
+class PredictionRecord(Base, TimestampMixin):
+    """
+    پیش‌بینی ثبت‌شدهٔ موتور هوش پیش‌بینی — قانون حیاتی ۵.
+
+    هر پیش‌بینی (نماد × افق) در لحظهٔ صدور ذخیره می‌شود و پس از سپری
+    شدن افق، با قیمت واقعی حل می‌شود: جهت درست بود؟ قیمت داخل بازهٔ
+    P25..P75 بود؟ بدون این جدول، هر «آمار دقت» ادعای بی‌پشتوانه است.
+
+    چرا رکورد به‌ازای هر افق و نه یک رکورد با JSON؟ تا بتوان با یک
+    کوئری ساده دقت را به تفکیک افق/نماد/رژیم/مدل (قانون ۶) و کالیبراسیون
+    احتمال (خواستهٔ ۲۵) محاسبه کرد — ایندکس‌گذاری روی ستون‌های جدا.
+    """
+
+    __tablename__ = "predictions"
+    __table_args__ = (
+        Index("ix_predictions_lookup", "symbol", "horizon", "status"),
+        Index("ix_predictions_resolve", "status", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(String(40), index=True, nullable=False)
+    horizon: Mapped[str] = mapped_column(String(10), nullable=False)
+    horizon_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+    direction: Mapped[str] = mapped_column(String(12), nullable=False)  # bullish/bearish/neutral/uncertain
+    probability: Mapped[int] = mapped_column(Integer, nullable=False)
+    confidence_effective: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    #: چندک‌ها به قیمت در لحظهٔ پیش‌بینی — برای سنجش «بازه» بعداً.
+    p10: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    p25: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    p50: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    p75: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    p90: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    last_price: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    method: Mapped[str] = mapped_column(String(12), default="empirical", nullable=False)
+    regime: Mapped[str] = mapped_column(String(24), default="unknown", nullable=False)
+    model_agreement: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    #: خروجی مدل‌های عضو آنسامبل — برای دقت به تفکیک مدل (قانون ۶).
+    models: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list, nullable=False)
+    #: عوامل توضیح‌پذیری با علامت — برای What-Changed (خواستهٔ ۲۸).
+    contributors: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list, nullable=False)
+    #: open = در انتظار سپری شدن افق؛ resolved = با قیمت واقعی سنجیده شد.
+    status: Mapped[str] = mapped_column(String(12), default="open", index=True, nullable=False)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    actual_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    direction_correct: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    range_correct: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    note: Mapped[str] = mapped_column(Text, default="", nullable=False)

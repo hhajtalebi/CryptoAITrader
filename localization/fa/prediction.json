@@ -1,0 +1,91 @@
+{
+  "subtitle": "نردبان ۱۳ افق از ۱ دقیقه تا ۷ روز — توزیع احتمال، نه یک عدد",
+  "refresh": "محاسبهٔ گزارش",
+  "computing": "در حال محاسبه…",
+  "no_symbol": "نمادی انتخاب نشده",
+  "empty": "هنوز گزارشی ساخته نشده است. نمادی را در صفحهٔ تحلیل انتخاب کنید و «محاسبهٔ گزارش» را بزنید. همهٔ اعداد از مدل‌های کمی روی دادهٔ واقعی می‌آیند؛ هیچ عددی ساخته نمی‌شود.",
+  "no_data": "دادهٔ کافی نیست.",
+  "horizons_title": "نردبان افق‌ها",
+  "horizons_hint": "هر افق: جهت، احتمال (٪)، بازهٔ P10 تا P90 و روش. افق‌های بدونِ تاریخچهٔ کافی، خاموش گزارش می‌شوند.",
+  "direction": {
+    "bullish": "صعودی",
+    "bearish": "نزولی",
+    "neutral": "بی‌طرف",
+    "uncertain": "نامطمئن"
+  },
+  "range_value": "بازهٔ ۱۰٪ تا ۹۰٪: {low} تا {high}",
+  "confidence_short": "اطمینان",
+  "samples": "نمونه",
+  "agreement": "توافق مدل‌ها",
+  "conflict": "تعارض مدل‌ها",
+  "volatility_short": "نوسان",
+  "method": {
+    "empirical": "تجربی",
+    "analytic": "تحلیلی",
+    "blended": "ترکیبی"
+  },
+  "disabled_row": "{horizon}: غیرفعال — {reason}",
+  "market_title": "وضعیت بازار",
+  "stage_row": "مرحلهٔ بازار: {stage} ({confidence}٪)",
+  "regime_row": "{tf}: {regime} (جهت {dir})",
+  "alignment_row": "هم‌راستایی تایم‌فریم‌ها: {value}",
+  "alignment": {
+    "aligned": "هم‌راستا",
+    "mixed": "مختلط",
+    "conflicted": "در تعارض"
+  },
+  "data_quality": "کیفیت داده: {value}٪",
+  "last_price": "آخرین قیمت: {price}",
+  "stage": {
+    "ACCUMULATION": "انباشت",
+    "MARKUP": "رشد",
+    "DISTRIBUTION": "توزیع",
+    "MARKDOWN": "ریزش",
+    "RANGE": "رِنج",
+    "UNKNOWN": "نامشخص"
+  },
+  "regime": {
+    "strong_trend_up": "روند قوی صعودی",
+    "weak_trend": "روند ضعیف",
+    "range": "رِنج",
+    "breakdown": "فروپاشی",
+    "trend_reversal": "بازگشت روند",
+    "distribution": "توزیع سهم",
+    "strong_trend_down": "روند قوی نزولی"
+  },
+  "scenarios_title": "سناریوهای افق اصلی",
+  "primary_horizon": "افق اصلی: {horizon}",
+  "scenario_row": "{name}: {probability}٪ — از {low} تا {high}",
+  "scenario": {
+    "bull": "گاوی",
+    "base": "پایه",
+    "bear": "خرسی"
+  },
+  "event_pressure": "فشار رویداد: {value}",
+  "warnings_title": "هشدارها و آنومالی",
+  "no_warnings": "هشدار فعالی نیست.",
+  "breakout_state": "شکست: {state}",
+  "false_breakout": "ریسک شکست قلابی: {risk}",
+  "changed_title": "چه عوض شد؟",
+  "no_change_data": "برای مقایسه، دو گزارش لازم است.",
+  "probability_delta": "تغییر احتمال: {value}",
+  "direction_changed": "جهت پیش‌بینی عوض شد.",
+  "factor_row": "{name}: {before} ← {after} ({direction})",
+  "factor_dir": {
+    "up": "افزایش",
+    "down": "کاهش"
+  },
+  "accuracy_title": "دقت ثبت‌شده",
+  "no_resolved": "هنوز پیش‌بینی حل‌شده‌ای نیست؛ پیش‌بینی‌ها بعد از سپری‌شدن افق با قیمت واقعی سنجیده می‌شوند.",
+  "accuracy_row": "حل‌شده: {count} — جهت {dir}٪ — بازه {rng}٪ — بریر {brier}",
+  "health_row": "{model}: {acc}٪ ({status})",
+  "health": {
+    "good": "سالم",
+    "watch": "تحت نظر",
+    "retraining_suggested": "پیشنهاد بازآموزی",
+    "insufficient_data": "دادهٔ ناکافی"
+  },
+  "timeline_title": "تایم‌لاین پیش‌بینی‌ها",
+  "no_timeline": "تایم‌لاینی ثبت نشده است.",
+  "timeline_row": "{when} — {direction} با احتمال {probability}٪"
+}

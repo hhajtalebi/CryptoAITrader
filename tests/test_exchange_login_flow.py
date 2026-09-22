@@ -21,6 +21,7 @@ pytest.importorskip("PySide6")
 from app.application import Application  # noqa: E402
 from app.core.paths import AppPaths  # noqa: E402
 from localization import Translator  # noqa: E402
+from tests.conftest import destroy_window  # noqa: E402
 from ui.controllers.main_controller import MainController  # noqa: E402
 from ui.themes.theme_manager import ThemeManager  # noqa: E402
 from ui.windows.main_window import MainWindow  # noqa: E402
@@ -80,9 +81,9 @@ def gui(tmp_path, qt_application):
         runner = getattr(controller, "runner", None)
         if runner is not None and hasattr(runner, "stop"):
             runner.stop()
-        window.close()
-        window.deleteLater()
-        qt_app.processEvents()
+        # `close()` + `deleteLater()` + `processEvents()` درخت ویجت را آزاد
+        # نمی‌کرد؛ حذف قطعی در `conftest.destroy_window` توضیح داده شده.
+        destroy_window(window, qt_app)
         # موتور بازار باید پیش از بستن حلقه متوقف شود، وگرنه تسکِ
         # «lbank-ws» معلق می‌ماند و پیام «Task was destroyed but it is
         # pending!» چاپ می‌شود.

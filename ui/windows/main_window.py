@@ -41,6 +41,7 @@ from ui.pages import (
     DashboardPage,
     HelpPage,
     MarketsPage,
+    PredictionPage,
     ReportsPage,
     SettingsPage,
     SignalsPage,
@@ -59,6 +60,7 @@ NAV_ICONS: dict[str, str] = {
     "nav.markets": "markets",
     "nav.analysis": "analysis",
     "nav.signals": "signals",
+    "nav.prediction": "chart",
     "nav.chat": "chat",
     "nav.trades": "trades",
     "nav.wallet": "wallet",
@@ -106,6 +108,7 @@ class MainWindow(QMainWindow):
         ("nav.markets", MarketsPage),
         ("nav.analysis", AnalysisPage),
         ("nav.signals", SignalsPage),
+        ("nav.prediction", PredictionPage),
         ("nav.chat", ChatPage),
         ("nav.trades", TradesPage),
         ("nav.wallet", WalletPage),
@@ -253,10 +256,15 @@ class MainWindow(QMainWindow):
         bind("Ctrl+B", self.toggle_sidebar, "help.shortcuts.sidebar")
         bind("Ctrl+Shift+F", self.toggle_focus_mode, "help.shortcuts.focus")
         bind("Ctrl+T", self._cycle_theme, "help.shortcuts.theme")
-        # میان‌بر عددی برای ده صفحه: Ctrl+1 تا Ctrl+9 و Ctrl+0
-        for index in range(len(self.PAGES)):
+        # میان‌بر عددی برای ده صفحهٔ نخست: Ctrl+1 تا Ctrl+9 و Ctrl+0.
+        # سقفِ ده برای جلوگیری از تصادم است: با یازده صفحه، Ctrl+1 دوبار
+        # بسته می‌شد و داشبورد میان‌برش را از دست می‌داد.
+        for index in range(min(len(self.PAGES), 10)):
             key = (index + 1) % 10
             bind(f"Ctrl+{key}", lambda i=index: self.go_to_page(i), "help.shortcuts.pages")
+        # صفحات یازدهم به بعد: F1، F2، …
+        for offset, index in enumerate(range(10, len(self.PAGES))):
+            bind(f"F{offset + 1}", lambda i=index: self.go_to_page(i), "help.shortcuts.pages")
 
     def _connect_signals(self) -> None:
         """اتصال کنترل‌های نوار بالا و صفحه تنظیمات."""

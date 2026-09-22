@@ -369,11 +369,45 @@ class TestAutoTradingVisible:
         عددها باید از تنظیمات کاربر بیایند.
 
         کاربر صریح گفت هدف سود، حد ضرر و اهرم را خودش تعیین می‌کند.
+
+        چرا این آزمون فراخوانی واقعی می‌کند و نه `grep` روی منبع:
+            شکل قبلی فقط `assert "build_trader_config" in source` بود، آن
+            هم روی منبع `_auto_trader`. وقتی آن متد کار را به
+            `_auto_trade_config()` واگذار کرد (که خودش
+            `build_trader_config()` را صدا می‌زند)، رفتار درست سر جایش
+            بود ولی آزمون شکست خورد — چون دنبال یک **نام** می‌گشت، نه
+            دنبال رفتار. `docs/HANDOVER_FA.md` §۵ صریحاً همین تله را
+            هشدار می‌دهد: «روی فراخوانی واقعی ادعا بزنید، نه حضور یک
+            نام». حالا عددهای کاربر را در پیکربندیِ واقعاً ساخته‌شده
+            می‌بینیم؛ اگر روزی کسی عددی را hard-code کند، این آزمون
+            می‌شکند.
         """
+        from types import SimpleNamespace
+
         from ui.controllers.main_controller import MainController
 
-        source = inspect.getsource(MainController._auto_trader)
-        assert "build_trader_config" in source
+        saved = {
+            "scalp.margin_per_trade": 42.0,
+            "scalp.target_profit": 7.5,
+            "scalp.max_loss": 4.5,
+            "scalp.leverage": 33.0,
+        }
+
+        class Settings:
+            def get(self, key, default=None):  # noqa: ANN001, ANN202
+                return saved.get(key, default)
+
+        fake_self = SimpleNamespace(app=SimpleNamespace(settings=Settings()))
+
+        config = MainController._auto_trade_config(fake_self)  # noqa: SLF001
+
+        assert config.margin_per_trade == 42.0
+        assert config.target_profit == 7.5
+        assert config.max_loss == 4.5
+        assert config.leverage == 33.0
+        # سقف‌های سخت هنوز اعمال می‌شوند و حالت پیش‌فرض کاغذی می‌ماند
+        assert config.mode == "paper"
+        assert not config.is_live
 
     def test_engine_defaults_to_paper(self) -> None:
         """حالت پیش‌فرض باید کاغذی باشد، نه پول واقعی."""
