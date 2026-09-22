@@ -41,8 +41,9 @@ LIVE_CONFIRMATION_PHRASE = "معامله واقعی را می‌پذیرم"
 #: سقف سخت تعداد معامله‌های همزمان. حتی اگر کاربر عدد بزرگ‌تری بگذارد.
 HARD_MAX_CONCURRENT = 10
 
-#: سقف سخت اهرم. اهرم ۱۲۵ یعنی ۰٫۸٪ حرکت مخالف، کل پول را می‌برد.
-HARD_MAX_LEVERAGE = 25.0
+#: سقف سخت اهرم. کاربر صریحاً ۲۰۰ خواست. بالاتر از این دیگر سقف ایمنی نیست:
+#: با اهرم ۲۰۰، حرکت مخالف حدود ۰٫۵٪ کل مارجین را می‌سوزاند.
+HARD_MAX_LEVERAGE = 200.0
 
 
 class LiveTradingNotEnabledError(RuntimeError):
@@ -51,26 +52,49 @@ class LiveTradingNotEnabledError(RuntimeError):
 
 class LiveOrderGateway:
     """
-    درگاه سفارش واقعی — هنوز پیاده نشده و عمداً صریح شکست می‌خورد.
+    درگاه سفارش واقعی.
 
-    وقتی آداپتور صرافی متد سفارش امضاشده گرفت، اینجا پیاده می‌شود.
+    بدون اجراکنندهٔ تأییدشده، باز و بستن هر دو بلند شکست می‌خورند.
+    payload صرافی اینجا ساخته نمی‌شود. اگر اجراکننده باشد ولی حجم
+    قرارداد مثبت نباشد، پیش از هر فراخوانی رد می‌شود.
     """
 
-    def __init__(self, exchange_name: str) -> None:
-        self.exchange_name = exchange_name
+    def __init__(self, exchange_name: str, executor: Any | None = None) -> None:
+        self.exchange_name = str(exchange_name or "").strip()
+        self._executor = executor
 
-    async def open_position(self, **_kwargs: Any) -> dict[str, Any]:
-        """ثبت سفارش واقعی."""
-        raise LiveTradingNotEnabledError(
-            f"ثبت سفارش واقعی روی «{self.exchange_name}» هنوز پیاده‌سازی "
-            "نشده است. حالت کاغذی همهٔ منطق را با قیمت زنده اجرا می‌کند."
-        )
+    async def open_position(self, **kwargs: Any) -> dict[str, Any]:
+        """ثبت سفارش واقعی، یا شکست صریح اگر مسیر تأیید نشده باشد."""
+        if self._executor is None:
+            raise LiveTradingNotEnabledError(
+                f"ثبت سفارش واقعی روی «{self.exchange_name}» هنوز پیاده‌سازی "
+                "نشده است. حالت کاغذی همهٔ منطق را با قیمت زنده اجرا می‌کند."
+            )
+        quantity = float(kwargs.get("quantity") or 0.0)
+        if quantity <= 0:
+            raise LiveTradingNotEnabledError(
+                "حجم قرارداد تأیید نشده است؛ سفارش واقعی ارسال نشد"
+            )
+        result = self._executor.open_position(**kwargs)
+        if hasattr(result, "__await__"):
+            result = await result
+        return dict(result or {})
 
-    async def close_position(self, **_kwargs: Any) -> dict[str, Any]:
-        """بستن سفارش واقعی."""
-        raise LiveTradingNotEnabledError(
-            f"بستن سفارش واقعی روی «{self.exchange_name}» هنوز پیاده‌سازی نشده است."
-        )
+    async def close_position(self, **kwargs: Any) -> dict[str, Any]:
+        """بستن سفارش واقعی، یا شکست صریح اگر مسیر تأیید نشده باشد."""
+        if self._executor is None:
+            raise LiveTradingNotEnabledError(
+                f"بستن سفارش واقعی روی «{self.exchange_name}» هنوز پیاده‌سازی نشده است."
+            )
+        quantity = float(kwargs.get("quantity") or 0.0)
+        if quantity <= 0:
+            raise LiveTradingNotEnabledError(
+                "حجم قرارداد تأیید نشده است؛ سفارش واقعی ارسال نشد"
+            )
+        result = self._executor.close_position(**kwargs)
+        if hasattr(result, "__await__"):
+            result = await result
+        return dict(result or {})
 
 
 @dataclass
@@ -102,6 +126,8 @@ class AutoTradeConfig:
     mode: str = "paper"
     #: عبارت تأیید معاملهٔ واقعی
     live_confirmation: str = ""
+    #: کارمزد گیرندهٔ هر طرف. پیش‌فرض ۰٫۰۶٪ است.
+    fee_rate: float = 0.0006
 
     def validated(self) -> AutoTradeConfig:
         """
@@ -117,8 +143,9 @@ class AutoTradeConfig:
         self.margin_per_trade = max(1.0, float(self.margin_per_trade or 1.0))
         self.target_profit = max(0.01, float(self.target_profit or 0.01))
         self.max_loss = max(0.01, float(self.max_loss or 0.01))
-        self.poll_seconds = max(1.0, float(self.poll_seconds or 5.0))
+        self.poll_seconds = max(0.25, float(self.poll_seconds or 5.0))
         self.max_hold_seconds = max(30, int(self.max_hold_seconds or 900))
+        self.fee_rate = max(0.0, float(self.fee_rate or 0.0))
         return self
 
     @property
@@ -220,6 +247,15 @@ class AutoTrader:
         self._listeners: list[Callable[[str, dict[str, Any]], None]] = []
         self._halted_reason = ""
 
+    def apply_config(self, config: AutoTradeConfig) -> None:
+        """
+        عوض کردن تنظیم موتور در حال اجرا.
+
+        حلقهٔ پایش هر دور `self.config` را می‌خواند. اگر این متد نباشد،
+        ذخیرهٔ عددهای تازه تا ری‌استارت موتور بی‌اثر می‌ماند.
+        """
+        self.config = config.validated()
+
     # ---- وضعیت ------------------------------------------------------
 
     @property
@@ -317,10 +353,20 @@ class AutoTrader:
             return None
 
         config = self.config
-        quantity = config.notional / price
+        from trading.micro_plan import plan_levels
+
+        plan = plan_levels(
+            config.margin_per_trade,
+            config.leverage,
+            config.target_profit,
+            config.max_loss,
+            config.fee_rate,
+        )
+        quantity = plan.notional / price
         sign = 1.0 if side == "long" else -1.0
-        target = price * (1 + sign * config.target_percent() / 100.0)
-        stop = price * (1 - sign * config.stop_percent() / 100.0)
+        # هدف و حد، ناخالص‌اند تا بعد از کسر هر دو کارمزد به عدد خالص برسند.
+        target = price + sign * (plan.gross_target / quantity)
+        stop = price - sign * (plan.stop_distance / quantity)
 
         if config.is_live:
             if self._gateway is None:
@@ -338,6 +384,7 @@ class AutoTrader:
             stop_loss=stop,
             take_profit=target,
             leverage=config.leverage,
+            fee=plan.entry_fee,
             mode="live" if config.is_live else "paper",
             note="معاملهٔ خودکار اسکلپ",
             extra={
@@ -345,6 +392,9 @@ class AutoTrader:
                 "score": float(getattr(candidate, "score", 0.0)),
                 "target_profit": config.target_profit,
                 "max_loss": config.max_loss,
+                "round_trip_fee": plan.round_trip_fee,
+                "gross_target": plan.gross_target,
+                "fee_rate": config.fee_rate,
             },
         )
 
@@ -379,8 +429,17 @@ class AutoTrader:
                 symbol=managed.symbol, side=managed.side, quantity=managed.quantity
             )
 
+        from trading.micro_plan import exit_fee_from_notional
+
+        exit_fee = exit_fee_from_notional(
+            managed.quantity * managed.entry_price,
+            self.config.fee_rate,
+        )
         record = self._repo.close_trade(
-            managed.trade_id, exit_price=price, note=f"بسته شد: {reason}"
+            managed.trade_id,
+            exit_price=price,
+            fee=exit_fee,
+            note=f"بسته شد: {reason}",
         )
         self._open.pop(managed.trade_id, None)
 

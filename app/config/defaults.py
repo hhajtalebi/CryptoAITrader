@@ -70,6 +70,8 @@ class SettingKey(str, Enum):
     AI_FREE_MODELS_ONLY = "ai.free_models_only"
     AI_CHAT_TIMEOUT = "ai.chat_timeout"
     AI_CHAT_MAX_TOOLS = "ai.chat_max_tools"
+    #: پروفایل سرعت: fast / balanced / deep. پیش‌فرض متعادل است.
+    AI_SPEED_PROFILE = "ai.speed_profile"
     AI_SIGNAL_MODE = "ai.signal_mode"
     AI_NARRATIVE_ENABLED = "ai.narrative_enabled"
     AI_NARRATIVE_LANGUAGE = "ai.narrative_language"
@@ -126,6 +128,8 @@ class SettingKey(str, Enum):
     SCALP_SCAN_LIMIT = "scalp.scan_limit"
     #: آیا هوش مصنوعی نامزدهای نهایی را بازبینی کند
     SCALP_AI_REVIEW = "scalp.ai_review"
+    #: نرخ کارمزد گیرندهٔ هر طرف برای محاسبهٔ سود خالص
+    SCALP_TAKER_FEE = "scalp.taker_fee_rate"
     #: منبع انتخاب نماد برای معاملهٔ خودکار: `scalp` یا `confidence`
     AUTOTRADE_SOURCE = "scalp.candidate_source"
     #: حداقل درصد اطمینان سیگنال برای ورود خودکار (حالت `confidence`)
@@ -161,6 +165,9 @@ class SettingKey(str, Enum):
     SIGNAL_TRACK_OUTCOMES = "signals.track_outcomes"
     SIGNAL_TRACK_INTERVAL = "signals.track_interval"
     SIGNAL_TRACK_BATCH = "signals.track_batch"
+
+    #: به‌روزرسانی ساعتی دفترچهٔ نتیجه؛ پیش‌فرض خاموش تا پهنای باند بی‌اجازه نرود
+    SIGNAL_SCORECARD_AUTO = "signals.scorecard_auto"
 
     # --- Risk / مدیریت ریسک ---
     RISK_ACCOUNT_BALANCE = "risk.account_balance"
@@ -286,6 +293,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     SettingKey.AI_FREE_MODELS_ONLY.value: True,
     SettingKey.AI_CHAT_TIMEOUT.value: 120,
     SettingKey.AI_CHAT_MAX_TOOLS.value: 4,
+    SettingKey.AI_SPEED_PROFILE.value: "balanced",
     # پاسخ چت تکه‌تکه نمایش داده شود (مثل تایپ‌کردن) به‌جای انتظار
     # برای متن کامل. اگر سرویس جریان ندهد، خودکار به حالت عادی
     # برمی‌گردد، پس روشن‌بودنش بی‌خطر است.
@@ -328,6 +336,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     SettingKey.SCALP_MAX_SPREAD.value: 0.25,
     SettingKey.SCALP_SCAN_LIMIT.value: 25,
     SettingKey.SCALP_AI_REVIEW.value: True,
+    SettingKey.SCALP_TAKER_FEE.value: 0.0006,
     # پیش‌فرض «اطمینان»: کاربر خواست روی همهٔ ارزها تحلیل شود و هر
     # سیگنالی که اطمینانش از ۷۵٪ بالاتر رفت وارد معامله شود.
     SettingKey.AUTOTRADE_SOURCE.value: "confidence",
@@ -420,6 +429,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     SettingKey.SIGNAL_TRACK_OUTCOMES.value: True,
     SettingKey.SIGNAL_TRACK_INTERVAL.value: 180,
     SettingKey.SIGNAL_TRACK_BATCH.value: 60,
+    SettingKey.SIGNAL_SCORECARD_AUTO.value: False,
     # Risk
     SettingKey.RISK_ACCOUNT_BALANCE.value: 1000.0,
     SettingKey.RISK_PERCENT.value: 1.0,

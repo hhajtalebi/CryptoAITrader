@@ -521,6 +521,19 @@ class Application:
         )
         return api_key, api_secret
 
+
+    def ai_speed_limits(self) -> Any:
+        """سقف سرعت هوش مصنوعی. متعادل عددهای ذخیره‌شده را بازنویسی نمی‌کند."""
+        from ai.speed_profile import limits_for
+
+        return limits_for(self.settings)
+
+    def signal_ai_timeout(self) -> float:
+        """مهلت سیگنال، با رعایت پروفایل سرعت."""
+        from ai.speed_profile import signal_timeout_seconds
+
+        return signal_timeout_seconds(self.settings)
+
     def autonomous_agent(self) -> Any:
         """
         ساخت تنبل عامل خودمختار.
@@ -543,12 +556,13 @@ class Application:
         # سرویس انتخابی کاربر باید اول زنجیره باشد؛ وگرنه تولید سیگنال
         # هر بار اول سراغ سرویس‌های محلیِ خاموش می‌رود و کاربر معطل
         # شکست آن‌ها می‌ماند (همان «سیگنال با هوش مصنوعی خیلی کند است»).
+        limits = self.ai_speed_limits()
         self._autonomous_agent = AutonomousAgent(
             self._ai_manager,
             self._ai_toolset,
             self.risk_parameters(),
-            max_iterations=self.settings.get_int("ai.max_agent_steps", 8),
-            timeout_seconds=float(self.settings.get_int("ai.agent_timeout", 180)),
+            max_iterations=limits.agent_steps,
+            timeout_seconds=float(limits.agent_timeout),
             preferred_provider=str(self.settings.get("ai.provider", "") or "") or None,
         )
         logger.info("Autonomous agent created")
@@ -578,12 +592,13 @@ class Application:
         # سرویس انتخابی کاربر باید **اول** زنجیره باشد. بدون این، چت
         # هر بار از سرویس‌های محلی خاموش شروع می‌کرد و کاربر چند ثانیه
         # منتظر شکست آن‌ها می‌ماند تا نوبت به سرویس واقعی برسد.
+        limits = self.ai_speed_limits()
         self._chat_agent = ChatAgent(
             self._ai_manager,
             self._ai_toolset,
             self.risk_parameters(),
-            max_tool_calls=self.settings.get_int("ai.chat_max_tools", 4),
-            timeout_seconds=float(self.settings.get_int("ai.chat_timeout", 120)),
+            max_tool_calls=limits.chat_tools,
+            timeout_seconds=float(limits.chat_timeout),
             preferred_provider=str(self.settings.get("ai.provider", "") or "") or None,
         )
         logger.info("Chat agent created")
@@ -1054,7 +1069,7 @@ class Application:
         analyst = self.ai_analyst()
         if analyst is None:
             return signal
-        timeout = float(self.settings.get_int("signals.ai_timeout", 45) or 45)
+        timeout = self.signal_ai_timeout()
         try:
             from ai.agent.analyst import AnalysisRequest
 
@@ -1153,7 +1168,7 @@ class Application:
         """افزودن تحلیل نوشتاری فارسی به سیگنال."""
         from ai.agent.narrative import NarrativeWriter
 
-        timeout = float(self.settings.get_int("signals.ai_timeout", 45) or 45)
+        timeout = self.signal_ai_timeout()
         # ساخت تحلیل‌گر، مدیر ارائه‌دهنده‌ها را هم می‌سازد
         if self._ai_manager is None:
             self.ai_analyst()

@@ -97,25 +97,65 @@ class MarketDataEngine:
         await self._provider.connect()
         is_online = await self._provider.ping()
         self._update_status(ConnectionStatus.CONNECTED if is_online else ConnectionStatus.DISCONNECTED)
+        if is_online:
+            self._mark_rest_alive(True)
 
-        if self._websocket_enabled and self._provider.capabilities.supports_websocket and is_online:
-            # کلاینت را خود صرافی می‌سازد. پیش‌تر اینجا همیشه کلاینت LBank
-            # ساخته می‌شد و کاربرِ توبیت داده زندهٔ صرافی دیگری می‌گرفت.
+        # پینگ اول اگر شکست بخورد، سوکت را هم خاموش نمی‌کنیم. REST
+        # جایگزین است و سوکت باید دوباره تلاش کند، نه اینکه تا ری‌استارت
+        # هرگز شروع نشود.
+        if self._websocket_enabled:
+            await self.ensure_streaming()
+        logger.info("Market data engine started (online=%s)", is_online)
+
+    async def ensure_streaming(self) -> None:
+        """
+        شروع وب‌سوکت اگر هنوز شروع نشده باشد.
+
+        نبود کلاینت یا شکست شروع، برنامه را آفلاین نمی‌کند. REST می‌ماند.
+        """
+        if self._websocket is not None or not self._websocket_enabled:
+            return
+        capabilities = getattr(self._provider, "capabilities", None)
+        if capabilities is None or not getattr(capabilities, "supports_websocket", False):
+            return
+        try:
             client = self._provider.create_websocket_client(
                 on_ticker=self._handle_live_ticker,
                 on_candle=self._handle_live_candle,
                 on_status_change=self._handle_ws_status,
             )
-            if client is None:
-                logger.warning(
-                    "Exchange '%s' advertises WebSocket support but provides no client; "
-                    "falling back to REST polling",
-                    self._provider.name,
-                )
-            else:
-                self._websocket = client
-                await self._websocket.start()
-        logger.info("Market data engine started (online=%s)", is_online)
+        except Exception as exc:  # noqa: BLE001 - سوکت نباید بالا آمدن برنامه را بشکند
+            logger.warning("Live stream unavailable, using REST: %s", exc)
+            return
+        if client is None:
+            logger.warning(
+                "Exchange '%s' advertises WebSocket support but provides no client; "
+                "falling back to REST polling",
+                self._provider.name,
+            )
+            return
+        self._websocket = client
+        try:
+            await self._websocket.start()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Live stream start failed, using REST: %s", exc)
+            self._websocket = None
+
+    async def keepalive(self) -> bool:
+        """
+        نگه داشتن اتصال.
+
+        یک پینگ ناموفق بلافاصله آفلاین اعلام نمی‌شود؛ تحمل شکست REST
+        همان قانون قبلی است. سوکت افتاده هم اینجا دوباره راه می‌افتد.
+        """
+        await self.ensure_streaming()
+        try:
+            ok = await self._provider.ping()
+        except Exception:  # noqa: BLE001
+            self._mark_rest_alive(False)
+            return bool(self.is_online)
+        self._mark_rest_alive(bool(ok))
+        return bool(self.is_online)
 
     async def stop(self) -> None:
         """توقف کامل موتور و آزادسازی منابع."""
@@ -239,6 +279,9 @@ class MarketDataEngine:
         پایگاه داده در این مسیر انجام نمی‌شود تا فشار I/O ایجاد نکند.
         """
         self._live_tickers[ticker.symbol] = ticker
+        # تیک زنده یعنی داده می‌رسد. افتادن یک درخواست REST نباید
+        # برنامه‌ای را که قیمت لحظه‌ای دارد آفلاین نشان دهد.
+        self._mark_rest_alive(True)
         for listener in list(self._ticker_listeners):
             try:
                 listener(ticker)
@@ -351,6 +394,18 @@ class MarketDataEngine:
 
         return await self._deduplicated(cache_key, _fetch)
 
+
+    @staticmethod
+    def _ticker_is_fresh(ticker: Ticker, max_age: float = 15.0) -> bool:
+        """تیکر بدون زمان دیده‌شدن کهنه حساب نمی‌شود."""
+        import time
+
+        seen = int(getattr(ticker, "timestamp", 0) or 0)
+        if seen <= 0:
+            return True
+        stamp = seen / 1000.0 if seen > 10_000_000_000 else float(seen)
+        return time.time() - stamp <= max_age
+
     async def get_current_price(self, symbol: str) -> float:
         """
         قیمت لحظه‌ای یک نماد.
@@ -359,7 +414,7 @@ class MarketDataEngine:
         هرگز قیمت حدسی برگردانده نمی‌شود.
         """
         live = self._live_tickers.get(symbol)
-        if live is not None and live.last_price > 0:
+        if live is not None and live.last_price > 0 and self._ticker_is_fresh(live):
             return live.last_price
 
         cache_key = MarketCache.make_key("price", self._provider.name, symbol)
@@ -370,9 +425,27 @@ class MarketDataEngine:
         async def _fetch() -> float:
             price = await self._provider.get_current_price(symbol)
             self._cache.set(cache_key, price, ttl_seconds=3)
+            self._mark_rest_alive(True)
             return price
 
         return await self._deduplicated(cache_key, _fetch)
+
+    def peek_candles(self, symbol: str, timeframe: str, limit: int = 300) -> list[Candle]:
+        """
+        کندل‌های موجود در حافظه، بدون درخواست شبکه.
+
+        نمودار زنده نباید برای هر تیک قیمت، کل تاریخ را دوباره بکشد.
+        اگر چیزی در حافظه نباشد، فهرست خالی برمی‌گردد و REST جایگزین است.
+        """
+        count = limit or self._history_candles
+        cache_key = MarketCache.make_key("candles", self._provider.name, symbol, timeframe, count)
+        cached = self._cache.get(cache_key)
+        if cached:
+            return self._merge_live_candle(symbol, timeframe, list(cached))
+        live = self._live_candles.get((symbol, timeframe))
+        if live is None:
+            return []
+        return [live]
 
     async def get_all_tickers(self, *, max_age_seconds: float = 10.0) -> list[Ticker]:
         """
@@ -587,7 +660,7 @@ class MarketDataEngine:
         if timeframe:
             await self._websocket.unsubscribe_candles(symbol, timeframe)
 
-    async def set_watchlist_subscriptions(self, symbols: list[str], max_symbols: int = 12) -> None:
+    async def set_watchlist_subscriptions(self, symbols: list[str], max_symbols: int = 80) -> None:
         """
         هم‌گام‌سازی اشتراک‌ها با فهرست پیگیری کاربر.
 

@@ -30,10 +30,10 @@ from market.engine import MarketDataEngine
 logger = get_logger(__name__)
 
 #: فاصله زمانی نظرسنجی REST برای کل بازار (ثانیه)
-DEFAULT_POLL_INTERVAL = 5.0
+DEFAULT_POLL_INTERVAL = 2.0
 
 #: بیشینه نمادهایی که هم‌زمان روی WebSocket مشترک می‌شوند
-MAX_STREAMED_SYMBOLS = 20
+MAX_STREAMED_SYMBOLS = 80
 
 
 @dataclass
@@ -83,7 +83,7 @@ class LivePriceFeed:
         poll_interval: float = DEFAULT_POLL_INTERVAL,
     ) -> None:
         self._market = market
-        self._poll_interval = max(2.0, float(poll_interval))
+        self._poll_interval = max(0.5, float(poll_interval))
         self._prices: dict[str, PriceUpdate] = {}
         self._listeners: list[Callable[[dict[str, PriceUpdate]], None]] = []
         self._poll_task: asyncio.Task[None] | None = None

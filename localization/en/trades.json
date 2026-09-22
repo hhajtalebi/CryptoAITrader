@@ -84,6 +84,13 @@
     "source": "Symbol selection method",
     "source_confidence": "Scan all coins by confidence",
     "source_scalp": "Scalp (short-term volatility)",
-    "settings_saved": "Auto-trading settings saved"
+    "settings_saved": "Auto-trading settings saved",
+    "automatic": "Apply fast automatic profile",
+    "preset": "Net profit ${target}",
+    "economics": "Notional ${notional} • round-trip fee ${fee} • close at net ${target} (gross ${gross})",
+    "poll": "Monitor interval (seconds)",
+    "mode_label": "Order mode",
+    "confirm": "Live confirmation phrase",
+    "confirm_placeholder": "Type the confirmation phrase to allow live orders"
   }
 }

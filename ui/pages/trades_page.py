@@ -24,12 +24,15 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
+
+from trading.auto_trader import HARD_MAX_LEVERAGE
 
 from localization import Translator
 from ui.pages.base_page import BasePage
@@ -177,6 +180,16 @@ class TradesPage(BasePage):
         set_role(self.auto_state_label, "chip_warn")
         top.addWidget(self.auto_state_label)
 
+        self.auto_preset_combo = QComboBox()
+        for target in (3, 4, 5):
+            self.auto_preset_combo.addItem(
+                self.tr_.tr("trades.auto.preset", target=target), target
+            )
+        top.addWidget(self.auto_preset_combo)
+        self.auto_automatic_button = make_button(self.tr_.tr("trades.auto.automatic"))
+        self.auto_automatic_button.clicked.connect(self._emit_automatic_profile)
+        top.addWidget(self.auto_automatic_button)
+
         self.auto_toggle_button = make_button(
             self.tr_.tr("trades.auto.start"), primary=True
         )
@@ -252,8 +265,21 @@ class TradesPage(BasePage):
         self.auto_loss_input = _money(0.01, 10_000.0, 0.5)
 
         self.auto_leverage_input = QSpinBox()
-        self.auto_leverage_input.setRange(1, 25)
+        self.auto_leverage_input.setRange(1, int(HARD_MAX_LEVERAGE))
         self.auto_leverage_input.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.auto_poll_input = QDoubleSpinBox()
+        self.auto_poll_input.setRange(0.25, 60.0)
+        self.auto_poll_input.setSingleStep(0.25)
+        self.auto_poll_input.setDecimals(2)
+        self.auto_poll_input.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.auto_mode_combo = QComboBox()
+        self.auto_mode_combo.addItem(self.tr_.tr("trades.auto.mode_paper"), "paper")
+        self.auto_mode_combo.addItem(self.tr_.tr("trades.auto.mode_live"), "live")
+
+        self.auto_confirm_input = QLineEdit()
+        self.auto_confirm_input.setPlaceholderText(self.tr_.tr("trades.auto.confirm_placeholder"))
 
         self.auto_concurrent_input = QSpinBox()
         self.auto_concurrent_input.setRange(1, 10)
@@ -276,6 +302,9 @@ class TradesPage(BasePage):
             ("trades.auto.concurrent", self.auto_concurrent_input),
             ("trades.auto.min_confidence", self.auto_confidence_input),
             ("trades.auto.source", self.auto_source_combo),
+            ("trades.auto.poll", self.auto_poll_input),
+            ("trades.auto.mode_label", self.auto_mode_combo),
+            ("trades.auto.confirm", self.auto_confirm_input),
         )
         for index, (key, widget) in enumerate(fields):
             grid.addWidget(QLabel(self.tr_.tr(key)), index // 2, (index % 2) * 2)
@@ -315,6 +344,17 @@ class TradesPage(BasePage):
         )
         if index >= 0:
             self.auto_source_combo.setCurrentIndex(index)
+        if "scalp.mode" in values:
+            mode_index = self.auto_mode_combo.findData(str(values.get("scalp.mode") or "paper"))
+            if mode_index >= 0:
+                self.auto_mode_combo.setCurrentIndex(mode_index)
+        if "scalp.live_confirmation" in values:
+            self.auto_confirm_input.setText(str(values.get("scalp.live_confirmation") or ""))
+        if "scalp.poll_seconds" in values:
+            try:
+                self.auto_poll_input.setValue(float(values.get("scalp.poll_seconds") or 5.0))
+            except (TypeError, ValueError):
+                pass
 
     def collect_auto_settings(self) -> dict:
         """خواندن عددهای دستی برای ذخیره."""
@@ -326,11 +366,36 @@ class TradesPage(BasePage):
             "scalp.max_concurrent": self.auto_concurrent_input.value(),
             "scalp.min_confidence": self.auto_confidence_input.value(),
             "scalp.candidate_source": self.auto_source_combo.currentData(),
+            "scalp.poll_seconds": self.auto_poll_input.value(),
+            "scalp.mode": self.auto_mode_combo.currentData(),
+            "scalp.live_confirmation": self.auto_confirm_input.text().strip(),
         }
 
     def _emit_auto_settings(self) -> None:
         """اعلام تغییر عددها به کنترلر."""
         self.auto_settings_changed.emit(self.collect_auto_settings())
+
+    def _emit_automatic_profile(self) -> None:
+        """
+        پروفایل خیلی کوتاه: ۱۰ دلار، اهرم ۲۰۰، سود خالص ۳/۴/۵.
+
+        حالت سفارش و عبارت تأیید دست نمی‌خورند. اگر کاربر LIVE را
+        نوشته باشد، همین دکمه آن را پاک یا عوض نمی‌کند.
+        """
+        target = float(self.auto_preset_combo.currentData() or 3)
+        self.auto_margin_input.setValue(10)
+        self.auto_leverage_input.setValue(int(HARD_MAX_LEVERAGE))
+        self.auto_target_input.setValue(target)
+        self.auto_loss_input.setValue(target)
+        self.auto_concurrent_input.setValue(1)
+        self.auto_poll_input.setValue(0.4)
+        payload = self.collect_auto_settings()
+        payload.pop("scalp.mode", None)
+        payload.pop("scalp.live_confirmation", None)
+        payload["scalp.max_hold_seconds"] = 90
+        payload["scalp.taker_fee_rate"] = 0.0006
+        payload["scalp.settings_mode"] = "automatic"
+        self.auto_settings_changed.emit(payload)
 
     def _on_auto_toggle(self) -> None:
         """درخواست روشن یا خاموش کردن معاملهٔ خودکار."""
@@ -348,6 +413,7 @@ class TradesPage(BasePage):
         متن دکمه تنها منبع حقیقت برای «الان چه کاری انجام می‌شود» است،
         پس هر بار از روی وضعیت موتور نوشته می‌شود نه از روی حدس.
         """
+        self._auto_running = bool(running)
         if running:
             self.auto_toggle_button.setText(self.tr_.tr("trades.auto.stop"))
             self.auto_state_label.setText(self.tr_.tr("trades.auto.running"))
@@ -356,7 +422,15 @@ class TradesPage(BasePage):
             self.auto_toggle_button.setText(self.tr_.tr("trades.auto.start"))
             self.auto_state_label.setText(self.tr_.tr("trades.auto.stopped"))
             set_role(self.auto_state_label, "chip_warn")
-        self.auto_status_label.setText(detail or self.tr_.tr("trades.auto.hint"))
+        self.auto_status_label.setText(
+            detail or getattr(self, "_auto_economics", "") or self.tr_.tr("trades.auto.hint")
+        )
+
+    def set_auto_economics(self, text: str) -> None:
+        """نشاندن اقتصاد کارمزد روی همان برچسب وضعیت، بدون ردیف تازه."""
+        self._auto_economics = str(text or "")
+        if text and not getattr(self, "_auto_running", False):
+            self.auto_status_label.setText(self._auto_economics)
 
     def _build_filters(self) -> QWidget:
         """نوار فیلترها: بازهٔ تاریخ، نماد، جهت و وضعیت."""

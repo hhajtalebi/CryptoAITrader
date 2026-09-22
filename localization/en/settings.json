@@ -320,5 +320,9 @@
     "data_safe": "Your data (database, settings and accounts) is left untouched by an update."
   },
   "alerts_sound": "Alert sound",
-  "ai_get_key_at": "🔑 Get your API key at: {url}"
+  "ai_get_key_at": "🔑 Get your API key at: {url}",
+  "speed_profile": "AI speed profile",
+  "speed_fast": "Fast",
+  "speed_balanced": "Balanced",
+  "speed_deep": "Deep"
 }

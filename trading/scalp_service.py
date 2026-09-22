@@ -261,4 +261,5 @@ class ScalpService:
             daily_loss_limit=float(self._setting("scalp.daily_loss_limit", 20.0)),
             mode=str(self._setting("scalp.mode", "paper")),
             live_confirmation=str(self._setting("scalp.live_confirmation", "")),
+            fee_rate=float(self._setting("scalp.taker_fee_rate", 0.0006) or 0.0006),
         ).validated()

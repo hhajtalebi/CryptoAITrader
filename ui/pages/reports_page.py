@@ -10,6 +10,7 @@ from typing import Any
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QHBoxLayout,
     QLabel,
@@ -55,6 +56,7 @@ class ReportsPage(BasePage):
 
     #: کاربر خواست دفترچهٔ نتیجهٔ پیش‌بینی‌ها دوباره محاسبه شود
     scorecard_refresh_requested = Signal()
+    scorecard_auto_changed = Signal(bool)
 
     def __init__(self, translator: Translator, parent: Any = None) -> None:
         self._summary_rows: dict[str, KeyValueRow] = {}
@@ -114,6 +116,10 @@ class ReportsPage(BasePage):
         )
         self.scorecard_refresh_button.clicked.connect(self.scorecard_refresh_requested)
         top.addWidget(self.scorecard_refresh_button)
+        self.scorecard_auto_check = QCheckBox(self.tr_.tr("scorecard.auto"))
+        self.scorecard_auto_check.setChecked(False)
+        self.scorecard_auto_check.toggled.connect(self.scorecard_auto_changed.emit)
+        top.addWidget(self.scorecard_auto_check)
 
         self.scorecard_verdict_label = QLabel(self.tr_.tr("scorecard.no_data"))
         self.scorecard_verdict_label.setWordWrap(True)
@@ -139,6 +145,15 @@ class ReportsPage(BasePage):
 
         body.addStretch(1)
         return page
+
+    def set_scorecard_auto(self, enabled: bool) -> None:
+        """نشاندن تیک خودکار بدون اینکه دوباره سیگنال ذخیره بفرستد."""
+        box = getattr(self, "scorecard_auto_check", None)
+        if box is None:
+            return
+        box.blockSignals(True)
+        box.setChecked(bool(enabled))
+        box.blockSignals(False)
 
     def set_scorecard(self, report: dict[str, Any]) -> None:
         """نشاندن گزارش دفترچهٔ نتیجه روی جدول."""
