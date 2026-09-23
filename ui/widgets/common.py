@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QVBoxLayout,
-    QWidget,
+    QWidget,    QTableWidget,
 )
 
 from ui.widgets.charts_mini import ConfidenceRing
@@ -510,3 +510,107 @@ def center_numeric_inputs(root: QWidget) -> int:
         box.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.UpDownArrows)
         count += 1
     return count
+
+
+# ----------------------------------------------------------------------
+# جدول‌های مقاوم و ردیف واکنش‌گرا (v2.0 — صفحهٔ معاملهٔ خودکار و پیش‌بینی)
+# ----------------------------------------------------------------------
+
+def harden_table(
+    table: "QTableWidget",
+    *,
+    min_row_height: int = 30,
+    min_column_width: int = 72,
+    min_table_height: int = 180,
+    max_total_width: int = 2400,
+) -> "QTableWidget":
+    """
+    مقاوم‌سازی جدول در برابر فشرده‌شدن (خواستهٔ §۹).
+
+    قانون: جدول هرگز له نمی‌شود؛ اگر جا کم است، اسکرول عمودی و
+    افقی فعال می‌شود:
+      • حداقل ارتفاع ردیف و عرض ستون تضمین می‌شود
+      • عرض کل جدول دست‌کم به اندازهٔ مجموع ستون‌ها می‌رسد تا
+        اسکرول افقیِ صفحه کار کند، نه فشرده‌شدن ستون‌ها
+      • مرتب‌سازی روشن است؛ جست‌وجو/تمام‌صفحه از TableToolbar موجود
+        می‌آید (تکرار ساخته نمی‌شود)
+    """
+    from PySide6.QtWidgets import QAbstractItemView
+
+    header = table.horizontalHeader()
+    header.setMinimumSectionSize(min_column_width)
+    header.setDefaultSectionSize(min_column_width)
+    table.verticalHeader().setDefaultSectionSize(min_row_height)
+    table.verticalHeader().setMinimumSectionSize(min_row_height)
+    table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+    table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+    table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+    table.setSortingEnabled(True)
+    table.setMinimumHeight(min_table_height)
+    _fit_total_width(table, max_total_width=max_total_width)
+    return table
+
+
+def _fit_total_width(table: "QTableWidget", *, max_total_width: int) -> None:
+    """حداقل عرض جدول = مجموع ستون‌ها (سقف‌دار) — اسکرول افقی، نه له‌شدن."""
+    if table.columnCount() <= 0:
+        return
+    total = 0
+    for column in range(table.columnCount()):
+        total += max(table.columnWidth(column), table.horizontalHeader().minimumSectionSize())
+    table.setMinimumWidth(min(int(total) + 24, max_total_width))
+
+
+class ResponsiveRow(QWidget):
+    """
+    ردیف دو-پane‌ای که در عرض کم به‌صورت عمودی چیده می‌شود.
+
+    خواستهٔ §۱۰/§۱۱: در صفحهٔ بزرگ دو ستون (خلاصه | نمودار)، در
+    صفحهٔ کوچک زیر هم — بدون حذف هیچ داده‌ای.
+    """
+
+    def __init__(
+        self,
+        first: QWidget,
+        second: QWidget,
+        *,
+        breakpoint: int = 1100,
+        parent: QWidget | None = None,
+        stretch: tuple[int, int] = (3, 2),
+    ) -> None:
+        super().__init__(parent)
+        self._first = first
+        self._second = second
+        self._breakpoint = breakpoint
+        self._stretch = stretch
+        self._stacked: bool | None = None
+        self._apply(stacked=False)
+
+    def set_stacked(self, stacked: bool) -> None:
+        """تغییر چیدمان به عمودی (True) یا افقی (False)."""
+        self._apply(stacked=bool(stacked))
+
+    def _apply(self, *, stacked: bool) -> None:
+        """بازچینی بدون از دست رفتن ویجت‌ها."""
+        if stacked == self._stacked:
+            return
+        self._stacked = stacked
+        old = self.layout()
+        if old is not None:
+            while old.count():
+                item = old.takeAt(0)
+                widget = item.widget()
+                if widget is not None:
+                    widget.setParent(None)
+            QWidget().setLayout(old)  # حذف چیدمان قدیمی
+        layout = QHBoxLayout(self) if not stacked else QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+        layout.addWidget(self._first, self._stretch[0])
+        layout.addWidget(self._second, self._stretch[1])
+
+    def reflow(self, width: int) -> None:
+        """چیدمان را با عرض موجود هماهنگ کن."""
+        self.set_stacked(width < self._breakpoint)
+
+

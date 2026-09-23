@@ -13,7 +13,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -107,6 +107,14 @@ OUTCOME_TICK_MS = 30_000
 # فاصلهٔ پایش معاملات باز. قیمت از کش خوانده می‌شود؛ REST فقط وقتی
 # کش کهنه باشد. دو ثانیه برای بستن سریع اسکالپ کافی است.
 TRADE_MONITOR_TICK_MS = 2_000
+
+#: فاصلهٔ تازه‌سازی داشبورد ترمینال معاملهٔ خودکار (v2.0). خروج
+#: موقعیت‌ها تیک‌محور است؛ این تایمر فقط «نمایش» را تازه می‌کند.
+TERMINAL_UI_INTERVAL_MS = 1_000
+
+#: فاصلهٔ نوسازی Bid/Ask از دفتر سفارش (REST). تیک وب‌سوکت Bid/Ask
+#: ندارد؛ دفتر باید جداگانه بخواند و روی کش تیک لایه شود.
+ORDERBOOK_REFRESH_MS = 5_000
 # تازه‌سازی کندل‌ها. قیمت لحظه‌ای جداگانه و بدون redraw کامل می‌آید.
 LIVE_CHART_TICK_MS = 8_000
 
@@ -343,6 +351,32 @@ class MainController(QObject):
         )
         self.trades.auto_trade_toggled.connect(self.toggle_auto_trading)
         self.trades.auto_settings_changed.connect(self.save_auto_trade_settings)
+        # ---- ترمینال معاملهٔ خودکار (v2.0) ----
+        self.trades.auto_mode_changed.connect(self.change_auto_engine_mode)
+        self.trades.auto_symbol_changed.connect(self.on_auto_symbol_selected)
+        self.trades.close_position_requested.connect(self.close_auto_position)
+        self.trades.close_position_blocked.connect(
+            lambda: self._toast(
+                self.tr_.tr("trades.no_open_trade_selected"), level="warning"
+            )
+        )
+        self.trades.emergency_exit_requested.connect(self.emergency_exit_positions)
+        # v2.1 — ترمینال حرفه‌ای
+        self.trades.auto_timeframe_changed.connect(self.on_auto_timeframe_changed)
+        self.trades.opportunity_enter_requested.connect(self.on_opportunity_enter)
+        # v2.2 — ترمینال حرفه‌ای
+        self.trades.chart_indicators_changed.connect(self.on_chart_indicators_changed)
+        self.trades.scanner_settings_saved.connect(self.on_scanner_settings_saved)
+        self.trades.selected_symbols_saved.connect(self.on_selected_symbols_saved)
+        self.trades.ai_opinion_requested.connect(self.on_ai_opinion_requested)
+        self.trades.notice_requested.connect(
+            lambda message: self._toast(message)
+        )
+        self._terminal_timer = QTimer(self.window)
+        self._terminal_timer.setInterval(TERMINAL_UI_INTERVAL_MS)
+        self._terminal_timer.timeout.connect(self._refresh_auto_terminal)
+        self._terminal_timer.start()
+        self._terminal_stats_tick = 0
         # پنل باید از همان ابتدا تنظیم‌های واقعی کاربر را نشان دهد،
         # نه خط تیره؛ وگرنه معلوم نیست با چه هدفی معامله می‌شود.
         QTimer.singleShot(0, self._refresh_auto_trade_panel)
@@ -390,6 +424,7 @@ class MainController(QObject):
         self._started = True
         self.runner.start()
         self.analysis.apply_chart_palette(self.themes.palette)
+        self.trades.apply_chart_palette(self.themes.palette)
         self._populate_indicator_catalog()
         # کاربر گزارش کرد «اندیکاتورها در بخش اندیکاتورها نیستند». پنل
         # فهرست درست پر می‌شد، ولی جدول مقادیر تا وقتی دکمهٔ «تحلیل»
@@ -570,6 +605,20 @@ class MainController(QObject):
                 symbol = str(getattr(trade, "symbol", "") or "").strip().upper()
                 if symbol:
                     symbols.append(symbol)
+        # نماد پنل پیش‌بینیِ ترمینال + نمادهای حالت Selected (v2.0):
+        # بدون تیک این نمادها، نردبان و پایش فرصت کور می‌شود.
+        auto_symbol = str(getattr(self, "_auto_prediction_symbol", "") or "").strip().upper()
+        if auto_symbol:
+            symbols.append(auto_symbol)
+        try:
+            selected = str(
+                self.app.settings.get("scalp.selected_symbols", "") or ""
+            ).upper()
+            symbols.extend(
+                item.strip() for item in selected.replace(";", ",").split(",") if item.strip()
+            )
+        except Exception:  # noqa: BLE001
+            pass
         try:
             for row in self.app.trade_repository.open_trades(self.app.auth.user_id):
                 symbol = str((row or {}).get("symbol") or "").strip().upper()
@@ -972,6 +1021,9 @@ class MainController(QObject):
             self.analysis.set_symbols(unique)
             self.signals.set_symbols(unique)
             self.chat.set_symbols(unique)
+            # ترمینال معامله — با انتخاب نخستین نماد، نمودار و
+            # پیش‌بینی همان لحظه بار می‌شوند (سیگنال از خود کمبو).
+            self.trades.set_auto_symbols(unique)
 
             self._update_streamed_symbols()
 
@@ -4300,6 +4352,7 @@ class MainController(QObject):
 
         palette = self.themes.palette
         self.analysis.apply_chart_palette(palette)
+        self.trades.apply_chart_palette(palette)
         self.markets.set_palette(palette)
         self.window.apply_theme_tokens()
         # کارت پوستهٔ فعال در تنظیمات علامت می‌خورد
@@ -4359,6 +4412,7 @@ class MainController(QObject):
             self.app.auth.set_preference("ui.theme", key)
         palette = self.themes.palette
         self.analysis.apply_chart_palette(palette)
+        self.trades.apply_chart_palette(palette)
         self.markets.set_palette(palette)
         self.window.apply_theme_tokens()
         self.window.set_connection_indicator(
@@ -5090,14 +5144,37 @@ class MainController(QObject):
         confidence_source = ConfidenceCandidateSource(self.app)
 
         async def candidate_source() -> list:
-            """نامزدهای معامله بر پایهٔ منبعی که کاربر انتخاب کرده."""
-            mode = str(
+            """
+            نامزدهای معامله بر پایهٔ حالت موتور (خواستهٔ §۳).
+
+            selected → همان منبع قبلی، فقط نمادهای انتخابی کاربر
+            scan     → همان رفتار قبلی (کل بازار با فیلتر کاربر)
+            ai       → تحلیل نمادهای برتر با موتور پیش‌بینی + نردبان
+                       روند + تصمیم‌ساز AI؛ خروجی یا معاملهٔ کامل است
+                       یا NO TRADE با دلیل.
+            """
+            engine_mode = str(
+                self.app.settings.get("scalp.engine_mode", "scan") or "scan"
+            ).strip().lower()
+            source_mode = str(
                 self.app.settings.get("scalp.candidate_source", "confidence") or "confidence"
             ).strip().lower()
-            if mode == "confidence":
-                return await confidence_source.scan()
-            candidates = await service.scan()
-            return [c for c in candidates if service.feasibility(c)[0]]
+
+            if engine_mode == "ai":
+                return await self._ai_candidate_scan()
+
+            selected = self._auto_selected_symbols()
+            if source_mode == "confidence":
+                candidates = await confidence_source.scan()
+            else:
+                candidates = await service.scan()
+                candidates = [c for c in candidates if service.feasibility(c)[0]]
+            if engine_mode == "selected" and selected is not None:
+                candidates = [
+                    c for c in candidates
+                    if str(getattr(c, "symbol", "")).upper() in selected
+                ]
+            return candidates
 
         from trading.execution import build_gateway
 
@@ -5109,9 +5186,15 @@ class MainController(QObject):
             candidate_source=candidate_source,
             gateway=build_gateway(exchange),
             user_id=self.app.auth.user_id,
+            portfolio_source=self._portfolio_snapshot,
+            invalidation_source=self._prediction_direction,
         )
+        # مسیر تیک: هر تیک وب‌سوکت بلافاصله TP/SL/سر‌به‌سر/تریلینگ را
+        # می‌سنجد — پایش فقط fallback است (خواستهٔ §۶).
+        engine.attach_tick_engine(self._ensure_tick_engine())
         engine.add_listener(self._on_auto_trade_event)
         self._auto_trader_engine = engine
+        self._update_streamed_symbols()
         return engine
 
     def save_auto_trade_settings(self, values: dict) -> None:
@@ -5146,6 +5229,20 @@ class MainController(QObject):
             "scalp.mode",
             "scalp.live_confirmation",
             "scalp.poll_seconds",
+            # v2.0 — حالت‌ها و محافظ‌ها
+            "scalp.engine_mode",
+            "scalp.selected_symbols",
+            "scalp.min_liquidity",
+            "scalp.max_spread_percent",
+            "scalp.scan_interval_seconds",
+            "scalp.stale_after_seconds",
+            "scalp.slippage_percent",
+            "scalp.trailing_enabled",
+            "scalp.break_even_enabled",
+            "scalp.signal_invalidation",
+            "scalp.allocation_mode",
+            "scalp.allocation_percent",
+            "scalp.max_total_margin_percent",
         )
         values = {key: self.app.settings.get(key) for key in keys}
         if hasattr(self.trades, "load_auto_settings"):
@@ -5813,6 +5910,1278 @@ class MainController(QObject):
         from trading.scalp_service import ScalpService
 
         return ScalpService(self.app).build_trader_config()
+
+    # ------------------------------------------------------------------
+    # ترمینال معاملهٔ خودکار (v2.0) — کش تیک، نردبان، AI، داشبورد
+    # ------------------------------------------------------------------
+    def _ensure_tick_engine(self) -> Any:
+        """
+        ساخت (یک‌بار) کش تیک و اتصال آن به جریان وب‌سوکت.
+
+        هر تیک صرافی با سه مهر زمانی (صرافی/دریافت/پردازش) ثبت
+        می‌شود؛ سن داده و تأخیر از همین‌جا حساب می‌شود (خواستهٔ §۶).
+        شنونده روی نخ asyncio صدا زده می‌شود و فقط دادهٔ خام را
+        ثبت می‌کند — هیچ ویجتی لمس نمی‌شود.
+        """
+        existing = getattr(self, "_tick_engine", None)
+        if existing is not None:
+            return existing
+
+        from trading.price_cache import TickEngine
+
+        stale_after = float(
+            self.app.settings.get("scalp.stale_after_seconds", 10.0) or 10.0
+        )
+        engine = TickEngine(stale_after_seconds=max(1.0, stale_after))
+        self._tick_engine = engine
+
+        market = self.app.market
+        if market is not None:
+            market.add_ticker_listener(self._on_market_ticker)
+
+        # نوسازی دوره‌ای دفتر سفارش برای Bid/Ask — تیک وب‌سوکتِ این
+        # صرافی Bid/Ask ندارد؛ دفتر واقعی جداگانه خوانده و روی کش
+        # تیک لایه می‌شود.
+        self._orderbook_timer = QTimer(self.window)
+        self._orderbook_timer.setInterval(ORDERBOOK_REFRESH_MS)
+        self._orderbook_timer.timeout.connect(self._refresh_orderbooks)
+        self._orderbook_timer.start()
+        return engine
+
+    def _on_market_ticker(self, ticker: Any) -> None:
+        """تیک خام صرافی → کش تیک (نخ asyncio؛ بدون ویجت)."""
+        engine = getattr(self, "_tick_engine", None)
+        if engine is None:
+            return
+        try:
+            engine.record(
+                str(getattr(ticker, "symbol", "") or ""),
+                float(getattr(ticker, "last_price", 0.0) or 0.0),
+                source="websocket",
+                exchange_ts=int(getattr(ticker, "timestamp", 0) or 0),
+                change_percent=float(getattr(ticker, "change_percent", 0.0) or 0.0),
+            )
+        except Exception:  # noqa: BLE001 - تیک بد نباید جریان را ببندد
+            logger.debug("Tick record failed", exc_info=True)
+
+    def _refresh_orderbooks(self) -> None:
+        """
+        خواندن دفتر سفارش نمادهای مهم (نخ پس‌زمینه).
+
+        فقط نمادهای دارای موقعیت باز یا پنل پیش‌بینی/حالت Selected —
+        نه کل بازار؛ فشار شبکه کنترل‌شده می‌ماند.
+        """
+        if self.app.market is None or getattr(self, "runner", None) is None:
+            return
+        symbols = list(dict.fromkeys(self._stream_symbols()))
+        if not symbols:
+            return
+
+        async def refresh() -> None:
+            market = self.app.market
+            for symbol in symbols[:12]:
+                try:
+                    book = await market.get_orderbook(symbol, depth=5)
+                except Exception:  # noqa: BLE001
+                    continue
+                engine = getattr(self, "_tick_engine", None)
+                if engine is not None and book is not None:
+                    engine.record_book(symbol, book)
+
+        self.runner.submit(
+            "terminal-orderbook",
+            refresh(),
+            on_error=lambda message, exc=None: logger.debug(
+                "Orderbook refresh failed: %s", message
+            ),
+        )
+
+    def _auto_selected_symbols(self) -> list[str] | None:
+        """نمادهای حالت Selected؛ None یعبی حالت selected فعال نیست."""
+        engine_mode = str(
+            self.app.settings.get("scalp.engine_mode", "scan") or "scan"
+        ).strip().lower()
+        if engine_mode != "selected":
+            return None
+        raw = str(self.app.settings.get("scalp.selected_symbols", "") or "")
+        items = [
+            item.strip().upper()
+            for item in raw.replace(";", ",").split(",")
+            if item.strip()
+        ]
+        seen: list[str] = []
+        for item in items:
+            if item not in seen:
+                seen.append(item)
+        return seen
+
+    def _portfolio_snapshot(self) -> dict[str, Any]:
+        """
+        وضعیت پرتفوی برای موتور و تصمیم‌ساز AI.
+
+        موجودی از حساب متصل می‌آید؛ اگر حسابی نباشد از مجموع معاملات
+        کاغذی (صفر در بدترین حالت) — هیچ عددی از بیرون ساخته نمی‌شود.
+        """
+        engine = getattr(self, "_auto_trader_engine", None)
+        used_margin = 0.0
+        open_count = 0
+        if engine is not None:
+            used_margin = sum(
+                float(t.used_margin() or 0.0) for t in engine.open_trades
+            )
+            open_count = len(engine.open_trades)
+        else:
+            try:
+                rows = self.app.trade_repository.open_trades(self.app.auth.user_id)
+                open_count = len(rows)
+                used_margin = sum(
+                    float((row or {}).get("margin") or 0.0) for row in rows
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        balance = 0.0
+        try:
+            user_id = self.app.auth.user_id
+            account = (
+                self.app.exchange_accounts.default_account(user_id)
+                if user_id is not None
+                else None
+            )
+            if account is not None:
+                balance = float(account.get("total_value_usdt") or 0.0)
+        except Exception:  # noqa: BLE001
+            pass
+        stats = getattr(self, "_terminal_stats", {}) or {}
+        return {
+            "balance": balance,
+            "used_margin": used_margin,
+            "available_margin": max(0.0, balance - used_margin),
+            "open_count": open_count,
+            "daily_pnl": stats.get("daily_pnl", 0.0),
+            "win_rate": stats.get("win_rate", 0.0),
+        }
+
+    def _cached_prediction_dict(self, symbol: str) -> dict[str, Any] | None:
+        """گزارش کش‌شدهٔ موتور پیش‌بینی برای یک نماد (بدون بازمحاسبه)."""
+        engine = getattr(self.app, "prediction_engine", None)
+        if engine is None:
+            return None
+        try:
+            report = engine.report(str(symbol or "").upper())
+        except Exception:  # noqa: BLE001
+            return None
+        if report is None:
+            return None
+        try:
+            return report.to_dict()
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _prediction_direction(self, symbol: str) -> str:
+        """
+        جهت فعلی پیش‌بینی نماد (LONG/SHORT/"") برای ابطال سیگنال.
+
+        افق مرجع همان ۱۵ دقیقه است؛ اگر گزارش کش‌شده نباشد، رشتهٔ خالی
+        برمی‌گردد — یعنی «نمی‌دانم» و معامله بسته نمی‌شود.
+        """
+        payload = self._cached_prediction_dict(symbol)
+        if not payload:
+            return ""
+        from trading.ai_decider import direction_from_horizon, pick_horizon
+
+        horizon = pick_horizon(payload)
+        return direction_from_horizon(horizon) if horizon else ""
+
+    def change_auto_engine_mode(self, mode: str) -> None:
+        """تغییر حالت موتور (Selected/Scan/AI) از صفحهٔ معاملات."""
+        value = str(mode or "scan").strip().lower()
+        if value not in ("selected", "scan", "ai"):
+            return
+        try:
+            self.app.settings.set("scalp.engine_mode", value)
+        except Exception as exc:  # noqa: BLE001
+            self._on_error(self.tr_.tr("common.state.error"), exc)
+            return
+        engine = getattr(self, "_auto_trader_engine", None)
+        if engine is not None:
+            engine.apply_config(self._auto_trade_config())
+        self._update_streamed_symbols()
+        self._toast(self.tr_.tr("trades.auto.mode_changed", mode=value), level="info")
+
+    def on_auto_symbol_selected(self, symbol: str) -> None:
+        """نماد نمودار/پیش‌بینی ترمینال عوض شد — تیک، گزارش و کندل بده."""
+        clean = str(symbol or "").strip().upper()
+        self._auto_prediction_symbol = clean
+        self._auto_prediction_payload = None
+        if clean:
+            self._update_streamed_symbols()
+            self._run_auto_prediction(clean)
+            self._load_terminal_chart(clean, self._auto_timeframe())
+
+    def _auto_timeframe(self) -> str:
+        """تایم‌فریم فعلی نمودار ترمینال (پیش‌فرض ۱۵ دقیقه — ستاپ اسکلپ)."""
+        tf = str(getattr(self, "_terminal_timeframe", "") or "15m")
+        return tf if tf in ("1m", "5m", "15m", "1h", "4h") else "15m"
+
+    def on_auto_timeframe_changed(self, timeframe: str) -> None:
+        """تایم‌فریم نمودار ترمینال عوض شد — کندل تازه و اشتراک سوکت."""
+        tf = str(timeframe or "15m").strip().lower()
+        if tf not in ("1m", "5m", "15m", "1h", "4h"):
+            return
+        self._terminal_timeframe = tf
+        symbol = str(getattr(self, "_auto_prediction_symbol", "") or "").strip().upper()
+        if not symbol:
+            return
+        self._load_terminal_chart(symbol, tf)
+
+    def _load_terminal_chart(self, symbol: str, timeframe: str) -> None:
+        """
+        کندل‌های واقعی نمودار ترمینال (مرجع UI — §۳).
+
+        کندل + حجم از همان موتور بازار تحلیل می‌آید؛ هیچ داده‌ای
+        ساخته نمی‌شود. دادهٔ کم → پیام صادقانهٔ «بدون داده».
+        """
+        page = self.trades
+        if self.app.market is None or not symbol:
+            page.price_chart.show_placeholder()
+            return
+
+        async def load() -> list:
+            return list(
+                await self.app.market.get_candles(symbol, timeframe, limit=300)
+            )
+
+        def apply(candles: list) -> None:
+            # اگر کاربر نماد/تایم‌فریم را عوض کرده، نتیجهٔ کهنه را نکش
+            if symbol != str(
+                getattr(self, "_auto_prediction_symbol", "") or ""
+            ).upper() or timeframe != self._auto_timeframe():
+                return
+            if candles:
+                page.set_chart_candles(candles, timeframe, symbol)
+                # کندل‌ها برای محاسبهٔ اندیکاتورها نگه داشته می‌شوند
+                self._terminal_candles = list(candles)
+                self._mark_terminal_chart()
+                self._apply_chart_indicators()
+            else:
+                page.price_chart.show_placeholder()
+
+        self.runner.submit(
+            "terminal-chart",
+            load(),
+            on_success=apply,
+            on_error=lambda message, exc=None: logger.debug(
+                "Terminal chart load failed: %s", message
+            ),
+        )
+
+    def _mark_terminal_chart(self) -> None:
+        """
+        خطوط موقعیت و پیش‌بینی روی نمودار ترمینال (§۳).
+
+        ورود/SL مؤثر/TP از موقعیت‌های واقعی بازِ همان نماد؛ اگر
+        موقعیتی نیست، خطوط پاک می‌شوند تا نمودار دروغ نگوید.
+        """
+        page = self.trades
+        symbol = str(getattr(self, "_auto_prediction_symbol", "") or "").upper()
+        engine = getattr(self, "_auto_trader_engine", None)
+        entry = stop = None
+        targets: list[float] = []
+        if engine is not None and symbol:
+            for managed in engine.open_trades:
+                if managed.symbol == symbol:
+                    entry = managed.entry_price
+                    stop = (
+                        managed.effective_stop
+                        if managed.effective_stop > 0
+                        else managed.stop_price
+                    )
+                    if managed.target_price > 0:
+                        targets.append(managed.target_price)
+                    break
+        # خطوط مهم پیش‌بینی: P50 افق مرجع همان نماد (منبع واحد)
+        payload = getattr(self, "_auto_prediction_payload", None)
+        if payload:
+            horizons = payload.get("horizons") or []
+            if horizons:
+                quantiles = (horizons[0] or {}).get("quantiles") or {}
+                p50 = quantiles.get("p50")
+                if p50 and (entry is None or abs(float(p50) - entry) > 1e-9):
+                    targets.append(float(p50))
+        page.mark_chart_position(entry, stop, targets)
+
+    def on_opportunity_enter(self, symbol: str) -> None:
+        """
+        ورود دستی به فرصت انتخاب‌شدهٔ جدول (§۵ — ستون Action).
+
+        نامزدِ ذخیره‌شده از همان مسیر `open_trade` می‌گذرد؛ همهٔ
+        دروازه‌ها (دادهٔ تازه، اسپرد، نقدینگی، روند، ظرفیت) دوباره
+        سنجیده می‌شوند و ردِ مجدد ممکن و صادقانه است.
+        """
+        engine = getattr(self, "_auto_trader_engine", None)
+        clean = str(symbol or "").strip().upper()
+        if engine is None:
+            # موتور خاموش است — ورود ممکن نیست؛ پویش فقط «دید» است
+            self._toast(
+                self.tr_.tr("trades.auto.engine_required"),
+                level="warning",
+            )
+            return
+        candidate = engine.opportunity_candidate(clean)
+        if candidate is None:
+            # نامزد پویش پس‌زمینه (v2.2) — همان پروتکل موتور
+            candidate = (getattr(self, "_watch_candidates", {}) or {}).get(clean)
+        if candidate is None:
+            self._toast(
+                self.tr_.tr("trades.auto.blocked", reason="no_candidate"),
+                level="warning",
+            )
+            return
+
+        def done(result: Any) -> None:
+            if result is not None:
+                self._toast(
+                    self.tr_.tr("trades.auto.opened", symbol=clean,
+                                price=f"{getattr(result, 'entry_price', 0):,.6g}"),
+                    level="info",
+                )
+            else:
+                self._toast(
+                    self.tr_.tr(
+                        "trades.auto.blocked", reason="rejected_by_guards"
+                    ),
+                    level="warning",
+                )
+            self.refresh_trades()
+
+        self.runner.submit(
+            "auto-manual-enter",
+            engine.open_trade(candidate),
+            on_success=done,
+            on_error=self._on_error,
+        )
+
+    # ------------------------------------------------------------------
+    # v2.2 — اندیکاتورهای نمودار ترمینال
+    # ------------------------------------------------------------------
+    def on_chart_indicators_changed(self, state: dict) -> None:
+        """تیک اندیکاتور → محاسبه از کندل‌های واقعی همان نمودار."""
+        self._indicator_state = dict(state or {})
+        self._apply_chart_indicators()
+
+    def _apply_chart_indicators(self) -> None:
+        """
+        ترسیم/حذف اندیکاتورهای فعال روی نمودار ترمینال.
+
+        محاسبه از همان کتابخانهٔ اندیکاتورهای تحلیل (منبع واحد) روی
+        کندل‌های واقعیِ بارگذاری‌شده؛ دادهٔ کم → پیام صادقانه.
+        """
+        page = self.trades
+        state = getattr(self, "_indicator_state", {}) or {}
+        candles = getattr(self, "_terminal_candles", None) or []
+        timestamps = [float(c.timestamp) for c in candles]
+
+        specs = (
+            ("ema", "EMA 21", ("ema",)),
+            ("sma", "SMA 50", ("sma",)),
+            ("bb", "BB upper", ("upper",)),
+            ("bb", "BB lower", ("lower",)),
+        )
+        for key, name, output_keys in specs:
+            if state.get(key):
+                self._draw_terminal_indicator(
+                    page, key, name, output_keys, candles, timestamps
+                )
+            else:
+                page.price_chart.remove_overlay(name)
+
+    def _draw_terminal_indicator(
+        self,
+        page: Any,
+        key: str,
+        name: str,
+        output_keys: tuple[str, ...],
+        candles: list,
+        timestamps: list[float],
+    ) -> None:
+        """محاسبه و ترسیم یک اندیکاتور روی نمودار ترمینال."""
+        from indicators.trend import EMAIndicator, SMAIndicator
+        from indicators.volatility import BollingerBandsIndicator
+
+        try:
+            indicator = {
+                "ema": EMAIndicator,
+                "sma": SMAIndicator,
+                "bb": BollingerBandsIndicator,
+            }[key]()
+            result = indicator.calculate(candles, self._auto_timeframe())
+            for output_key in output_keys:
+                series = result.values.get(output_key)
+                if series:
+                    page.price_chart.set_overlay(
+                        name, timestamps, list(series)
+                    )
+        except Exception as exc:  # noqa: BLE001 - دادهٔ کم و …
+            self._toast(
+                self.tr_.tr("trades.auto.indicator_failed", name=name),
+                level="warning",
+            )
+            logger.debug("Terminal indicator %s failed: %s", name, exc)
+
+    # ------------------------------------------------------------------
+    # v2.2 — نظر هوش مصنوعی روی پنل تصمیم
+    # ------------------------------------------------------------------
+    def on_ai_opinion_requested(self, symbol: str) -> None:
+        """
+        درخواست تحلیل لحظه‌ای عامل هوش مصنوعی برای نماد نمودار.
+
+        همان عامل خودمختار صفحهٔ تحلیل (منبع واحد) روی همان نماد و
+        تایم‌فریمِ نمودار ترمینال؛ داده از ابزارهای واقعی می‌آید و
+        مدل فقط توضیح می‌دهد — عددسازی ممنوع (قواعد سند حاکم).
+        """
+        page = self.trades
+        agent = self.app.autonomous_agent()
+        if agent is None:
+            page.set_ai_opinion(
+                self.tr_.tr("analysis.ai_disabled"), failed=True
+            )
+            return
+        symbol = str(symbol or "").strip().upper()
+        timeframe = self._auto_timeframe()
+
+        def apply(outcome: Any) -> None:
+            page.set_ai_opinion(self._format_agent_outcome(outcome))
+
+        def failed(message: str, _exc: Exception | None = None) -> None:
+            page.set_ai_opinion(
+                self.tr_.tr("analysis.ai_failed", error=message), failed=True
+            )
+
+        self.runner.submit(
+            "terminal-ai-opinion",
+            agent.run(symbol, timeframe=timeframe),
+            on_success=apply,
+            on_error=failed,
+        )
+
+    # ------------------------------------------------------------------
+    # v2.2 — تنظیمات پویش و نمادهای انتخابی
+    # ------------------------------------------------------------------
+    def on_scanner_settings_saved(self, values: dict) -> None:
+        """ذخیرهٔ تنظیمات پویش (کلیدهای scalp.watch_*) + ریست تایمر."""
+        self.save_auto_trade_settings(dict(values or {}))
+        # شمارنده را صفر کن تا پویش تازه با فاصلهٔ تازه شروع شود
+        self._terminal_stats_tick = 0
+
+    def on_selected_symbols_saved(self, symbols: list) -> None:
+        """
+        نمادهای انتخابیِ تازه → تنظیمات + فهرست علاقه‌مندی‌ها.
+
+        خواستهٔ کاربر: همین لیست در دیتابیس به‌عنوان «نمادهای
+        مورد علاقهٔ من» ذخیره شود و همه‌جا (داشبورد/تحلیل/سیگنال)
+        قابل استفاده باشد — همان فهرست پیگیری (watchlist) سیستم.
+        """
+        chosen = [
+            str(s).strip().upper() for s in symbols or [] if str(s).strip()
+        ]
+        try:
+            self.app.settings.set("scalp.selected_symbols", ",".join(chosen))
+        except Exception as exc:  # noqa: BLE001
+            self._on_error(self.tr_.tr("common.state.error"), exc)
+            return
+
+        # همگام‌سازی با فهرست پیگیری دیتابیس
+        try:
+            repository = self.app.symbol_repository
+            exchange = str(self.app.settings.active_exchange or "")
+            current = set(repository.get_watchlist())
+            for symbol in chosen:
+                if symbol not in current:
+                    repository.add_to_watchlist(symbol, exchange)
+            for symbol in current - set(chosen):
+                repository.remove_from_watchlist(symbol, exchange)
+        except Exception:  # noqa: BLE001 - دیتابیس نباید ذخیره را بگیرد
+            logger.debug("Watchlist sync failed", exc_info=True)
+
+        self.refresh_auto_config()
+        self._update_streamed_symbols()
+        self._toast(
+            self.tr_.tr("trades.auto.picker_saved", count=len(chosen)),
+            level="success",
+        )
+
+    # ------------------------------------------------------------------
+    # v2.2 — پویش دائمی بازار برای جدول فرصت‌ها
+    # ------------------------------------------------------------------
+    def _run_watch_scan(self) -> None:
+        """
+        پویش پس‌زمینهٔ بازار حتی وقتی موتور معامله خاموش است.
+
+        خواستهٔ کاربر: «جدول فرصت‌ها همیشه خالی است» — چون فقط هنگام
+        اجرای موتور پر می‌شد. حالا همان پویش AI (موتور واحد) هر چند
+        ثانیه روی نمادهای پویش اجرا می‌شود و نامزدها را زنده نگه
+        می‌دارد؛ اجرا/عدم‌اجرای معامله همچنان فقط با موتور روشن.
+        """
+        if getattr(self, "_watch_scan_running", False):
+            return
+        if self.app.market is None:
+            return
+        self._watch_scan_running = True
+
+        def apply(candidates: list) -> None:
+            self._watch_scan_running = False
+            self._watch_candidates = {
+                str(getattr(c, "symbol", "") or ""): c for c in candidates or []
+            }
+            self._watch_rows = self._watch_rows_from_candidates(candidates or [])
+            engine = getattr(self, "_auto_trader_engine", None)
+            if not (engine is not None and engine.is_running and engine.opportunities()):
+                self.trades.set_opportunities(self._watch_rows)
+
+        def failed(_message: str, _exc: Exception | None = None) -> None:
+            self._watch_scan_running = False
+
+        self.runner.submit(
+            "terminal-watch-scan",
+            self._ai_candidate_scan(),
+            on_success=apply,
+            on_error=failed,
+        )
+
+    def _watch_rows_from_candidates(self, candidates: list) -> list[dict[str, Any]]:
+        """
+        تبدیل نامزدهای پویش به ردیف‌های جدول فرصت‌ها.
+
+        «قابل ورود» یعنی اطمینان ≥ آستانهٔ تنظیم‌شدهٔ کاربر و اسپرد
+        در محدوده — ورودِ واقعی همچنان دروازه‌های موتور را می‌گذرد.
+        """
+        min_confidence = float(
+            self.app.settings.get("scalp.watch_min_confidence", 70) or 70
+        )
+        max_spread = float(
+            self.app.settings.get("scalp.watch_max_spread", 0.25) or 0.25
+        )
+        cap = max(5, int(self.app.settings.get("scalp.watch_row_cap", 30) or 30))
+        rows: list[dict[str, Any]] = []
+        for candidate in candidates or []:
+            symbol = str(getattr(candidate, "symbol", "") or "")
+            if not symbol:
+                continue
+            score = float(getattr(candidate, "score", 0.0) or 0.0)
+            spread = float(getattr(candidate, "spread_percent", 0.0) or 0.0)
+            optional = lambda name: (  # noqa: E731 - خوانایی در نگاشت
+                getattr(candidate, name, None)
+            )
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "direction": str(getattr(candidate, "direction", "") or ""),
+                    "confidence": score,
+                    "probability": optional("probability"),
+                    "expected_move": optional("expected_move_percent"),
+                    "trend": "",
+                    "mtf": str(getattr(candidate, "mtf", "") or ""),
+                    "risk": optional("risk_reward"),
+                    "spread": spread,
+                    "liquidity": float(
+                        getattr(candidate, "turnover_24h", 0.0) or 0.0
+                    ),
+                    "score": score,
+                    "entry": optional("entry_price"),
+                    "tp": optional("take_profit"),
+                    "sl": optional("stop_loss"),
+                    "leverage": optional("leverage"),
+                    "margin": optional("margin"),
+                    "prediction": str(getattr(candidate, "prediction", "") or ""),
+                    "decision": "watch",
+                    "reason": "؛ ".join(
+                        str(r) for r in list(getattr(candidate, "reasons", []) or [])[:2]
+                    ),
+                    "actionable": score >= min_confidence and spread <= max_spread,
+                }
+            )
+        rows.sort(key=lambda row: float(row.get("score", 0.0) or 0.0), reverse=True)
+        return rows[:cap]
+
+    def _run_auto_prediction(self, symbol: str) -> None:
+        """
+        گزارش پیش‌بینی برای پنل تصمیم ترمینال (خواستهٔ §۲).
+
+        همان موتور واحد؛ فقط با تایم‌فریم‌های نردبان (4h/1h/15m/5m)
+        تا رژیم همهٔ پله‌ها موجود باشد. None صادقانه «داده نیست» است.
+        """
+        symbol = str(symbol or "").strip().upper()
+        page = self.trades
+        if not symbol or self.app.market is None:
+            page.update_prediction_summary(None)
+            return
+
+        async def compute() -> dict[str, Any] | None:
+            engine = self.app.prediction_engine
+            if engine is None:
+                return None
+            report = await engine.assess(
+                symbol, timeframes=("5m", "15m", "1h", "4h")
+            )
+            return report.to_dict() if report is not None else None
+
+        def apply(payload: dict[str, Any] | None) -> None:
+            if str(self._auto_prediction_symbol or "").upper() != symbol:
+                return  # کاربر نماد را عوض کرده؛ گزارش کهنه را نشان نده
+            self._auto_prediction_payload = payload
+            page.update_prediction_summary(self._enrich_auto_prediction(symbol, payload))
+
+        self.runner.submit(
+            "auto-prediction",
+            compute(),
+            on_success=apply,
+            on_error=lambda message, exc=None: logger.debug(
+                "Auto prediction failed: %s", message
+            ),
+        )
+
+    def _enrich_auto_prediction(
+        self, symbol: str, payload: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        """تزریق قیمت زنده و جهت 1m (از تیک‌ها) به گزارش موتور."""
+        if not payload:
+            return payload
+        result = dict(payload)
+        tick_engine = getattr(self, "_tick_engine", None)
+        quote = tick_engine.get(symbol) if tick_engine is not None else None
+        if quote is not None:
+            result["live_price"] = quote.last
+            # پلهٔ 1m از خود تیک‌ها — جهت میکرو برای ورود (خواستهٔ §۴)
+            history = tick_engine.history(symbol, limit=20)
+            prices = [price for _, price in history]
+            if len(prices) >= 5:
+                average = sum(prices) / len(prices)
+                last = prices[-1]
+                direction = (
+                    1 if last > average * 1.0002
+                    else (-1 if last < average * 0.9998 else 0)
+                )
+                regimes = dict(result.get("regimes") or {})
+                regimes["1m"] = {"regime": "live_tick", "direction": direction}
+                result["regimes"] = regimes
+        return result
+
+    def close_auto_position(self, trade_id: int) -> None:
+        """بستن یک موقعیت باز از جدول موقعیت‌های ترمینال."""
+        engine = getattr(self, "_auto_trader_engine", None)
+        if engine is not None:
+            for managed in engine.open_trades:
+                if int(getattr(managed, "trade_id", 0)) == int(trade_id):
+                    self.runner.submit(
+                        "auto-close-position",
+                        engine.close_trade(managed, "manual"),
+                        on_success=lambda _r: self.refresh_trades(),
+                        on_error=self._on_error,
+                    )
+                    return
+        self.close_paper_trade(trade_id)
+
+    def emergency_exit_positions(self) -> None:
+        """خروج اضطراری همهٔ موقعیت‌های موتور (دکمهٔ پانیک)."""
+        engine = getattr(self, "_auto_trader_engine", None)
+        if engine is None or not engine.open_trades:
+            self._toast(self.tr_.tr("trades.no_open_trade_selected"), level="warning")
+            return
+
+        def done(_records: Any) -> None:
+            self._toast(self.tr_.tr("trades.auto.emergency_done"), level="warning")
+            self.refresh_trades()
+
+        self.runner.submit(
+            "auto-emergency",
+            engine.emergency_exit_all("emergency"),
+            on_success=done,
+            on_error=self._on_error,
+        )
+
+    def _position_rows(self) -> list[dict[str, Any]]:
+        """
+        ردیف‌های جدول موقعیت‌های باز (خواستهٔ §۸).
+
+        منبع: موقعیت‌های زندهٔ موتور (با Bid/Ask و سن داده از کش تیک)
+        و در نبود موتور، معامله‌های بازِ مخزن. قالب‌بندی عدد اینجا
+        انجام می‌شود تا صفحه فقط نمایش بدهد.
+        """
+        tick_engine = getattr(self, "_tick_engine", None)
+        stale_after = float(
+            self.app.settings.get("scalp.stale_after_seconds", 10.0) or 10.0
+        )
+        fmt = self.tr_.format_number
+        rows: list[dict[str, Any]] = []
+
+        def quote_for(symbol: str) -> Any:
+            return tick_engine.get(symbol) if tick_engine is not None else None
+
+        engine = getattr(self, "_auto_trader_engine", None)
+        if engine is not None and engine.open_trades:
+            for managed in engine.open_trades:
+                quote = quote_for(managed.symbol)
+                price = float(getattr(quote, "last", 0.0) or 0.0)
+                if price <= 0:
+                    price = self._cached_symbol_price(managed.symbol, max_age=30.0)
+                if price <= 0:
+                    price = managed.entry_price
+                pnl = managed.unrealised(price)
+                notional = managed.margin * managed.leverage
+                age_ms = (
+                    float(getattr(quote, "age_ms", -1.0))
+                    if quote is not None else -1.0
+                )
+                stale = age_ms < 0 or age_ms > stale_after * 1000.0
+                duration = int(
+                    (datetime.now(UTC) - managed.opened_at).total_seconds()
+                )
+                exit_reason = ""
+                if managed.trailing_active:
+                    exit_reason = self.tr_.tr("trades.auto.pos_reason_trailing")
+                elif managed.break_even_armed:
+                    exit_reason = self.tr_.tr("trades.auto.pos_reason_breakeven")
+                rows.append(
+                    {
+                        "id": managed.trade_id,
+                        "symbol": managed.symbol,
+                        "side": managed.side,
+                        "side_text": self.tr_.tr(
+                            f"trades.sides.{managed.side}", managed.side
+                        ),
+                        "quantity_text": fmt(managed.quantity, 6),
+                        "entry_text": fmt(managed.entry_price, 4),
+                        "current_text": fmt(price, 4),
+                        "bid_text": fmt(float(getattr(quote, "bid", 0.0) or 0.0), 4)
+                        if quote is not None and quote.bid > 0 else "—",
+                        "ask_text": fmt(float(getattr(quote, "ask", 0.0) or 0.0), 4)
+                        if quote is not None and quote.ask > 0 else "—",
+                        "margin_text": fmt(managed.margin, 2),
+                        "notional_text": fmt(notional, 2),
+                        "leverage_text": f"{managed.leverage:g}×",
+                        "tp_text": fmt(managed.target_price, 4),
+                        "sl_text": fmt(managed.effective_stop, 4),
+                        "pnl": pnl,
+                        "pnl_text": f"{pnl:+.2f}",
+                        "pnl_percent_text": (
+                            f"{(pnl / managed.margin * 100):+.1f}٪"
+                            if managed.margin > 0 else "—"
+                        ),
+                        "duration_text": f"{duration // 60}:{duration % 60:02d}",
+                        "data_age_text": (
+                            self.tr_.tr("trades.auto.stale_data")
+                            if stale
+                            else f"{fmt(age_ms, 0)} ms"
+                            if age_ms >= 0
+                            else "—"
+                        ),
+                        "exit_reason_text": exit_reason or "—",
+                        "status_text": self.tr_.tr(
+                            "trades.auto.mode_live" if managed.mode == "live"
+                            else "trades.auto.mode_paper"
+                        ),
+                    }
+                )
+            return rows
+
+        try:
+            for record in self.app.trade_repository.open_trades(self.app.auth.user_id):
+                symbol = str((record or {}).get("symbol") or "")
+                quote = quote_for(symbol)
+                price = float(getattr(quote, "last", 0.0) or 0.0)
+                if price <= 0:
+                    price = self._cached_symbol_price(symbol, max_age=30.0)
+                entry = float((record or {}).get("entry_price") or 0.0)
+                quantity = float((record or {}).get("quantity") or 0.0)
+                side = str((record or {}).get("side") or "long")
+                sign = 1.0 if side == "long" else -1.0
+                pnl = (price - entry) * sign * quantity if price > 0 and entry > 0 else 0.0
+                margin = float((record or {}).get("margin") or 0.0)
+                leverage = float((record or {}).get("leverage") or 1.0) or 1.0
+                age_ms = (
+                    float(getattr(quote, "age_ms", -1.0))
+                    if quote is not None else -1.0
+                )
+                stale = age_ms < 0 or age_ms > stale_after * 1000.0
+                rows.append(
+                    {
+                        "id": (record or {}).get("id"),
+                        "symbol": symbol,
+                        "side": side,
+                        "side_text": self.tr_.tr(f"trades.sides.{side}", side),
+                        "quantity_text": fmt(quantity, 6) if quantity else "—",
+                        "entry_text": fmt(entry, 4) if entry else "—",
+                        "current_text": fmt(price, 4) if price else "—",
+                        "bid_text": fmt(float(getattr(quote, "bid", 0.0) or 0.0), 4)
+                        if quote is not None and quote.bid > 0 else "—",
+                        "ask_text": fmt(float(getattr(quote, "ask", 0.0) or 0.0), 4)
+                        if quote is not None and quote.ask > 0 else "—",
+                        "margin_text": fmt(margin, 2) if margin else "—",
+                        "notional_text": fmt(margin * leverage, 2) if margin else "—",
+                        "leverage_text": f"{leverage:g}×",
+                        "tp_text": fmt(float((record or {}).get("take_profit") or 0.0), 4)
+                        if (record or {}).get("take_profit") else "—",
+                        "sl_text": fmt(float((record or {}).get("stop_loss") or 0.0), 4)
+                        if (record or {}).get("stop_loss") else "—",
+                        "pnl": pnl,
+                        "pnl_text": f"{pnl:+.2f}",
+                        "pnl_percent_text": (
+                            f"{(pnl / margin * 100):+.1f}٪" if margin > 0 else "—"
+                        ),
+                        "duration_text": "—",
+                        "data_age_text": (
+                            self.tr_.tr("trades.auto.stale_data")
+                            if stale
+                            else f"{fmt(age_ms, 0)} ms"
+                            if age_ms >= 0
+                            else "—"
+                        ),
+                        "exit_reason_text": "—",
+                        "status_text": str((record or {}).get("status") or "open"),
+                    }
+                )
+        except Exception:  # noqa: BLE001
+            logger.debug("Open positions unavailable", exc_info=True)
+        return rows
+
+    def _risk_panel_data(self, portfolio: dict, tick_stats: dict) -> dict[str, Any]:
+        """
+        داده‌های پنل ریسک (مرجع UI — §۱۱) — همه از منابع واقعی.
+
+        زیان روزانه و سقف‌ها از موتور/تنظیم، افت سرمایه از منحنی
+        سهام مخزن، اسپرد/کهداتی از کش تیک. حکم نهایی بدترین حالتِ
+        خانه‌هاست؛ خودِ جلوی ورود را موتور می‌گیرد.
+        """
+        config = self._auto_trade_config()
+        engine = getattr(self, "_auto_trader_engine", None)
+        stats = getattr(self, "_terminal_stats", {}) or {}
+        daily_pnl = float(stats.get("daily_pnl", 0.0) or 0.0)
+        daily_limit = float(config.daily_loss_limit)
+        loss_used = max(0.0, -daily_pnl) / daily_limit if daily_limit > 0 else 0.0
+
+        # حداکثر افت از منحنی سهام واقعی مخزن
+        max_drawdown = 0.0
+        try:
+            curve = self.app.trade_repository.equity_curve(
+                user_id=self.app.auth.user_id,
+                starting_balance=float(portfolio.get("balance", 0.0) or 0.0),
+            )
+            peak = None
+            for _ts, value in curve or []:
+                value = float(value or 0.0)
+                peak = value if peak is None else max(peak, value)
+                if peak > 0:
+                    max_drawdown = max(max_drawdown, (peak - value) / peak)
+        except Exception:  # noqa: BLE001
+            pass
+
+        # ریسک اسپرد: بدترین اسپرد میان نمادهای دارای موقعیت/پنل
+        tick_engine = getattr(self, "_tick_engine", None)
+        worst_spread = 0.0
+        stale_count = 0
+        symbols = set()
+        if engine is not None:
+            symbols.update(t.symbol for t in engine.open_trades)
+        panel_symbol = str(
+            getattr(self, "_auto_prediction_symbol", "") or ""
+        ).upper()
+        if panel_symbol:
+            symbols.add(panel_symbol)
+        for symbol in symbols:
+            quote = tick_engine.get(symbol) if tick_engine is not None else None
+            if quote is None:
+                stale_count += 1
+                continue
+            worst_spread = max(worst_spread, float(quote.spread_percent or 0.0))
+            if tick_engine.is_stale(symbol):
+                stale_count += 1
+
+        balance = float(portfolio.get("balance", 0.0) or 0.0)
+        used = float(portfolio.get("used_margin", 0.0) or 0.0)
+        margin_usage = (used / balance * 100.0) if balance > 0 else 0.0
+        exposure = sum(
+            float(t.margin * t.leverage)
+            for t in (engine.open_trades if engine is not None else [])
+        )
+        open_count = int(portfolio.get("open_count", 0) or 0)
+
+        spread_ok = worst_spread <= float(config.max_spread_percent)
+        margin_ok = margin_usage <= float(config.max_total_margin_percent)
+        data_ok = stale_count == 0
+        loss_ok = loss_used < 1.0
+        capacity_ok = open_count < int(config.max_concurrent)
+        halted = engine is not None and bool(getattr(engine, "halted_reason", ""))
+
+        verdict_role = "chip_up"
+        if halted or not (loss_ok and capacity_ok):
+            verdict_role = "chip_down"
+        elif not (spread_ok and margin_ok and data_ok):
+            verdict_role = "chip_warn"
+        verdict_key = {
+            "chip_up": "trades.auto.risk_verdict_ok",
+            "chip_warn": "trades.auto.risk_verdict_warn",
+            "chip_down": "trades.auto.risk_verdict_block",
+        }[verdict_role]
+
+        return {
+            "daily_loss": f"{daily_pnl:+.2f}$ / {daily_limit:g}$",
+            "max_drawdown": f"{max_drawdown * 100:.1f}٪",
+            "exposure": self._money(exposure),
+            "margin_usage": f"{margin_usage:.0f}٪ / {float(config.max_total_margin_percent):g}٪",
+            "open_trades": f"{open_count} / {int(config.max_concurrent)}",
+            "risk_per_trade": f"{float(config.max_loss):g}$",
+            "leverage": f"{float(config.leverage):g}×",
+            "spread_risk": (
+                f"{worst_spread:.3f}٪"
+                if symbols
+                else self.tr_.tr("common.none", default="—")
+            ),
+            "liquidity_risk": (
+                "OK" if float(config.min_liquidity) > 0 else "—"
+            ),
+            "data_risk": (
+                self.tr_.tr("trades.auto.stale_data") if stale_count
+                else self.tr_.tr("common.online")
+            ),
+            "verdict": self.tr_.tr(verdict_key),
+            "verdict_role": verdict_role,
+        }
+
+    def _refresh_auto_terminal(self) -> None:
+        """
+        تازه‌سازی ترمینال (تایمر ۱ ثانیه — فقط نمایش).
+
+        خروج موقعیت‌ها تیک‌محور است و اینجا اتفاق نمی‌افتد؛ این متد
+        فقط آخرین وضعیت واقعی را روی کارت‌ها، قرص‌های هدر، نمودار،
+        پنل ریسک و جدول‌ها می‌نشیند.
+        """
+        try:
+            page = self.trades
+            engine = getattr(self, "_auto_trader_engine", None)
+            tick_engine = self._ensure_tick_engine()
+
+            # آمار سنگین (SQLite) هر ۵ تیک؛ بقیهٔ مقادیر هر تیک
+            self._terminal_stats_tick += 1
+            if self._terminal_stats_tick % 5 == 0:
+                try:
+                    statistics = self.app.trade_repository.statistics(
+                        user_id=self.app.auth.user_id
+                    )
+                    realised = float(engine.realised_today) if engine is not None else 0.0
+                    self._terminal_stats = {
+                        "daily_pnl": realised
+                        + float(statistics.get("total_pnl", 0.0) or 0.0),
+                        "win_rate": float(statistics.get("win_rate", 0.0) or 0.0),
+                    }
+                except Exception:  # noqa: BLE001
+                    pass
+            stats = getattr(self, "_terminal_stats", {}) or {}
+
+            portfolio = self._portfolio_snapshot()
+
+            # رژیم و روند از گزارش کش‌شدهٔ همان موتور واحد
+            auto_symbol = str(
+                getattr(self, "_auto_prediction_symbol", "") or ""
+            ).upper()
+            payload = self._cached_prediction_dict(auto_symbol) if auto_symbol else None
+            # روند (هم‌راستایی MTF) برای ردیف وضعیت زیر نمودار؛ رژیمِ
+            # کامل در پنل پیش‌بینی همان نماد نمایش داده می‌شود.
+            trend_text = "—"
+            if payload:
+                alignment = str((payload.get("multi_timeframe") or {}).get("alignment") or "")
+                trend_text = (
+                    self.tr_.tr(f"prediction.alignment.{alignment}", default=alignment)
+                    if alignment else "—"
+                )
+
+            market = self.app.market
+            websocket_ok = False
+            if market is not None:
+                from app.core.constants import ConnectionStatus
+
+                websocket_ok = market.websocket_status is ConnectionStatus.CONNECTED
+            tick_stats = tick_engine.stats()
+
+            # --- قرص آخرین تیک: زمان واقعی پردازش آخرین تیک ---
+            last_age = tick_stats.get("last_tick_age_ms")
+            tick_pill = {
+                "websocket": websocket_ok,
+                "avg_total_latency_ms": tick_stats.get("avg_total_latency_ms"),
+                "stale": bool(
+                    last_age is not None
+                    and float(last_age) > tick_engine.stale_after_ms
+                ),
+                "last_tick_text": "",
+            }
+            if last_age is not None:
+                processed_ago = float(last_age)
+                processed_at = datetime.now() - timedelta(milliseconds=processed_ago)
+                tick_pill["last_tick_text"] = self.tr_.tr(
+                    "trades.auto.hdr_tick",
+                    value=processed_at.strftime("%H:%M:%S") + f".{processed_at.microsecond // 1000:03d}",
+                )
+
+            # --- کارت‌های اطلاعاتی ۹گانه ---
+            risk = self._risk_panel_data(portfolio, tick_stats)
+            # ردیف‌های نمایشی: موتورِ در حال اجرا غنی‌تر است؛ وگرنه
+            # نامزدهای پویش پس‌زمینه (v2.2) جدول را زنده نگه می‌دارند.
+            engine_rows = engine.opportunities() if engine is not None else []
+            if engine is not None and engine.is_running and engine_rows:
+                opportunities = engine_rows
+            else:
+                opportunities = getattr(self, "_watch_rows", []) or []
+            page.set_auto_dashboard(
+                {
+                    "balance": self._money(portfolio.get("balance", 0.0)),
+                    "available": self._money(portfolio.get("available_margin", 0.0)),
+                    "used": self._money(portfolio.get("used_margin", 0.0)),
+                    "daily_pnl": f"{float(stats.get('daily_pnl', 0.0)):+.2f}$",
+                    "open_count": self._digits(portfolio.get("open_count", 0)),
+                    "opportunities": self._digits(len(opportunities)),
+                    "win_rate": "{}٪".format(
+                        self.tr_.format_number(float(stats.get("win_rate", 0.0) or 0.0), 0)
+                    ),
+                    "drawdown": str(risk.get("max_drawdown", "—")),
+                    "risk_status": str(risk.get("verdict", "—")),
+                }
+            )
+            page.set_tick_status(tick_pill)
+            page.set_paper_live(
+                bool(engine is not None and engine.config.is_live)
+                if engine is not None
+                else bool(self._auto_trade_config().is_live)
+            )
+            page.set_risk_panel(risk)
+            page.set_opportunities(opportunities)
+            page.set_open_positions(self._position_rows())
+
+            # --- پویش پس‌زمینهٔ فرصت‌ها (v2.2) ---
+            if bool(self.app.settings.get("scalp.watch_scan_enabled", True)):
+                interval = max(
+                    5,
+                    int(
+                        float(
+                            self.app.settings.get("scalp.watch_scan_interval", 20)
+                            or 20
+                        )
+                    ),
+                )
+                if self._terminal_stats_tick % interval == 0:
+                    self._run_watch_scan()
+            if self._terminal_stats_tick % 30 == 0:
+                page.set_scanner_values(
+                    {
+                        "watch_scan_enabled": self.app.settings.get(
+                            "scalp.watch_scan_enabled", True
+                        ),
+                        "watch_scan_interval": self.app.settings.get(
+                            "scalp.watch_scan_interval", 20
+                        ),
+                        "watch_min_confidence": self.app.settings.get(
+                            "scalp.watch_min_confidence", 70
+                        ),
+                        "watch_max_spread": self.app.settings.get(
+                            "scalp.watch_max_spread", 0.25
+                        ),
+                        "watch_row_cap": self.app.settings.get(
+                            "scalp.watch_row_cap", 30
+                        ),
+                    }
+                )
+
+            # --- نمودار: قیمت زنده، خطوط موقعیت/پیش‌بینی، وضعیت ---
+            if auto_symbol:
+                quote = tick_engine.get(auto_symbol)
+                if quote is not None and quote.last > 0:
+                    history = tick_engine.history(auto_symbol, limit=120)
+                    page.update_price_tick(
+                        auto_symbol,
+                        quote.last,
+                        [price for _, price in history],
+                    )
+                    page.set_chart_live_price(float(quote.last))
+                    stale = tick_engine.is_stale(auto_symbol)
+                    page.set_chart_status(
+                        price=self.tr_.format_number(float(quote.last), 4),
+                        trend=trend_text,
+                        age=(
+                            self.tr_.tr("trades.auto.stale_data")
+                            if stale
+                            else f"{self.tr_.format_number(float(quote.age_ms), 0)} ms"
+                        ),
+                        stale=stale,
+                    )
+                    self._mark_terminal_chart()
+                # بازخوانی دوره‌ای کندل — هر ۵ ثانیه (خواستهٔ رال‌تایم)
+                if self._terminal_stats_tick % 5 == 0:
+                    self._load_terminal_chart(auto_symbol, self._auto_timeframe())
+                # بازمحاسبهٔ دوره‌ای گزارش (موتور خودش کش دارد)
+                if self._terminal_stats_tick % 30 == 0:
+                    self._run_auto_prediction(auto_symbol)
+            elif not getattr(self, "_terminal_symbol_bootstrapped", False):
+                # هنوز نمادی انتخاب نشده — از تحلیل یا فهرست پیگیری.
+                # هر تیک امتحان می‌شود تا بازار بارگذاری شود؛ پس از
+                # نخستین موفقیت دیگر تلاش نمی‌کند.
+                try:
+                    symbol = self.analysis.symbol_combo.currentText().strip().upper()
+                except Exception:  # noqa: BLE001
+                    symbol = ""
+                if not symbol:
+                    watchlist = self._watchlist_symbols()
+                    symbol = watchlist[0] if watchlist else ""
+                if symbol:
+                    self._terminal_symbol_bootstrapped = True
+                    self._auto_prediction_symbol = symbol
+                    page.set_auto_symbol(symbol)
+                    self._run_auto_prediction(symbol)
+                    self._load_terminal_chart(symbol, self._auto_timeframe())
+        except Exception:  # noqa: BLE001 - تایمر نمایش نباید برنامه را ببندد
+            logger.debug("Auto terminal refresh failed", exc_info=True)
+
+    async def _ai_candidate_scan(self) -> list:
+        """
+        پویش حالت AI Auto (خواستهٔ §۳).
+
+        برای هر نماد برتر (تیک تازه + گردش بالا، تا سقف تنظیم‌شده):
+        گزارش موتور پیش‌بینی → نردبان روند → تصمیم‌ساز AI. خروجی فقط
+        نامزدهای کامل است؛ نامزدهای رد‌شده با دلیل در جدول فرصت‌ها
+        ثبت می‌شوند. هیچ داده‌ای ساخته نمی‌شود — گزارش نبود یعنی skip.
+        """
+        from trading.ai_decider import (
+            AICandidate,
+            PortfolioState,
+            decide as ai_decide,
+        )
+        from trading.trend_ladder import build_ladder
+
+        engine = getattr(self, "_auto_trader_engine", None)
+        tick_engine = getattr(self, "_tick_engine", None)
+        prediction_engine = getattr(self.app, "prediction_engine", None)
+        market = self.app.market
+        if market is None or prediction_engine is None or tick_engine is None:
+            return []
+
+        scan_limit = max(1, int(self.app.settings.get("scalp.scan_limit", 10) or 10))
+        symbols: list[str] = []
+        selected = self._auto_selected_symbols() or []
+        symbols.extend(selected)
+        for symbol in self._watchlist_symbols():
+            if symbol not in symbols:
+                symbols.append(symbol)
+        symbols = symbols[:scan_limit]
+
+        config = self._auto_trade_config()
+        portfolio_dict = self._portfolio_snapshot()
+        portfolio = PortfolioState(
+            balance=float(portfolio_dict.get("balance", 0.0) or 0.0),
+            used_margin=float(portfolio_dict.get("used_margin", 0.0) or 0.0),
+            open_count=int(portfolio_dict.get("open_count", 0) or 0),
+            max_concurrent=int(config.max_concurrent),
+            max_total_margin_percent=float(config.max_total_margin_percent),
+        )
+
+        candidates: list = []
+        for symbol in symbols:
+            quote = tick_engine.get(symbol)
+            if quote is None or quote.last <= 0 or tick_engine.is_stale(symbol):
+                continue
+            try:
+                ticker = await market.get_ticker(symbol)
+                turnover = float(getattr(ticker, "turnover_24h", 0.0) or 0.0)
+            except Exception:  # noqa: BLE001
+                turnover = 0.0
+
+            # گزارش همان موتور واحد — با کش خودش (REPORT_TTL)
+            report = await prediction_engine.assess(
+                symbol, timeframes=("5m", "15m", "1h", "4h")
+            )
+            if report is None:
+                continue
+            payload = report.to_dict()
+            ladder = build_ladder(
+                symbol,
+                regimes=payload.get("regimes"),
+                tick_history=[
+                    (ts, price)
+                    for ts, price in tick_engine.history(symbol, limit=30)
+                ],
+            )
+
+            decision = ai_decide(
+                symbol=symbol,
+                report=payload,
+                ladder=ladder,
+                quote=quote,
+                turnover_24h=turnover,
+                portfolio=portfolio,
+                min_confidence=float(
+                    self.app.settings.get("scalp.min_confidence", 55) or 55
+                ),
+                min_liquidity=float(config.min_liquidity),
+                max_spread_percent=float(config.max_spread_percent),
+                allocation_mode=str(config.allocation_mode),
+                base_margin=float(config.margin_per_trade),
+                max_leverage=float(config.leverage),
+                trend_policy=str(config.trend_conflict_policy),
+                stale_after_ms=float(config.stale_after_seconds) * 1000.0,
+            )
+            if not decision.ok:
+                if engine is not None:
+                    horizons_all = payload.get("horizons") or []
+                    first_horizon = horizons_all[0] if horizons_all else {}
+                    engine.note_rejected(
+                        symbol=symbol,
+                        direction=str(
+                            (first_horizon or {}).get("direction", "") or ""
+                        ).upper().replace("BULLISH", "LONG").replace("BEARISH", "SHORT"),
+                        confidence=float(
+                            (first_horizon or {}).get("confidence", 0.0) or 0.0
+                        ),
+                        reason=decision.reason,
+                        turnover_24h=turnover,
+                        trend_ladder=ladder,
+                    )
+                continue
+
+            horizons = payload.get("horizons") or []
+            prediction_text = ""
+            probability = 0.0
+            expected_move = 0.0
+            if horizons:
+                first = horizons[0]
+                probability = float(first.get("probability", 0.0) or 0.0)
+                prediction_text = "{} {}٪".format(
+                    str(first.get("direction", "")), self.tr_.format_number(probability, 0)
+                )
+                # حرکت موردانتظار: پ50 افق نسبت به قیمت زنده
+                p50 = float((first.get("quantiles") or {}).get("p50", 0.0) or 0.0)
+                if p50 > 0 and quote.last > 0:
+                    expected_move = (p50 / quote.last - 1.0) * 100.0
+            candidates.append(
+                AICandidate(
+                    symbol=symbol,
+                    price=quote.last,
+                    direction=decision.direction,
+                    score=decision.confidence,
+                    turnover_24h=turnover,
+                    spread_percent=quote.spread_percent,
+                    entry_price=decision.entry_price,
+                    margin=decision.margin,
+                    leverage=decision.leverage,
+                    take_profit=decision.take_profit,
+                    stop_loss=decision.stop_loss,
+                    prediction=prediction_text,
+                    trend_ladder=ladder,
+                    reasons=list(decision.reasons),
+                    probability=probability,
+                    expected_move_percent=round(expected_move, 3),
+                    mtf=str(
+                        (payload.get("multi_timeframe") or {}).get("alignment") or ""
+                    ),
+                    risk_reward=round(decision.risk_reward, 2),
+                )
+            )
+        return candidates
 
     def _market_reachable(self) -> bool:
         """آنلاین اگر REST سالم باشد یا قیمت تازه از سوکت آمده باشد."""

@@ -78,11 +78,17 @@ class PriceChart(QWidget):
         self._palette = dict(palette or {})
         self._overlay_curves: dict[str, pg.PlotDataItem] = {}
         self._level_lines: list[pg.InfiniteLine] = []
+        #: خطوط سیگنال (ورود/SL/TP) — جدا از سطوح، برای به‌روزرسانی مکرر
+        self._signal_lines: list[pg.InfiniteLine] = []
         self._timeframe = "1h"
         self._chart_type = "candles"
         self._candles: list[Candle] = []
         self._user_zoomed = False
         self._last_price: float | None = None
+        # خط‌کشی کاربر (v2.2)
+        self._draw_mode = ""
+        self._draw_items: list[Any] = []
+        self._draw_pending: list[tuple[float, float]] = []
 
         pg.setConfigOptions(antialias=True)
 
@@ -142,6 +148,14 @@ class PriceChart(QWidget):
         self.price_plot.getViewBox().sigRangeChangedManually.connect(self._on_manual_range)
 
         self.price_plot.scene().sigMouseMoved.connect(self._on_mouse_moved)
+        # نشانگر نقطهٔ اول خط روند + کلیک خط‌کشی (v2.2)
+        self.draw_marker = pg.ScatterPlotItem(
+            [], [], size=9,
+            pen=pg.mkPen(None), brush=pg.mkBrush("#a78bfa"),
+        )
+        self.draw_marker.setVisible(False)
+        self.price_plot.addItem(self.draw_marker, ignoreBounds=True)
+        self.price_plot.scene().sigMouseClicked.connect(self._on_chart_clicked)
 
         layout.addWidget(self.price_plot, 1)
         layout.addWidget(self.volume_plot)
@@ -257,7 +271,9 @@ class PriceChart(QWidget):
         """
         علامت‌گذاری ورود، حد ضرر و اهداف روی نمودار.
 
-        این خطوط هم مثل سطوح، جزو خطوط قابل پاک‌شدن هستند.
+        فراخوانی مکرر مجاز است: خطوط سیگنالِ قبلی پاک می‌شوند ولی
+        سطوح حمایت/مقاومت دست‌نخورده می‌مانند (ترمینال معاملهٔ خودکار
+        همین را هر ثانیه صدا می‌زند).
         """
         specs: list[tuple[float, str, str]] = []
         if entry is not None:
@@ -267,6 +283,7 @@ class PriceChart(QWidget):
         for index, target in enumerate(targets or [], start=1):
             specs.append((target, f"TP{index}", self._palette.get("success", "#22c55e")))
 
+        self._clear_signal_lines()
         for price, label, color in specs:
             line = pg.InfiniteLine(
                 pos=float(price),
@@ -277,7 +294,7 @@ class PriceChart(QWidget):
                 labelOpts={"position": 0.9, "color": color, "movable": False},
             )
             self.price_plot.addItem(line, ignoreBounds=True)
-            self._level_lines.append(line)
+            self._signal_lines.append(line)
 
     # ------------------------------------------------------------------
     # وضعیت نمایش
@@ -285,6 +302,83 @@ class PriceChart(QWidget):
     def _on_manual_range(self, *_args: Any) -> None:
         """کاربر خودش زوم یا جابه‌جا کرد — از این پس دامنه را حفظ کن."""
         self._user_zoomed = True
+
+    # ------------------------------------------------------------------
+    # ابزار خط‌کشی (v2.2)
+    # ------------------------------------------------------------------
+    def set_draw_mode(self, mode: str) -> None:
+        """
+        فعال/غیرفعال کردن حالت خط‌کشی روی نمودار.
+
+        حالت‌ها: "" (خاموش)، "hline" (خط افقی با هر کلیک)،
+        "trend" (خط روند با دو کلیک). خطوطِ کشیده‌شده ملکی از
+        کاربرند و با تازه‌شدن کندل پاک نمی‌شوند.
+        """
+        self._draw_mode = mode if mode in ("", "hline", "trend") else ""
+        self._draw_pending: list[tuple[float, float]] = []
+        # در حالت خط‌کشی، درگِ ماوس نباید نمودار را جابه‌جا کند
+        self.price_plot.setMouseEnabled(
+            x=self._draw_mode == "", y=self._draw_mode == ""
+        )
+
+    def draw_count(self) -> int:
+        """شمار خطوط کشیده‌شده (برای آزمون‌ها و دکمهٔ پاک‌کردن)."""
+        return len(self._draw_items)
+
+    def clear_drawings(self) -> None:
+        """پاک‌کردن همهٔ خطوط کاربر."""
+        for item in self._draw_items:
+            try:
+                self.price_plot.removeItem(item)
+            except Exception:  # noqa: BLE001 - آیتم حذف‌شده
+                pass
+        self._draw_items = []
+        self._draw_pending = []
+        self.draw_marker.setVisible(False)
+
+    def _add_hline(self, y: float) -> None:
+        """خط افقی در قیمت کلیک‌شده — مثل تریدینگ‌ویو."""
+        line = pg.InfiniteLine(
+            angle=0,
+            movable=True,
+            pen=pg.mkPen(self._palette.get("accent", "#a78bfa"), width=2),
+        )
+        line.setPos(y)
+        self.price_plot.addItem(line, ignoreBounds=True)
+        self._draw_items.append(line)
+
+    def _add_trend(self, start: tuple[float, float], end: tuple[float, float]) -> None:
+        """خط روند بین دو نقطهٔ کلیک‌شده."""
+        curve = pg.PlotDataItem(
+            [start[0], end[0]], [start[1], end[1]],
+            pen=pg.mkPen(self._palette.get("accent", "#a78bfa"), width=2),
+        )
+        self.price_plot.addItem(curve, ignoreBounds=True)
+        self._draw_items.append(curve)
+
+    def _on_chart_clicked(self, position: Any) -> None:
+        """کلیک در حالت خط‌کشی."""
+        if not self._draw_mode:
+            return
+        if not self.price_plot.sceneBoundingRect().contains(position):
+            return
+        point = self.price_plot.getPlotItem().vb.mapSceneToView(position)
+        if self._draw_mode == "hline":
+            self._add_hline(float(point.y()))
+            return
+        # trend: دو کلیک
+        self._draw_pending.append((float(point.x()), float(point.y())))
+        if len(self._draw_pending) == 1:
+            self.draw_marker.setPos(point)
+            self.draw_marker.setVisible(True)
+        else:
+            self._add_trend(self._draw_pending[0], self._draw_pending[1])
+            self._draw_pending = []
+            self.draw_marker.setVisible(False)
+
+    def screenshot_pixmap(self) -> Any:
+        """عکس‌لحظه‌ای از کل نمودار (قیمت + حجم) به‌صورت QPixmap."""
+        return self.grab()
 
     def reset_zoom(self) -> None:
         """بازگشت به نمای خودکار (دکمهٔ «تناسب صفحه»)."""
@@ -350,6 +444,7 @@ class PriceChart(QWidget):
         for name in list(self._overlay_curves):
             self.remove_overlay(name)
         self._clear_levels()
+        self._clear_signal_lines()
         self._label.setText("")
 
     def show_placeholder(self) -> None:
@@ -388,6 +483,12 @@ class PriceChart(QWidget):
         for line in self._level_lines:
             self.price_plot.removeItem(line)
         self._level_lines.clear()
+
+    def _clear_signal_lines(self) -> None:
+        """حذف خطوط سیگنال (ورود/SL/TP) — بدون دست‌زدن به سطوح."""
+        for line in self._signal_lines:
+            self.price_plot.removeItem(line)
+        self._signal_lines.clear()
 
     def _on_mouse_moved(self, position: Any) -> None:
         """

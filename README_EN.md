@@ -2,7 +2,7 @@
 
 **Professional desktop app for crypto market analysis and futures signal generation**
 
-Version 2.0.0 · Windows 10/11 · Python 3.11+ (tested up to 3.13) · Persian & English
+Version 2.2.0 · Windows 10/11 · Python 3.11+ (tested up to 3.13) · Persian & English
 
 [راهنمای فارسی](README.md)
 
@@ -98,6 +98,7 @@ python main.py --log-level DEBUG    # Verbose logging
 | **Analysis** | Candlestick chart with volume, moving averages, key levels, indicator table, AI narrative |
 | **Signals** | Multi-timeframe signal generation and full history |
 | **Predictions** | The predictive intelligence report: horizons, regimes, scenarios, warnings, what changed, and recorded accuracy |
+| **Trading** | Professional auto-trading terminal: 9 icon-topped capital cards, live candlestick chart (1m–4h) with EMA/SMA/Bollinger overlays, drawing tools, PNG snapshot and icon-based symbol menu; prediction panel with on-demand AI analysis; always-live 17-column opportunity scanner (runs even with the engine off) with modal settings; 19-column open positions with per-row Close button and details modal; 10-cell risk panel; favorite symbols via searchable checkable picker stored in the database |
 | **Reports** | Build a report over a date range and export it in five formats |
 | **Settings** | Language, theme, exchange, AI, risk parameters, backup and restore |
 | **Help** | Concept explanations and FAQ |
@@ -173,11 +174,11 @@ CryptoAITrader/
 ├── backup/                  Backup and restore
 ├── localization/{fa,en}/    Translations
 ├── ui/                      GUI
-│   ├── pages/               7 pages
+│   ├── pages/               11 pages
 │   ├── charts/              Candlestick chart
 │   └── controllers/         Wires the UI to the engines
 ├── migrations/              Alembic migrations
-├── tests/                   92 tests
+├── tests/                   84 test files (2,270 tests)
 ├── scripts/                 Build and run scripts
 └── docs/                    Documentation
 ```
@@ -207,7 +208,7 @@ scripts/run_tests.sh          # Linux/macOS
 python -m pytest tests -q     # Windows
 ```
 
-92 tests covering indicators, risk engine, signal engine, AI response validation, timeframes, localization, backup, reporting, and async execution.
+2,270 tests across 84 files covering indicators, risk engine, signal engine, AI response validation, timeframes, localization, backup, reporting, async execution, and the auto-trading terminal.
 
 ---
 
