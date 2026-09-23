@@ -136,6 +136,48 @@ class SettingKey(str, Enum):
     AUTOTRADE_MIN_CONFIDENCE = "scalp.min_confidence"
     #: چند نماد برتر در هر دور پویش بررسی شود
     AUTOTRADE_SCAN_SYMBOLS = "scalp.scan_symbols"
+    # --- v2.0: حالت‌ها و محافظ‌های رویدادمحور ---
+    #: حالت موتور: selected | scan | ai (خواستهٔ §۳)
+    AUTOTRADE_ENGINE_MODE = "scalp.engine_mode"
+    #: نمادهای حالت Selected — جداشده با ویرگول
+    AUTOTRADE_SELECTED_SYMBOLS = "scalp.selected_symbols"
+    #: فاصلهٔ پویش ورود (ثانیه) — جدا از پایش خروج تیک‌محور
+    AUTOTRADE_SCAN_INTERVAL = "scalp.scan_interval_seconds"
+    #: حداقل گردش ۲۴ ساعته برای ورود (دلار)
+    AUTOTRADE_MIN_LIQUIDITY = "scalp.min_liquidity"
+    #: بیشترین اسپرد ورود (درصد)
+    AUTOTRADE_MAX_SPREAD_PERCENT = "scalp.max_spread_percent"
+    #: سن مجاز دادهٔ بازار (ثانیه) — کهنه‌تر = STALE و ورود ممنوع
+    AUTOTRADE_STALE_AFTER = "scalp.stale_after_seconds"
+    #: پویش پس‌زمینهٔ فرصت‌ها حتی وقتی موتور خاموش است (v2.2)
+    AUTOTRADE_WATCH_SCAN_ENABLED = "scalp.watch_scan_enabled"
+    #: فاصلهٔ پویش پس‌زمینه (ثانیه)
+    AUTOTRADE_WATCH_SCAN_INTERVAL = "scalp.watch_scan_interval"
+    #: حداقل اطمینان برای «قابل ورود» در پویش
+    AUTOTRADE_WATCH_MIN_CONFIDENCE = "scalp.watch_min_confidence"
+    #: بیشترین اسپرد مجاز در پویش (درصد)
+    AUTOTRADE_WATCH_MAX_SPREAD = "scalp.watch_max_spread"
+    #: بیشترین ردیف جدول فرصت‌های پویش
+    AUTOTRADE_WATCH_ROW_CAP = "scalp.watch_row_cap"
+    #: لغزش تقریبی هر اجرا (درصد، علیه ما)
+    AUTOTRADE_SLIPPAGE = "scalp.slippage_percent"
+    #: سر‌به‌سر خودکار بعد از پوشش هزینه‌ها
+    AUTOTRADE_BREAK_EVEN = "scalp.break_even_enabled"
+    AUTOTRADE_BREAK_EVEN_TRIGGER = "scalp.break_even_trigger"
+    #: تریلینگ حد ضرر
+    AUTOTRADE_TRAILING = "scalp.trailing_enabled"
+    AUTOTRADE_TRAILING_ACTIVATION = "scalp.trailing_activation"
+    AUTOTRADE_TRAILING_OFFSET = "scalp.trailing_offset"
+    #: بستن خودکار وقتی جهت پیش‌بینی برمی‌گردد
+    AUTOTRADE_SIGNAL_INVALIDATION = "scalp.signal_invalidation"
+    #: سیاست تضاد روند: block | penalize
+    AUTOTRADE_TREND_POLICY = "scalp.trend_conflict_policy"
+    #: حالت تخصیص سرمایه (خواستهٔ §۱۲)
+    AUTOTRADE_ALLOCATION_MODE = "scalp.allocation_mode"
+    #: پارامتر درصدی حالت percent
+    AUTOTRADE_ALLOCATION_PERCENT = "scalp.allocation_percent"
+    #: سقف مجموع مارجین باز نسبت به موجودی (درصد)
+    AUTOTRADE_MAX_TOTAL_MARGIN = "scalp.max_total_margin_percent"
     UI_TIMEZONE = "ui.timezone"
     EXCHANGE_ACTIVE = "exchange.active"
     MARKET_MANUAL_TOMAN_RATE = "market.manual_toman_rate"
@@ -342,6 +384,30 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     SettingKey.AUTOTRADE_SOURCE.value: "confidence",
     SettingKey.AUTOTRADE_MIN_CONFIDENCE.value: 75,
     SettingKey.AUTOTRADE_SCAN_SYMBOLS.value: 40,
+    # --- v2.0: حالت‌ها و محافظ‌های رویدادمحور ---
+    SettingKey.AUTOTRADE_ENGINE_MODE.value: "scan",
+    SettingKey.AUTOTRADE_SELECTED_SYMBOLS.value: "BTC/USDT,ETH/USDT",
+    SettingKey.AUTOTRADE_SCAN_INTERVAL.value: 15.0,
+    SettingKey.AUTOTRADE_MIN_LIQUIDITY.value: 2_000_000.0,
+    SettingKey.AUTOTRADE_MAX_SPREAD_PERCENT.value: 0.25,
+    SettingKey.AUTOTRADE_STALE_AFTER.value: 10.0,
+    SettingKey.AUTOTRADE_SLIPPAGE.value: 0.02,
+    SettingKey.AUTOTRADE_BREAK_EVEN.value: True,
+    SettingKey.AUTOTRADE_BREAK_EVEN_TRIGGER.value: 1.0,
+    SettingKey.AUTOTRADE_TRAILING.value: False,
+    SettingKey.AUTOTRADE_TRAILING_ACTIVATION.value: 1.5,
+    SettingKey.AUTOTRADE_TRAILING_OFFSET.value: 0.4,
+    SettingKey.AUTOTRADE_SIGNAL_INVALIDATION.value: True,
+    SettingKey.AUTOTRADE_TREND_POLICY.value: "block",
+    SettingKey.AUTOTRADE_ALLOCATION_MODE.value: "fixed",
+    SettingKey.AUTOTRADE_ALLOCATION_PERCENT.value: 5.0,
+    SettingKey.AUTOTRADE_MAX_TOTAL_MARGIN.value: 60.0,
+    # --- v2.2: پویش دائمی فرصت‌ها (مستقل از موتور معامله) ---
+    SettingKey.AUTOTRADE_WATCH_SCAN_ENABLED.value: True,
+    SettingKey.AUTOTRADE_WATCH_SCAN_INTERVAL.value: 20,
+    SettingKey.AUTOTRADE_WATCH_MIN_CONFIDENCE.value: 70,
+    SettingKey.AUTOTRADE_WATCH_MAX_SPREAD.value: 0.25,
+    SettingKey.AUTOTRADE_WATCH_ROW_CAP.value: 30,
     SettingKey.UPDATE_AUTO_CHECK.value: False,
     SettingKey.ALERTS_ENABLED.value: True,
     SettingKey.ALERTS_ITEMS.value: [],

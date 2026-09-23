@@ -380,14 +380,28 @@ class TestManualAutoTradeControls:
 
         اولین پیاده‌سازی فقط ورودی‌ها را غیرفعال می‌کرد؛ صفحه ۶۸۷ پیکسل
         شد و از قد نمایشگر لپ‌تاپ (۶۶۰) گذشت.
+
+        صفحه در v2.0 پیمایش‌دار شد؛ قدِ کل صفحه دیگر تابع محتواست،
+        پس ارتفاعِ بدنهٔ پیمایش سنجیده می‌شود — همان چیزی که کاربر
+        باید برای دیدن پنل بپیماید.
         """
+        def body_height(page: TradesPage) -> int:
+            scroll = getattr(page, "_scroll", None)
+            target = scroll.widget() if scroll is not None else page
+            return target.minimumSizeHint().height()
+
+        # v2.1.1: پنل تنظیمات ترمینال پیش‌فرض جمع‌شده است؛ برای سنجش
+        # جعبهٔ دستی، اول پنل را باز کن — هدفِ اصلی تست همین است که
+        # «جعبهٔ باز ارتفاع اضافه بگیرد و جعبهٔ بسته نگیرد».
+        if getattr(page, "_config_collapsed", False):
+            page._toggle_config_panel()
         page.auto_manual_check.setChecked(False)
         QApplication.processEvents()
-        collapsed = page.minimumSizeHint().height()
+        collapsed = body_height(page)
 
         page.auto_manual_check.setChecked(True)
         QApplication.processEvents()
-        expanded = page.minimumSizeHint().height()
+        expanded = body_height(page)
 
         assert collapsed < expanded
 

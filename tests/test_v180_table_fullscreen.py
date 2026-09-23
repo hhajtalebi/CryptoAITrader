@@ -23,7 +23,8 @@ from ui.widgets.table_toolbar import (
 PAGE_IMPORTS = [
     ("ui.pages.dashboard_page", "DashboardPage", 2),
     ("ui.pages.signals_page", "SignalsPage", 2),
-    ("ui.pages.trades_page", "TradesPage", 1),
+    # v2.0: سه جدول — تاریخچه + پایش فرصت‌ها + موقعیت‌های باز
+    ("ui.pages.trades_page", "TradesPage", 3),
     ("ui.pages.wallet_page", "WalletPage", 1),
     ("ui.pages.markets_page", "MarketsPage", 2),
     # سه جدول: پیش‌نمایش گزارش، تفکیک عملکرد و سابقهٔ نتیجه‌ها

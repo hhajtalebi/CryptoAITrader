@@ -207,7 +207,12 @@ class PredictiveIntelligenceEngine:
         self._features = feature_store or FeatureStore()
         self._include_dl = include_dl
         self._now = now or (lambda: datetime.now(UTC))
-        self._report_cache: dict[str, tuple[float, IntelligenceReport]] = {}
+        # کلید کش: (نماد، تایم‌فریم‌ها). بدون تایم‌فریم در کلید، دو
+        # مصرف‌کننده با پیکربندی متفاوت (صفحهٔ تحلیل و نردبان معاملهٔ
+        # خودکار) گزارش همدیگر را می‌پوشاندند.
+        self._report_cache: dict[tuple[str, tuple[str, ...]], tuple[float, IntelligenceReport]] = {}
+        #: جدیدترین گزارش هر نماد (هر پیکربندی) برای report() همگام
+        self._latest_for_symbol: dict[str, tuple[float, IntelligenceReport]] = {}
         self._ensemble_cache: dict[tuple[str, str], tuple[float, ModelEnsemble]] = {}
         self._regime_history: dict[str, list[Any]] = {}
         self._weights: dict[str, float] | None = None
@@ -222,13 +227,11 @@ class PredictiveIntelligenceEngine:
 
     def report(self, symbol: str, *, force: bool = False) -> IntelligenceReport | None:
         """نسخهٔ همگام گزارش (از کش) — برای مسیرهای بدون async."""
-        cached = self._report_cache.get(symbol)
+        cached = self._latest_for_symbol.get(symbol)
         if cached is None:
             return None
         timestamp, report = cached
-        age = time.monotonic() - timestamp
-        report_dict_age = age  # خوانایی
-        if report_dict_age > REPORT_TTL and not force:
+        if time.monotonic() - timestamp > REPORT_TTL and not force:
             return None
         return report
 
@@ -246,7 +249,8 @@ class PredictiveIntelligenceEngine:
         peers: کندل‌های دارایی‌های مرجع (BTC/ETH/…) برای کراس-asset —
         اگر داده نبود این بخش صادقانه غایب است.
         """
-        cached = self._report_cache.get(symbol)
+        cache_key = (symbol, tuple(timeframes))
+        cached = self._report_cache.get(cache_key)
         if cached is not None and not force and time.monotonic() - cached[0] < REPORT_TTL:
             return cached[1]
 
@@ -542,7 +546,11 @@ class PredictiveIntelligenceEngine:
             model_health=health,
             data_quality=quality,
         )
-        self._report_cache[symbol] = (time.monotonic(), report)
+        self._report_cache[cache_key] = (time.monotonic(), report)
+        # نسخهٔ نماد را تازه نگه داریم تا report(symbol) همیشه جدیدترین باشد
+        latest = self._latest_for_symbol.get(symbol)
+        if latest is None or time.monotonic() - cached[0] >= 0 or True:
+            self._latest_for_symbol[symbol] = (time.monotonic(), report)
         return report
 
     # ------------------------------------------------------------------
@@ -702,7 +710,9 @@ class PredictiveIntelligenceEngine:
 
     def invalidate(self, symbol: str) -> None:
         """باطل‌کردن کش گزارش نماد — خواستهٔ ۳۵ (بازمحاسبهٔ رویدادمحور)."""
-        self._report_cache.pop(symbol, None)
+        for key in [k for k in self._report_cache if k[0] == symbol]:
+            self._report_cache.pop(key, None)
+        self._latest_for_symbol.pop(symbol, None)
 
     async def accuracy_snapshot(self, symbol: str) -> dict[str, Any]:
         """

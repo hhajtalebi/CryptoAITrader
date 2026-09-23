@@ -276,11 +276,29 @@ def test_non_scrollable_pages_keep_their_layout(
 
     تغییر `BasePage` نباید رفتار صفحه‌های موجود را عوض کند.
     """
+    from ui.pages.markets_page import MarketsPage
+
+    page = MarketsPage(translator)
+    assert page.scrollable is False
+    assert page.layout_root().parentWidget() is page
+
+
+def test_trades_page_is_scrollable_terminal(
+    qt_application,  # noqa: ARG001
+    translator: Translator,
+) -> None:
+    """
+    ترمینال معاملهٔ خودکار (v2.0) باید پیمایش داشته باشد.
+
+    خواستهٔ §۹: جدول‌ها هرگز له نمی‌شوند؛ در پنجرهٔ باریک اسکرول
+    عمودی/افقی فعال است. صفحهٔ تاریخچهٔ سادهٔ قبلی نبود، ولی این صفحه
+    دیگر دو جدول پهن + داشبورد دارد.
+    """
     from ui.pages.trades_page import TradesPage
 
     page = TradesPage(translator)
-    assert page.scrollable is False
-    assert page.layout_root().parentWidget() is page
+    assert page.scrollable is True
+    assert page._scroll is not None
 
 
 def test_reports_report_tab_is_scrollable(

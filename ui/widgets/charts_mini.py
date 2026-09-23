@@ -69,12 +69,25 @@ class Sparkline(ThemedWidget):
         width: int = 90,
         height: int = 28,
         filled: bool = True,
+        fixed: bool = True,
     ) -> None:
+        """
+        `fixed=False` نمودار را کشسان می‌کند (حداقل اندازه + رشد در
+        چیدمان) — برای نمودارهای بزرگِ داشبورد که باید با پنجره
+        هم‌اندازه شوند (v2.0). پیش‌فرض ثابت است تا مصرف‌کنندگان فعلی
+        تغییری نبینند.
+        """
         super().__init__(parent)
         self._values: list[float] = []
         self._color_name: str | None = None
         self._filled = filled
-        self.setFixedSize(width, height)
+        if fixed:
+            self.setFixedSize(width, height)
+        else:
+            self.setMinimumSize(width, height)
+            self.setSizePolicy(
+                QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+            )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
 
     def set_values(self, values: Sequence[float] | None, color_name: str | None = None) -> None:
@@ -422,3 +435,149 @@ class AreaChart(ThemedWidget):
 
 
 __all__ = ["AreaChart", "ConfidenceRing", "DonutChart", "Sparkline", "ThemedWidget"]
+
+
+class QuantileFan(ThemedWidget):
+    """
+    نمودار بادبزن چندک افق‌ها (v2.0 — داشبورد پیش‌بینی).
+
+    برای هر افقِ فعال، باند P10–P90 و باند باریک‌تر P25–P75 و خط
+    میانهٔ P50 رسم می‌شود؛ خط‌چین، آخرین قیمت واقعی است. همهٔ داده‌ها
+    مستقیم از چندک‌های موتور پیش‌بینی می‌آیند — این ویجت هیچ چیزی
+    حدس نمی‌زند؛ افق بدون چندک رسم نمی‌شود.
+
+    نمونه‌سازی:
+        fan = QuantileFan()
+        fan.set_points([("15m", 63900, 64000, 64100, 64200, 64300), ...],
+                       last_price=64000)
+    """
+
+    def __init__(self, parent: QWidget | None = None, *, height: int = 190) -> None:
+        super().__init__(parent)
+        self._points: list[tuple[str, float, float, float, float, float]] = []
+        self._last_price: float = 0.0
+        self.setMinimumHeight(height)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def set_points(
+        self,
+        points: "Sequence[tuple[str, float, float, float, float, float]] | None",
+        *,
+        last_price: float = 0.0,
+    ) -> None:
+        """
+        تنظیم نقاط: (نام افق، p10، p25، p50، p75، p90).
+
+        نقاط نامعتبر (قیمت غیرمثبت یا ترتیب نادرست) حذف می‌شوند تا
+        نمودار هیچ‌وقت شکل گیج‌کننده نسازد.
+        """
+        cleaned: list[tuple[str, float, float, float, float, float]] = []
+        for item in points or []:
+            try:
+                name, p10, p25, p50, p75, p90 = item
+                values = [float(p10), float(p25), float(p50), float(p75), float(p90)]
+            except (TypeError, ValueError):
+                continue
+            if any(not math.isfinite(v) or v <= 0 for v in values):
+                continue
+            if not (values[0] <= values[1] <= values[2] <= values[3] <= values[4]):
+                continue
+            cleaned.append((str(name), *values))
+        self._points = cleaned
+        try:
+            self._last_price = float(last_price) if last_price else 0.0
+        except (TypeError, ValueError):
+            self._last_price = 0.0
+        self.update()
+
+    def clear(self) -> None:
+        """پاک‌کردن نمودار."""
+        self.set_points(None, last_price=0.0)
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - نام Qt
+        """رسم بادبزن چندک + خط آخرین قیمت."""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        pad = 10.0
+        width = float(self.width())
+        height = float(self.height())
+
+        if len(self._points) < 1:
+            pen = QPen(self._color("text_faint"), 1, Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            painter.drawLine(
+                int(pad), int(height / 2), int(width - pad), int(height / 2)
+            )
+            painter.setPen(self._color("text_faint"))
+            painter.drawText(
+                self.rect().adjusted(0, 0, -8, -6),
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom,
+                "—",
+            )
+            painter.end()
+            return
+
+        lows = [p[1] for p in self._points]
+        highs = [p[5] for p in self._points]
+        low = min(lows + ([self._last_price] if self._last_price > 0 else []))
+        high = max(highs + ([self._last_price] if self._last_price > 0 else []))
+        span = high - low or 1.0
+
+        usable_h = height - 2 * pad
+        step = (width - 2 * pad) / max(1, (len(self._points) - 1))
+
+        def y_of(value: float) -> float:
+            return pad + usable_h * (1 - (value - low) / span)
+
+        # باند پهن P10–P90
+        band = QPainterPath()
+        band.moveTo(pad, y_of(self._points[0][1]))
+        for index, point in enumerate(self._points):
+            band.lineTo(pad + index * step, y_of(point[1]))
+        for index in range(len(self._points) - 1, -1, -1):
+            band.lineTo(pad + index * step, y_of(self._points[index][5]))
+        band.closeSubpath()
+        wide = QColor(self._color("primary"))
+        wide.setAlpha(36)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(wide)
+        painter.drawPath(band)
+
+        # باند باریک P25–P75
+        narrow = QPainterPath()
+        narrow.moveTo(pad, y_of(self._points[0][2]))
+        for index, point in enumerate(self._points):
+            narrow.lineTo(pad + index * step, y_of(point[2]))
+        for index in range(len(self._points) - 1, -1, -1):
+            narrow.lineTo(pad + index * step, y_of(self._points[index][4]))
+        narrow.closeSubpath()
+        tight = QColor(self._color("primary"))
+        tight.setAlpha(80)
+        painter.setBrush(tight)
+        painter.drawPath(narrow)
+
+        # خط میانه P50
+        median = QPainterPath()
+        median.moveTo(pad, y_of(self._points[0][3]))
+        for index, point in enumerate(self._points):
+            median.lineTo(pad + index * step, y_of(point[3]))
+        painter.setPen(QPen(self._color("primary"), 2))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPath(median)
+
+        # خط آخرین قیمت
+        if self._last_price > 0:
+            painter.setPen(QPen(self._color("text_faint"), 1, Qt.PenStyle.DashLine))
+            painter.drawLine(int(pad), int(y_of(self._last_price)), int(width - pad), int(y_of(self._last_price)))
+
+        # نام افق‌ها زیر نمودار
+        painter.setPen(self._color("text_muted"))
+        for index, point in enumerate(self._points):
+            x = pad + index * step
+            painter.drawText(
+                QRectF(x - 18, height - 12, 36, 12),
+                Qt.AlignmentFlag.AlignCenter,
+                point[0],
+            )
+        painter.end()

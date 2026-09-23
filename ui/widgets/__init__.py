@@ -23,10 +23,12 @@ from ui.widgets.common import (
     HeaderBar,
     KeyValueRow,
     RefreshButton,
+    ResponsiveRow,
     SignalCard,
     StatusPill,
     configure_button_column,
     configure_table,
+    harden_table,
     make_button,
     make_title,
 )
@@ -53,6 +55,7 @@ __all__ = [
     "Avatar",
     "AreaChart",
     "Card",
+    "ResponsiveRow",
     "ChipBar",
     "ConfidenceRing",
     "ConnectionCard",
@@ -89,6 +92,7 @@ __all__ = [
     "TableToolbar",
     "configure_button_column",
     "configure_table",
+    "harden_table",
     "make_button",
     "make_title",
 ]
