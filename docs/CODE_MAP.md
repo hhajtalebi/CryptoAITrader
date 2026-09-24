@@ -9707,3 +9707,40 @@ self._scorecard_timer.timeout.connect(self._scorecard_tick)
 - `market/rate_limiter.py`: پارامتر `no_retry_on` در `retry_async`.
 - `market/redundant_stream.py`: `stats()` کلیدهای اختیاری `endpoints` و `last_error`.
 - آزمون: `tests/test_v232_lbank.py` (بدون شبکهٔ واقعی).
+
+## مکمل نسخهٔ 2.4.0
+
+- `signals/scan_universe.py` (تازه): `UNIVERSE_TOP/ALL`، `normalize_universe`، `split_symbol`، `is_stable_pair`، `is_leveraged_token(symbol, known_bases)` (پسوند UP/DOWN/BULL/BEAR فقط وقتی پیشوند دارایی بازار باشد؛ SYRUP حذف نمی‌شود)، `UniverseFilter.create(min_turnover, smart, quotes)`، `priority_score` (log10 گردش + |تغییر|/25)، `build_universe(tickers, symbols, mode, limit, filters)`.
+- `signals/scanner.py`: `candidate_symbols(limit, universe, filters)` — مسیر قدیمی برای top بدون پالایش دست‌نخورده؛ `_smart_candidates`؛ `scan(..., universe, filters, on_signal)`.
+- `app/application.py`: `scan_market(..., universe, min_turnover, smart_filter, on_signal)` و ساخت `UniverseFilter`.
+- `signals/auto_scanner.py`: `SOURCE_FOUND/MARKET/BOTH`، `normalize_source`، `MAX_FOCUS_SIZE=100`، فیلدهای `source/universe/min_turnover/smart_filter`، ویژگی‌های `sweep_active`/`focus_active`، `seed_focus(signals, replace)`؛ حالت found هرگز چرخش/bootstrap ندارد.
+- `ui/pages/signals_page.py`: `scan_scope_combo`، `scan_smart_check`، `scan_turnover_spin` (هزار USDT)، `scan_universe_options()`، `scan_settings()/set_scan_settings()`، سیگنال `scan_settings_changed`، برآورد زمان در `set_scan_progress`؛ کارت خودکار: `auto_source_combo`، `auto_universe_combo`، `auto_sweep_limit_spin`، `auto_smart_check`، `auto_turnover_spin`؛ `auto_sweep_check` پنهان و هم‌گام با منبع.
+- `ui/controllers/main_controller.py`: سیگنال‌های Qt `scan_partial_found`، `auto_scan_signal_found`، `auto_scan_progress`؛ `_on_scan_partial_signal`/`_flush_scan_live` (دسته‌ای ۸۰۰ms)، `stop_market_scan` نتیجهٔ نیمه‌کاره را نگه می‌دارد، `_seed_auto_focus`، `save_scan_settings`/`_load_scan_settings`، `_execute_auto_job` برای چرخش کامل universe/min_turnover/smart_filter را می‌فرستد.
+- `app/config/defaults.py`: کلیدهای `signals.auto_scan_{source,universe,min_turnover,smart_filter}` و `signals.scan_{universe,limit,min_turnover,smart_filter}`.
+- آزمون: `tests/test_v240_scan_universe.py`.
+
+## مکمل نسخهٔ 2.4.1
+
+- `market/engine.py`: `bulk_fetch()` / `is_bulk_fetch()` (ContextVar)؛ در حالت انبوه `get_candles` نه `_persist_candles` می‌کند نه در `MarketCache` می‌نویسد (خواندن از کش آزاد است).
+- `signals/scanner.py`: `DEFAULT_CPU_DUTY=0.6`، `BACKGROUND_CPU_DUTY=0.35`، `CpuGovernor(duty, clock, cpu_clock)` با `time.thread_time`؛ `scan(..., cpu_duty)` داخل `bulk_fetch()` و `_scan`؛ `_wait_for_cooldown` (فقط مقدار عددی `rest_cooldown_remaining`).
+- `signals/engine.py`: `_gate()` (asyncio.Lock تنبلِ متعلق به حلقه) + `_compute_timeframe`؛ بعد از هر محاسبه `sleep(0)`.
+- `indicators/engine.py`: `calculate` → `_calculate(..., frame_holder, parameters)`؛ `calculate_many` یک DataFrame مشترک می‌سازد. `indicators/base.py`: تبدیل NaN→None با numpy.
+- `app/application.py`: `scan_market(..., cpu_duty)`؛ هر ۲۰ ذخیره یک `sleep(0)`.
+- `ui/pages/signals_page.py`: `SCAN_MAX_ROWS=200`، `scan_cap_note`، `_fill_scan_rows` با `setUpdatesEnabled(False)` و سرستون Interactive حین پرکردن.
+- `ui/controllers/main_controller.py`: گزارش پیشرفت دستی ≥۰٫۱۵s و خودکار ≥۰٫۵s؛ `_flush_scan_live` فاصلهٔ تطبیقی (۰٫۸ تا ۵ ثانیه)؛ پویش خودکار با `BACKGROUND_CPU_DUTY`.
+- آزمون: `tests/test_v241_performance.py`.
+
+## مکمل نسخهٔ 2.4.2
+
+- `signals/compute_pool.py` (تازه، بدون PySide): `compute_timeframe_job(symbol, timeframe, candles, default_parameters)` → `("ok", payload بدون candles)` یا `("error", متن)`؛ `ComputePool(workers, idle_shutdown)` با `compute_timeframe()` (None = محاسبهٔ محلی)، `shutdown()`، `disable()`، `enabled/running/jobs_done/fallbacks`؛ `default_worker_count()`؛ `lower_process_priority()`؛ `MAX_WORKERS=2`، `IDLE_SHUTDOWN_SECONDS=180`، `MAX_CONSECUTIVE_FAILURES=3`. زمینهٔ spawn.
+- `signals/engine.py`: تابع سطح ماژول `compute_timeframe_analysis(indicators, symbol, timeframe, candles)`؛ `SignalEngine.set_compute_pool(pool)`؛ `_analyze_timeframe` در `is_bulk_fetch()` اول استخر را امتحان می‌کند.
+- `indicators/engine.py`: `IndicatorEngine.default_parameters()` (رونوشت).
+- `app/application.py`: `compute_pool()` (تنبل؛ `performance.process_pool`، `CRYPTOAI_NO_PROCESS_POOL`)، `_should_store_scanned(signal, now)`، ثابت‌های `SCAN_DEDUP_SECONDS=1800`، `SCAN_DEDUP_CONFIDENCE=5`؛ `stop()` استخر را می‌بندد.
+- `main.py`: `multiprocessing.freeze_support()` زیر `__main__`.
+- `ui/responsiveness.py` (تازه): `UiStallWatchdog` (ضربان ۲۵۰ms، آستانهٔ ۱٫۵s، لاگ پشتهٔ نخ رابط هر ≥۳۰s)، `ShowWatcher`.
+- `ui/signal_share.py` (تازه): `signal_symbol`، `format_price`، `format_signal_text(signal, translator)`، `copy_to_clipboard`.
+- `ui/dialogs/signal_detail_dialog.py`: `copy_symbol_button`، `copy_info_button`، `share_text()`، `copy_symbol()`، `copy_info()`، `_flash_copied`.
+- `ui/pages/signals_page.py`: سیگنال `copy_notice(str)`؛ `scan_row_at`، `history_row_at`، `_install_copy_support`، `_show_copy_menu`، `copy_signal_symbol`، `copy_signal_info`؛ برچسب `scan_copy_hint`.
+- `ui/controllers/main_controller.py`: `_refresh_outcome_view` تنبل (`_outcome_view_stale`، `run_blocking("outcome-view")`)، `_on_outcome_view_shown`، `_terminal_timer_tick`، `_stall_watchdog` در `start()`/`shutdown()`، `_on_history_double_clicked` با نگاشت شناسه، اتصال `copy_notice` → `_toast`.
+- `localization/{en,fa}/signals.json`: گروه `share.*`.
+- آزمون: `tests/test_v242_lightweight_and_copy.py` (۲۵)؛ `tests/conftest.py` استخر را در آزمون‌ها خاموش می‌کند.

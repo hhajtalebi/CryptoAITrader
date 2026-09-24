@@ -14,6 +14,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -60,6 +62,11 @@ from signals import RiskEngine, SignalEngine
 from signals.strategies.registry import register_builtin_strategies
 
 logger = get_logger(__name__)
+
+#: پنجرهٔ حذف ذخیرهٔ تکراری سیگنال پویش (ثانیه) — ۲.۴.۲
+SCAN_DEDUP_SECONDS = 30 * 60
+#: تغییر اطمینانی که با وجود تکرار، ذخیرهٔ دوباره را توجیه می‌کند
+SCAN_DEDUP_CONFIDENCE = 5
 
 
 def _as_float(value: Any, fallback: float | None = None) -> float | None:
@@ -151,6 +158,8 @@ class Application:
         self.indicators = IndicatorEngine()
         self.market: MarketDataEngine | None = None
         self.signals: SignalEngine | None = None
+        self._compute_pool: Any = None
+        self._scan_saved: dict[tuple[str, str, str], tuple[float, int]] = {}
         self.risk = RiskEngine(self.risk_parameters())
 
         # ---- گزارش ----
@@ -259,6 +268,7 @@ class Application:
             risk_parameters=self.risk_parameters(),
             calibration_source=self.outcome_repository,
         )
+        self.signals.set_compute_pool(self.compute_pool())
         logger.info("Application started with exchange '%s'", exchange_name)
 
     async def switch_exchange(self, exchange_name: str = "") -> str:
@@ -311,6 +321,7 @@ class Application:
             risk_parameters=self.risk_parameters(),
             calibration_source=self.outcome_repository,
         )
+        self.signals.set_compute_pool(self.compute_pool())
         # عامل هوش مصنوعی هم موتور قدیمی را نگه داشته؛ دور ریخته می‌شود
         # تا با صرافی تازه بازساخته شود.
         self._ai_analyst = None
@@ -327,11 +338,68 @@ class Application:
 
     async def stop(self) -> None:
         """توقف تمیز همه اجزا."""
+        if self._compute_pool is not None:
+            self._compute_pool.shutdown()
         if self.market is not None:
             await self.market.stop()
         if self._ai_manager is not None:
             await self._ai_manager.close()
         logger.info("Application stopped")
+
+    # ------------------------------------------------------------------
+    # استخر محاسبه و حذف ذخیرهٔ تکراری پویش (۲.۴.۲)
+    # ------------------------------------------------------------------
+    def compute_pool(self) -> Any:
+        """
+        استخر فرایند محاسبهٔ پویش انبوه (تنبل؛ کارگرها فقط هنگام پویش بالا می‌آیند).
+
+        با تنظیم `performance.process_pool=false` یا متغیر محیطی
+        `CRYPTOAI_NO_PROCESS_POOL=1` خاموش می‌شود و همان محاسبهٔ محلی
+        ۲.۴.۱ انجام می‌شود.
+        """
+        if os.environ.get("CRYPTOAI_NO_PROCESS_POOL", "").strip() in {"1", "true", "yes"}:
+            return None
+        try:
+            if not self.settings.get_bool("performance.process_pool", True):
+                return None
+        except Exception:  # noqa: BLE001
+            pass
+        if self._compute_pool is None:
+            from signals.compute_pool import ComputePool
+
+            self._compute_pool = ComputePool()
+        return self._compute_pool
+
+    def _should_store_scanned(self, signal: Any, *, now: float | None = None) -> bool:
+        """
+        آیا این سیگنال پویش باید ذخیره شود؟
+
+        پویش خودکار هر چند دقیقه همان نمادها را دوباره می‌بیند؛ ذخیرهٔ هر بار
+        آن‌ها پایگاه داده و جدول پیگیری نتیجه را بی‌وقفه بزرگ می‌کرد و صفحهٔ
+        عملکرد را کند. همان نماد/صرافی/جهت اگر در ۳۰ دقیقهٔ اخیر ذخیره شده و
+        اطمینانش کمتر از ۵ واحد تغییر کرده باشد، دوباره ذخیره نمی‌شود.
+        """
+        moment = time.monotonic() if now is None else now
+        key = (
+            str(getattr(signal, "exchange", "") or ""),
+            str(getattr(signal, "symbol", "") or "").upper(),
+            str(getattr(getattr(signal, "direction", None), "value", "")),
+        )
+        confidence = int(getattr(signal, "confidence", 0) or 0)
+        previous = self._scan_saved.get(key)
+        if previous is not None:
+            saved_at, saved_confidence = previous
+            if (moment - saved_at) < SCAN_DEDUP_SECONDS and abs(
+                confidence - saved_confidence
+            ) < SCAN_DEDUP_CONFIDENCE:
+                return False
+        self._scan_saved[key] = (moment, confidence)
+        if len(self._scan_saved) > 20_000:
+            cutoff = moment - SCAN_DEDUP_SECONDS
+            self._scan_saved = {
+                k: v for k, v in self._scan_saved.items() if v[0] >= cutoff
+            }
+        return True
 
     # ------------------------------------------------------------------
     # هوش مصنوعی (اختیاری)
@@ -791,9 +859,18 @@ class Application:
         min_confidence: int = 0,
         include_wait: bool = False,
         on_progress: Any = None,
+        universe: str = "top",
+        min_turnover: float = 0.0,
+        smart_filter: bool | None = None,
+        on_signal: Any = None,
+        cpu_duty: float | None = None,
     ) -> Any:
         """
         پویش کل بازار و بازگرداندن سیگنال‌ها به ترتیب ضریب اطمینان.
+
+        نسخهٔ ۲.۴.۰: `universe="all"` همهٔ نمادهای صرافی را (با پالایش هوشمند
+        اختیاری و ترتیب نقدشوندگی/نوسان) پویش می‌کند؛ `on_signal` هر سیگنال را
+        همان لحظه برای نمایش زنده گزارش می‌دهد.
 
         این متد **عمداً هوش مصنوعی را صدا نمی‌زند**؛ فقط موتور ریاضی.
         کاربر خواست پویش گروهی توکن نسوزاند و تحلیل هوش مصنوعی بعداً و
@@ -813,6 +890,14 @@ class Application:
             self.signals,
             concurrency=self.settings.get_int("performance.parallel_requests", 4) or 4,
         )
+        filters = None
+        if universe == "all" or smart_filter is not None or min_turnover:
+            from signals.scan_universe import UniverseFilter
+
+            filters = UniverseFilter.create(
+                min_turnover=min_turnover,
+                smart=True if smart_filter is None else bool(smart_filter),
+            )
         result = await scanner.scan(
             symbols,
             timeframes or self.settings.analysis_timeframes,
@@ -820,13 +905,23 @@ class Application:
             min_confidence=min_confidence,
             include_wait=include_wait,
             on_progress=on_progress,
+            universe=universe,
+            filters=filters,
+            on_signal=on_signal,
+            **({"cpu_duty": cpu_duty} if cpu_duty is not None else {}),
         )
 
         # ذخیرهٔ سیگنال‌های جهت‌دار. «انتظار» ذخیره نمی‌شود وگرنه سابقه
         # با ده‌ها ردیف بی‌اثر پر می‌شود و پیداکردن سیگنال واقعی سخت
         # می‌شود.
-        for signal in result.signals:
+        for index, signal in enumerate(result.signals):
             if signal.direction is SignalDirection.WAIT:
+                continue
+            if index and index % 20 == 0:
+                # ذخیرهٔ صدها سیگنال پویش کل بازار نباید حلقهٔ شبکه را
+                # (وب‌سوکت، معاملهٔ خودکار) یک‌نفس قفل کند (۲.۴.۱).
+                await asyncio.sleep(0)
+            if not self._should_store_scanned(signal):
                 continue
             try:
                 signal_id = self.signal_repository.save_signal(signal, source="scan")

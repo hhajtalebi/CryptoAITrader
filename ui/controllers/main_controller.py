@@ -101,6 +101,9 @@ AI_STATUS_INTERVAL = 180_000
 #: اجرا می‌شود نه هر تیک.
 AUTO_SCAN_TICK_MS = 15_000
 
+#: ۲.۴.۱ — سهم CPU پویش پس‌زمینهٔ خودکار (رجوع: signals.scanner)
+from signals.scanner import BACKGROUND_CPU_DUTY  # noqa: E402
+
 #: تیک بررسی نتیجهٔ سیگنال‌ها. برخلاف پویش، اینجا فقط قیمت خوانده
 #: می‌شود و هزینه‌اش ناچیز است؛ ولی فاصلهٔ واقعی را کاربر تعیین می‌کند
 #: و این تیک صرفاً موعد را می‌سنجد.
@@ -183,6 +186,11 @@ class MainController(QObject):
     #: پیشرفت پویش بازار (انجام‌شده، کل، نماد، یافته‌شده). مثل بالا،
     #: سیگنال است چون پس‌فراخوانِ پویشگر روی نخ شبکه اجرا می‌شود.
     scan_progress_changed = Signal(int, int, str, int)
+    #: نسخهٔ ۲.۴.۰ — هر سیگنالِ پذیرفته‌شده در میانهٔ پویش دستی (نخ شبکه → UI)
+    scan_partial_found = Signal(object)
+    #: نسخهٔ ۲.۴.۰ — سیگنال/پیشرفتِ پویش خودکار (نخ شبکه → UI)
+    auto_scan_signal_found = Signal(object)
+    auto_scan_progress = Signal(int, int)
     #: رویداد موتور معاملهٔ خودکار (نخ شبکه → نخ رابط کاربری)
     auto_trade_event = Signal(str, dict)
 
@@ -255,6 +263,10 @@ class MainController(QObject):
         self.wallet = window.pages["nav.wallet"]
         self.settings_page = window.pages["nav.settings"]
 
+        #: ۲.۴.۲ — تازه‌سازی تنبل صفحهٔ عملکرد
+        self._outcome_view_stale = True
+        self._outcome_watch_installed = False
+        self._stall_watchdog = None
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setInterval(60_000)
         self._refresh_timer.timeout.connect(self.refresh_dashboard)
@@ -337,6 +349,9 @@ class MainController(QObject):
         self.chat_tool_started.connect(self._on_chat_tool_started)
         self.chat_tool_finished.connect(self._on_chat_tool_finished)
         self.scan_progress_changed.connect(self.signals.set_scan_progress)
+        self.scan_partial_found.connect(self._on_scan_partial_signal)
+        self.auto_scan_signal_found.connect(self._on_auto_partial_signal)
+        self.auto_scan_progress.connect(self._on_auto_scan_progress)
         self.auto_trade_event.connect(self._handle_auto_trade_event)
         self.chat.action_requested.connect(self._on_chat_action)
         self.chat.chat_cleared.connect(self._on_chat_cleared)
@@ -361,10 +376,12 @@ class MainController(QObject):
         self.signals.generate_button.clicked.connect(self.generate_signal)
         self.signals.scan_requested.connect(self.scan_market)
         self.signals.auto_scan_changed.connect(self.save_auto_scan_config)
+        self.signals.scan_settings_changed.connect(self.save_scan_settings)
         self.signals.auto_scan_run_now.connect(self.run_auto_scan_now)
         self.signals.scan_stop_requested.connect(self.stop_market_scan)
         self.signals.scan_ai_requested.connect(self.analyze_scanned_symbol)
         self.signals.scan_detail_requested.connect(self.show_scanned_signal_detail)
+        self.signals.copy_notice.connect(lambda message: self._toast(message, level="success"))
         self.reports.generate_button.clicked.connect(self.generate_report)
         if self.performance is not None:
             self.performance.refresh_requested.connect(self.refresh_outcomes_now)
@@ -412,7 +429,7 @@ class MainController(QObject):
         )
         self._terminal_timer = QTimer(self.window)
         self._terminal_timer.setInterval(TERMINAL_UI_INTERVAL_MS)
-        self._terminal_timer.timeout.connect(self._refresh_auto_terminal)
+        self._terminal_timer.timeout.connect(self._terminal_timer_tick)
         self._terminal_timer.start()
         self._terminal_stats_tick = 0
         # پنل باید از همان ابتدا تنظیم‌های واقعی کاربر را نشان دهد،
@@ -461,6 +478,14 @@ class MainController(QObject):
             return
         self._started = True
         self.runner.start()
+        # نسخهٔ ۲.۴.۲: هر «هنگ» نخ رابط با پشتهٔ دقیق در لاگ ثبت می‌شود
+        try:
+            from ui.responsiveness import UiStallWatchdog
+
+            self._stall_watchdog = UiStallWatchdog(self)
+            self._stall_watchdog.start()
+        except Exception:  # noqa: BLE001 - فقط ابزار تشخیص است
+            logger.debug("UI stall watchdog unavailable", exc_info=True)
         self.analysis.apply_chart_palette(self.themes.palette)
         self.trades.apply_chart_palette(self.themes.palette)
         self._populate_indicator_catalog()
@@ -523,6 +548,16 @@ class MainController(QObject):
                 except Exception:  # noqa: BLE001 - خاموشی هرگز نباید خطا بدهد
                     logger.warning("Engine shutdown did not finish cleanly")
         self.runner.stop()
+        # کارگرهای استخر محاسبه (۲.۴.۲) حتی اگر app.stop به موقع تمام نشد
+        pool = getattr(self.app, "_compute_pool", None)
+        if pool is not None:
+            try:
+                pool.shutdown()
+            except Exception:  # noqa: BLE001
+                pass
+        stall_watchdog = getattr(self, "_stall_watchdog", None)
+        if stall_watchdog is not None:
+            stall_watchdog.stop()
         logger.info("Controller shut down")
 
     def _on_engines_ready(self) -> None:
@@ -1752,13 +1787,32 @@ class MainController(QObject):
             return
 
         options = self.signals.scan_options()
+        universe = self.signals.scan_universe_options()
         frames = self.signals.selected_timeframes()
+        self.save_scan_settings(self.signals.scan_settings())
 
+        # نتیجه‌های زنده: هر سیگنال همان لحظه در جدول می‌نشیند و اگر
+        # کاربر پویشِ طولانیِ کل بازار را متوقف کند، از دست نمی‌رود.
+        self._scan_live_signals = []
+        self._scan_live_dirty = False
+        self._scan_live_active = True
         self.signals.set_scanning(True)
         self.signals.set_scan_status(self.tr_.tr("signals.scan_running"))
 
+        def on_signal(signal: Any) -> None:
+            """سیگنال پذیرفته‌شده از نخ شبکه → سیگنال Qt → نخ رابط کاربری."""
+            self.scan_partial_found.emit(signal)
+
+        last_progress = [0.0]
+
         def on_progress(progress: Any) -> None:
             """گزارش پیشرفت از نخ شبکه → سیگنال Qt → نخ رابط کاربری."""
+            # ۲.۴.۱: در پویش کل بازار صدها گزارش در ثانیه صف رابط را پر می‌کرد؛
+            # حداکثر ~۷ بار در ثانیه کافی است (گزارش پایانی همیشه می‌رود).
+            now = time.monotonic()
+            if int(progress.done) < int(progress.total) and now - last_progress[0] < 0.15:
+                return
+            last_progress[0] = now
             self.scan_progress_changed.emit(
                 int(progress.done), int(progress.total),
                 str(progress.symbol), int(progress.found),
@@ -1766,11 +1820,15 @@ class MainController(QObject):
 
         def apply(result: Any) -> None:
             """نمایش نتیجهٔ پویش."""
+            self._scan_live_active = False
+            self._stop_live_flush()
+            self._scan_live_signals = []
             rows = self._apply_stale_filter(
                 self._decorate_validity([signal.to_dict() for signal in result.signals])
             )
             self.signals.set_scan_results(rows)
             self._last_scan = result
+            self._seed_auto_focus(list(result.signals))
             if rows:
                 message = self.tr_.tr(
                     "signals.scan_done",
@@ -1788,6 +1846,8 @@ class MainController(QObject):
 
         def on_error(name: str, error: Exception) -> None:
             """خطای پویش نباید صفحه را در حالت «در حال پویش» رها کند."""
+            self._scan_live_active = False
+            self._stop_live_flush()
             self.signals.set_scan_status(self.tr_.tr("signals.scan_failed"))
             self._on_error(name, error)
 
@@ -1800,10 +1860,140 @@ class MainController(QObject):
                 min_confidence=options["min_confidence"],
                 include_wait=options["include_wait"],
                 on_progress=on_progress,
+                universe=universe["universe"],
+                min_turnover=universe["min_turnover"],
+                smart_filter=universe["smart_filter"],
+                on_signal=on_signal,
             ),
             on_success=apply,
             on_error=on_error,
             on_finished=lambda: self.signals.set_scanning(False),
+        )
+
+    # ------------------------------------------------------------------
+    # نسخهٔ ۲.۴.۰ — نتیجهٔ زندهٔ پویش و تنظیمات پایدار آن
+    # ------------------------------------------------------------------
+    #: فاصلهٔ تازه‌سازی جدول هنگام رسیدن سیگنال‌های زنده (میلی‌ثانیه).
+    #: رسم دوبارهٔ جدول به ازای هر سیگنال، روی پویش ۱۰۰۰+ نماد رابط را
+    #: کند می‌کرد؛ دسته‌کردن تا ۸۰۰ms هم زنده است و هم سبک.
+    SCAN_LIVE_FLUSH_MS = 800
+
+    def save_scan_settings(self, values: dict) -> None:
+        """ذخیرهٔ دامنه/تعداد/پالایش پویش دستی."""
+        for key, value in (values or {}).items():
+            try:
+                self.app.settings.set(key, value)
+            except Exception as error:  # noqa: BLE001 - ذخیره نباید پویش را بشکند
+                logger.debug("Could not persist %s: %s", key, error)
+
+    def _load_scan_settings(self) -> None:
+        """نشاندن تنظیمات ذخیره‌شدهٔ پویش دستی در صفحه."""
+        keys = (
+            "signals.scan_universe",
+            "signals.scan_limit",
+            "signals.scan_min_turnover",
+            "signals.scan_smart_filter",
+        )
+        try:
+            self.signals.set_scan_settings({key: self.app.settings.get(key) for key in keys})
+        except Exception as error:  # noqa: BLE001
+            logger.debug("Could not load scan settings: %s", error)
+
+    def _on_scan_partial_signal(self, signal: Any) -> None:
+        """یک سیگنال زنده رسید؛ جدول با تأخیر کوتاه و دسته‌ای تازه می‌شود."""
+        if not getattr(self, "_scan_live_active", False):
+            # پویش متوقف شده؛ سیگنال‌های دیررسیده جدول را عوض نکنند
+            return
+        live = getattr(self, "_scan_live_signals", None)
+        if live is None:
+            live = self._scan_live_signals = []
+        live.append(signal)
+        self._scan_live_dirty = True
+        timer = getattr(self, "_scan_live_timer", None)
+        if timer is None:
+            timer = self._scan_live_timer = QTimer(self.window)
+            timer.setSingleShot(True)
+            timer.setInterval(self.SCAN_LIVE_FLUSH_MS)
+            timer.timeout.connect(self._flush_scan_live)
+        if not timer.isActive():
+            timer.start()
+
+    def _flush_scan_live(self) -> None:
+        """نمایش سیگنال‌های زندهٔ انباشته، مرتب بر پایهٔ ضریب اطمینان."""
+        if not getattr(self, "_scan_live_dirty", False):
+            return
+        self._scan_live_dirty = False
+        signals = sorted(
+            list(getattr(self, "_scan_live_signals", []) or []),
+            key=lambda item: float(getattr(item, "confidence", 0) or 0),
+            reverse=True,
+        )
+        if not signals:
+            return
+        started = time.monotonic()
+        rows = self._apply_stale_filter(
+            self._decorate_validity([signal.to_dict() for signal in signals])
+        )
+        self.signals.set_scan_results(rows)
+        # تازه‌سازی تطبیقی (۲.۴.۱): اگر رسم جدول طول کشید، دفعهٔ بعد دیرتر؛
+        # رابط کاربری هیچ‌وقت بیش از ~۱۰٪ وقتش را صرف این جدول نمی‌کند.
+        elapsed_ms = (time.monotonic() - started) * 1000.0
+        timer = getattr(self, "_scan_live_timer", None)
+        if timer is not None:
+            timer.setInterval(int(min(5000, max(self.SCAN_LIVE_FLUSH_MS, elapsed_ms * 10))))
+        from types import SimpleNamespace
+
+        # تا پایان پویش، دکمهٔ تحلیل هوشمند/جزئیات روی همین نتایج کار کند
+        self._last_scan = SimpleNamespace(signals=signals)
+
+    def _stop_live_flush(self) -> None:
+        timer = getattr(self, "_scan_live_timer", None)
+        if timer is not None:
+            timer.stop()
+        self._scan_live_dirty = False
+
+    def _seed_auto_focus(self, signals: list) -> None:
+        """
+        نتیجهٔ پویش دستی → فهرست تمرکز سیگنال‌گیر خودکار.
+
+        در حالت «فقط سیگنال‌های پیداشده» فهرست با همین نتایج جایگزین
+        می‌شود؛ در حالت‌های دیگر به بالای فهرست افزوده می‌شود.
+        """
+        scheduler = getattr(self, "_auto_scheduler", None)
+        if scheduler is None or not signals:
+            return
+        from signals.auto_scanner import SOURCE_FOUND, normalize_source
+
+        replace = normalize_source(scheduler.config.source) == SOURCE_FOUND
+        try:
+            scheduler.seed_focus(signals, replace=replace)
+        except Exception as error:  # noqa: BLE001
+            logger.debug("Could not seed auto focus: %s", error)
+            return
+        self._refresh_auto_scan_status()
+
+    def _on_auto_partial_signal(self, signal: Any) -> None:
+        """سیگنال قوی در میانهٔ چرخش کامل: همان لحظه وارد فهرست تمرکز شود."""
+        scheduler = getattr(self, "_auto_scheduler", None)
+        if scheduler is None:
+            return
+        try:
+            scheduler.seed_focus([signal])
+        except Exception as error:  # noqa: BLE001
+            logger.debug("Could not seed auto focus: %s", error)
+
+    def _on_auto_scan_progress(self, done: int, total: int) -> None:
+        """نمایش «X از Y» برای چرخش کامل خودکار."""
+        scheduler = getattr(self, "_auto_scheduler", None)
+        if scheduler is None or not scheduler.running:
+            return
+        self.signals.set_auto_scan_status(
+            self.tr_.tr(
+                "signals.auto.status_progress",
+                done=self.tr_.format_number(int(done), 0),
+                total=self.tr_.format_number(int(total), 0),
+            ),
+            focus=scheduler.focus_symbols,
         )
 
     # ------------------------------------------------------------------
@@ -1833,9 +2023,15 @@ class MainController(QObject):
                     "signals.auto_scan_focus_size",
                     "signals.auto_scan_min_confidence",
                     "signals.auto_scan_notify",
+                    "signals.auto_scan_source",
+                    "signals.auto_scan_universe",
+                    "signals.auto_scan_sweep_limit",
+                    "signals.auto_scan_min_turnover",
+                    "signals.auto_scan_smart_filter",
                 )
             }
         )
+        self._load_scan_settings()
 
         self._auto_timer = QTimer(self.window)
         self._auto_timer.setInterval(AUTO_SCAN_TICK_MS)
@@ -1867,14 +2063,23 @@ class MainController(QObject):
             return
         from signals.auto_scanner import ScanJob
 
-        if scheduler.focus_symbols:
+        from signals.auto_scanner import SOURCE_MARKET, normalize_source
+
+        source = normalize_source(scheduler.config.source)
+        if scheduler.focus_symbols and source != SOURCE_MARKET:
             job = ScanJob(
                 kind="focus",
                 symbols=tuple(scheduler.focus_symbols[: scheduler.config.focus_size]),
                 reason="auto.reason_focus",
             )
-        else:
+        elif scheduler.config.sweep_active or (
+            not scheduler.focus_symbols and source != "found"
+        ):
             job = ScanJob(kind="full", symbols=(), reason="auto.reason_bootstrap")
+        else:
+            # «فقط سیگنال‌های پیداشده» و هنوز چیزی پیدا نشده
+            self.signals.set_auto_scan_status(self.tr_.tr("signals.auto.status_need_scan"))
+            return
         self._execute_auto_job(job)
 
     def _auto_scan_tick(self) -> None:
@@ -1904,7 +2109,37 @@ class MainController(QObject):
         scheduler.start(job)
         frames = self.signals.selected_timeframes()
         symbols = list(job.symbols) or None
-        limit = None if symbols else scheduler.config.sweep_limit
+        config = scheduler.config
+        universe = str(getattr(config, "universe", "top") or "top")
+        full = symbols is None
+        # چرخش کامل روی «کل صرافی» سقف تعداد ندارد؛ فقط حالت «پرگردش‌ترین‌ها»
+        # به `sweep_limit` محدود می‌شود.
+        if full:
+            limit = config.sweep_limit if universe == "top" else None
+        else:
+            limit = None
+
+        def on_signal(signal: Any) -> None:
+            self.auto_scan_signal_found.emit(signal)
+
+        last_auto_progress = [0.0]
+
+        def on_progress(progress: Any) -> None:
+            now = time.monotonic()
+            if int(progress.done) < int(progress.total) and now - last_auto_progress[0] < 0.5:
+                return
+            last_auto_progress[0] = now
+            self.auto_scan_progress.emit(int(progress.done), int(progress.total))
+
+        scan_kwargs: dict[str, Any] = {}
+        if full:
+            scan_kwargs = {
+                "universe": universe,
+                "min_turnover": float(getattr(config, "min_turnover", 0.0) or 0.0),
+                "smart_filter": bool(getattr(config, "smart_filter", True)),
+                "on_signal": on_signal,
+                "on_progress": on_progress,
+            }
 
         self.signals.set_auto_scan_status(
             self.tr_.tr(
@@ -1949,6 +2184,8 @@ class MainController(QObject):
                 limit=limit,
                 min_confidence=scheduler.config.focus_min_confidence,
                 include_wait=False,
+                cpu_duty=BACKGROUND_CPU_DUTY,
+                **scan_kwargs,
             ),
             on_success=apply,
             on_error=failed,
@@ -1998,6 +2235,17 @@ class MainController(QObject):
 
         if not scheduler.config.enabled:
             self.signals.set_auto_scan_status(self.tr_.tr("signals.auto.status_off"))
+            return
+
+        from signals.auto_scanner import SOURCE_FOUND, normalize_source
+
+        if (
+            last_count is None
+            and not scheduler.running
+            and normalize_source(scheduler.config.source) == SOURCE_FOUND
+            and not scheduler.focus_symbols
+        ):
+            self.signals.set_auto_scan_status(self.tr_.tr("signals.auto.status_need_scan"))
             return
 
         if last_count is not None:
@@ -2573,26 +2821,73 @@ class MainController(QObject):
         self._run_outcome_check()
 
     def _refresh_outcome_view(self, *, quiet: bool = False) -> None:
-        """تازه‌سازی صفحهٔ عملکرد اگر ساخته شده باشد."""
+        """
+        تازه‌سازی صفحهٔ عملکرد اگر ساخته شده باشد.
+
+        نسخهٔ ۲.۴.۲: این متد هر ۳۰ ثانیه از تایمر پیگیری نتیجه صدا زده
+        می‌شد و روی نخ رابط تا ۵۰۰۰ ردیف پایگاه داده می‌خواند و گروه‌بندی
+        می‌کرد — یکی از علت‌های «هنگ» پس از چند ساعت. حالا:
+            * وقتی صفحه پنهان است، فقط «کهنه» علامت می‌خورد و هنگام نمایش
+              صفحه تازه می‌شود؛
+            * پرس‌وجوها در نخ پس‌زمینه اجرا و فقط نتیجه روی رابط نشانده
+              می‌شود.
+        """
         page = getattr(self, "performance", None)
         if page is None:
             return
+        if not self._outcome_watch_installed:
+            self._outcome_watch_installed = True
+            try:
+                from ui.responsiveness import ShowWatcher
+
+                self._outcome_show_watcher = ShowWatcher(page, self._on_outcome_view_shown)
+            except Exception:  # noqa: BLE001
+                logger.debug("Performance show watcher unavailable", exc_info=True)
+        if quiet and not page.isVisible():
+            self._outcome_view_stale = True
+            return
+        self._outcome_view_stale = False
         try:
             days = int(getattr(page, "selected_period", lambda: 0)() or 0)
-            report = self.app.outcome_repository.performance(days=days or None)
-            page.set_performance(report)
-            page.set_history(
-                [
-                    self._outcome_row(record)
-                    for record in self.app.outcome_repository.history(
-                        days=days or None, limit=300
-                    )
-                ]
-            )
         except Exception:  # noqa: BLE001
+            days = 0
+        repository = self.app.outcome_repository
+
+        def load() -> tuple[Any, list[Any]]:
+            report = repository.performance(days=days or None)
+            records = list(repository.history(days=days or None, limit=300))
+            return report, records
+
+        def apply(result: tuple[Any, list[Any]]) -> None:
+            report, records = result
+            try:
+                page.set_performance(report)
+                page.set_history([self._outcome_row(record) for record in records])
+            except Exception:  # noqa: BLE001
+                logger.debug("Could not apply performance view", exc_info=True)
+                if not quiet:
+                    self.status(self.tr_.tr("signals.outcome.error"))
+
+        def failed(_name: str, _error: Exception) -> None:
             logger.debug("Could not refresh performance view", exc_info=True)
             if not quiet:
                 self.status(self.tr_.tr("signals.outcome.error"))
+
+        if not self.runner.running:
+            # پیش از راه‌اندازی حلقهٔ پس‌زمینه (و در آزمون‌ها): همان مسیر هم‌گام
+            try:
+                apply(load())
+            except Exception as error:  # noqa: BLE001
+                failed("outcome-view", error)
+            return
+        self.runner.run_blocking(
+            "outcome-view", load, on_success=apply, on_error=failed
+        )
+
+    def _on_outcome_view_shown(self) -> None:
+        """صفحهٔ عملکرد نمایش داده شد؛ اگر کهنه است تازه شود."""
+        if self._outcome_view_stale:
+            self._refresh_outcome_view(quiet=True)
 
     def _outcome_row(self, record: Any) -> dict:
         """تبدیل یک رکورد نتیجه به ردیف جدول."""
@@ -2617,9 +2912,20 @@ class MainController(QObject):
     def stop_market_scan(self) -> None:
         """توقف پویش در جریان."""
         self.runner.cancel("market-scan")
+        self._scan_live_active = False
         self.signals.set_scanning(False)
-        self.signals.set_scan_status(self.tr_.tr("signals.scan_cancelled"))
-        self.status(self.tr_.tr("signals.scan_cancelled"))
+        # نتیجه‌های زندهٔ تا این لحظه حفظ و نمایش داده می‌شوند
+        self._scan_live_dirty = bool(getattr(self, "_scan_live_signals", None))
+        self._flush_scan_live()
+        self._stop_live_flush()
+        partial = list(getattr(self, "_scan_live_signals", []) or [])
+        if partial:
+            self._seed_auto_focus(partial)
+            message = self.tr_.tr("signals.scan_cancelled_partial", found=len(partial))
+        else:
+            message = self.tr_.tr("signals.scan_cancelled")
+        self.signals.set_scan_status(message)
+        self.status(message)
 
     def analyze_scanned_symbol(self, symbol: str) -> None:
         """
@@ -3739,8 +4045,23 @@ class MainController(QObject):
         self._open_signal_detail(row)
 
     def _on_history_double_clicked(self, row: int, _column: int) -> None:
-        """دوبار کلیک روی سابقه سیگنال‌ها."""
-        self._open_signal_detail(row)
+        """
+        دوبار کلیک روی سابقه سیگنال‌ها.
+
+        ۲.۴.۲: جدول سابقه ممکن است مرتب/گروه‌بندی شده باشد؛ ردیف جدول با
+        شناسه به ردیف متناظر `_last_signal_rows` نگاشته می‌شود تا جزئیات
+        همان سیگنالی باز شود که کاربر رویش کلیک کرده.
+        """
+        target = row
+        getter = getattr(self.signals, "history_row_at", None)
+        shown = getter(row) if callable(getter) else {}
+        record_id = shown.get("id") if shown else None
+        if record_id is not None:
+            for index, candidate in enumerate(self._last_signal_rows):
+                if candidate.get("id") == record_id:
+                    target = index
+                    break
+        self._open_signal_detail(target)
 
     def _open_signal_detail(self, row: int) -> None:
         """
@@ -7088,6 +7409,19 @@ class MainController(QObject):
             "verdict": self.tr_.tr(verdict_key),
             "verdict_role": verdict_role,
         }
+
+    def _terminal_timer_tick(self) -> None:
+        """
+        تیک ۱ ثانیه‌ای ترمینال (۲.۴.۲): وقتی صفحهٔ معاملات دیده نمی‌شود،
+        نشاندن کارت‌ها، نمودار و جدول‌هایش فقط CPU و GIL را هدر می‌دهد.
+        خروج موقعیت‌ها تیک‌محور است و به این نمایش وابسته نیست.
+        """
+        try:
+            if not self.trades.isVisible():
+                return
+        except RuntimeError:
+            return
+        self._refresh_auto_terminal()
 
     def _refresh_auto_terminal(self) -> None:
         """

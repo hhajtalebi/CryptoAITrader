@@ -24,7 +24,10 @@ from __future__ import annotations
 from collections.abc import Callable
 
 import asyncio
+import contextlib
+import contextvars
 import time
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from typing import Any
 
@@ -57,6 +60,35 @@ MAX_COOLDOWN_SECONDS = 300.0
 
 #: ذخیرهٔ snapshot قیمت‌ها در DB برای حالت آفلاین؛ هر چند ثانیه کافی است.
 SNAPSHOT_PERSIST_INTERVAL = 30.0
+
+#: نسخهٔ ۲.۴.۱ — «درخواست انبوه» (پویش صدها/هزاران نماد).
+#:
+#: در این حالت کندل‌ها نه در پایگاه داده نوشته می‌شوند و نه در حافظهٔ نهان
+#: مشترک می‌نشینند. دلیل: پویش کل صرافی یعنی ~۴۰۰۰ درخواست کندل؛ نوشتن ۳۰۰
+#: کندل برای هر کدام میلیون‌ها ردیف SQLite و دیسکِ مشغول می‌ساخت (کل سیستم
+#: کند می‌شد)، و پرشدن حافظهٔ نهان ۵۰۰تایی، تیکر/قیمت داشبورد و معاملهٔ
+#: خودکار را بیرون می‌انداخت و درخواست REST اضافه و محدودیت نرخ می‌ساخت.
+#: ContextVar است تا فقط کارهای همان پویش (و تسک‌های فرزندش) را تحت تأثیر
+#: قرار دهد، نه داشبورد و معاملهٔ خودکار را که روی همان حلقه اجرا می‌شوند.
+_BULK_FETCH: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "market_bulk_fetch", default=False
+)
+
+
+@contextlib.contextmanager
+def bulk_fetch() -> Iterator[None]:
+    """علامت‌گذاری درخواست‌های این بلوک (و تسک‌های ساخته‌شده در آن) به‌عنوان انبوه."""
+    token = _BULK_FETCH.set(True)
+    try:
+        yield
+    finally:
+        _BULK_FETCH.reset(token)
+
+
+def is_bulk_fetch() -> bool:
+    """آیا درخواست جاری بخشی از یک پویش انبوه است؟"""
+    return _BULK_FETCH.get()
+
 
 _RATE_LIMIT_CODES = {429, 418, -1003, -1015, "429", "418", "-1003", "-1015"}
 
@@ -652,6 +684,9 @@ class MarketDataEngine:
             # `get_all_tickers` سلامت را گزارش می‌کرد، برای همین کاربری
             # که در صفحهٔ تحلیل بود آفلاین می‌ماند با اینکه داده می‌آمد.
             self._mark_rest_alive(True)
+            if is_bulk_fetch():
+                # پویش انبوه: نه دیسک، نه بیرون‌انداختن دادهٔ داغ از حافظهٔ نهان
+                return candles
             ttl = self._cache_ttl_for(timeframe)
             self._cache.set(cache_key, candles, ttl_seconds=ttl)
             self._persist_candles(symbol, timeframe, candles)

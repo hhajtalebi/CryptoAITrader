@@ -150,4 +150,9 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # نسخهٔ ۲.۴.۲: استخر فرایند محاسبهٔ پویش در نسخهٔ ساخته‌شده (exe)
+    # بدون این خط، هر کارگر یک پنجرهٔ تازهٔ برنامه باز می‌کرد.
+    import multiprocessing
+
+    multiprocessing.freeze_support()
     sys.exit(main())

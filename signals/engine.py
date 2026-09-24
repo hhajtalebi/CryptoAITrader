@@ -43,7 +43,7 @@ from indicators.support_resistance import (
     detect_trend,
     find_support_resistance,
 )
-from market.engine import MarketDataEngine
+from market.engine import MarketDataEngine, is_bulk_fetch
 from signals.risk_engine import RiskEngine
 from signals.validity import entry_window_minutes, expiry_minutes, primary_timeframe as pick_speed_frame
 from signals import confidence as confidence_model
@@ -79,6 +79,40 @@ TIMEFRAME_WEIGHTS: dict[str, float] = {
 DECISION_THRESHOLD = 0.22
 
 
+def compute_timeframe_analysis(
+    indicators: IndicatorEngine, symbol: str, timeframe: str, candles: list[Any]
+) -> dict[str, Any]:
+    """
+    بخش خالص و هم‌گام تحلیل یک تایم‌فریم.
+
+    هم در همین فرایند و هم در فرایند کارگر `signals.compute_pool` اجرا
+    می‌شود؛ بنابراین نباید به حالت موتور وابسته باشد (۲.۴.۲).
+    """
+    if len(candles) < MIN_CANDLES_FOR_ANALYSIS:
+        raise InsufficientDataError(
+            f"Only {len(candles)} candles available (need {MIN_CANDLES_FOR_ANALYSIS})",
+            details={"symbol": symbol, "timeframe": timeframe},
+        )
+
+    results = indicators.calculate_many(
+        REQUIRED_INDICATORS,
+        candles,
+        timeframe,
+        symbol=symbol,
+        parameters=SIGNAL_INDICATOR_PARAMETERS,
+    )
+    summaries = {name: result.to_summary() for name, result in results.items()}
+
+    return {
+        "candles": candles,
+        "indicators": summaries,
+        "structure": analyze_market_structure(candles, timeframe),
+        "levels": find_support_resistance(candles, max_levels=10),
+        "trend": detect_trend(candles),
+        "atr_result": results.get("ATR"),
+    }
+
+
 class SignalEngine:
     """
     تولیدکننده سیگنال معاملاتی.
@@ -106,6 +140,23 @@ class SignalEngine:
         # با نرخ برد واقعی همان بازه تعدیل می‌شود؛ نبودش یعنی سامانه
         # ادعای اثبات‌نشده نمی‌کند.
         self._calibration_source = calibration_source
+        # نسخهٔ ۲.۴.۱ — «دروازهٔ محاسبه»: هر بار فقط یک محاسبهٔ سنگین
+        # (اندیکاتور/ساختار/سطوح یک تایم‌فریم) روی حلقه اجرا می‌شود و بین
+        # دو محاسبه حلقه نوبت را به وب‌سوکت، تایمرها و بقیه می‌دهد. بدون آن،
+        # در پویش موازی ۱۶ محاسبه پشت‌سرهم اجرا می‌شد و حلقه تا ۴۰۰ms قفل
+        # می‌ماند. Lock تنبل ساخته می‌شود تا به حلقهٔ درست بچسبد.
+        self._compute_gate: asyncio.Lock | None = None
+        self._compute_gate_loop: Any = None
+        # نسخهٔ ۲.۴.۲ — استخر فرایند برای پویش انبوه (اختیاری)
+        self._compute_pool: Any = None
+
+    def _gate(self) -> asyncio.Lock:
+        """قفل محاسبهٔ متعلق به حلقهٔ جاری."""
+        loop = asyncio.get_running_loop()
+        if self._compute_gate is None or self._compute_gate_loop is not loop:
+            self._compute_gate = asyncio.Lock()
+            self._compute_gate_loop = loop
+        return self._compute_gate
 
     @property
     def risk_engine(self) -> RiskEngine:
@@ -389,29 +440,33 @@ class SignalEngine:
     async def _analyze_timeframe(self, symbol: str, timeframe: str) -> dict[str, Any]:
         """گردآوری کندل، اندیکاتور، ساختار و سطوح یک تایم‌فریم."""
         candles = await self._market.get_candles(symbol, timeframe, self._candle_limit)
-        if len(candles) < MIN_CANDLES_FOR_ANALYSIS:
-            raise InsufficientDataError(
-                f"Only {len(candles)} candles available (need {MIN_CANDLES_FOR_ANALYSIS})",
-                details={"symbol": symbol, "timeframe": timeframe},
+        pool = self._compute_pool
+        if pool is not None and is_bulk_fetch() and len(candles) >= MIN_CANDLES_FOR_ANALYSIS:
+            # نسخهٔ ۲.۴.۲: در پویش انبوه محاسبهٔ سنگین در فرایند کارگر جدا
+            # (با اولویت پایین) انجام می‌شود تا GIL نخ رابط گرافیکی را
+            # معطل نکند. هر خطای استخر → همان محاسبهٔ محلی قبلی.
+            params_getter = getattr(self._indicators, "default_parameters", None)
+            payload = await pool.compute_timeframe(
+                symbol, timeframe, candles,
+                params_getter() if callable(params_getter) else {},
             )
+            if payload is not None:
+                payload["candles"] = candles
+                return payload
+        async with self._gate():
+            try:
+                return self._compute_timeframe(symbol, timeframe, candles)
+            finally:
+                # نوبت به تایمرها و وب‌سوکت پیش از محاسبهٔ بعدی
+                await asyncio.sleep(0)
 
-        results = self._indicators.calculate_many(
-            REQUIRED_INDICATORS,
-            candles,
-            timeframe,
-            symbol=symbol,
-            parameters=SIGNAL_INDICATOR_PARAMETERS,
-        )
-        indicators = {name: result.to_summary() for name, result in results.items()}
+    def set_compute_pool(self, pool: Any) -> None:
+        """اتصال استخر فرایند محاسبه (یا None برای محاسبهٔ محلی)."""
+        self._compute_pool = pool
 
-        return {
-            "candles": candles,
-            "indicators": indicators,
-            "structure": analyze_market_structure(candles, timeframe),
-            "levels": find_support_resistance(candles, max_levels=10),
-            "trend": detect_trend(candles),
-            "atr_result": results.get("ATR"),
-        }
+    def _compute_timeframe(self, symbol: str, timeframe: str, candles: list[Any]) -> dict[str, Any]:
+        """بخش هم‌گام (CPU) تحلیل یک تایم‌فریم."""
+        return compute_timeframe_analysis(self._indicators, symbol, timeframe, candles)
 
     # ------------------------------------------------------------------
     # جمع‌بندی رأی‌ها

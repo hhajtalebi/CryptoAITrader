@@ -54,6 +54,24 @@ DEFAULT_FOCUS_SIZE = 10
 #: کمینهٔ ضریب اطمینان برای ورود به فهرست تمرکز
 DEFAULT_FOCUS_MIN_CONFIDENCE = 55
 
+#: منبع نمادهای سیگنال‌گیری خودکار (نسخهٔ ۲.۴.۰)
+#:   found  — فقط سیگنال‌هایی که در پویش بالا پیدا شده‌اند (و فهرست تمرکز)
+#:   market — فقط چرخش روی کل بازار صرافی
+#:   both   — هر دو: کل بازار با فاصلهٔ بلند، سیگنال‌های پیداشده با فاصلهٔ کوتاه
+SOURCE_FOUND = "found"
+SOURCE_MARKET = "market"
+SOURCE_BOTH = "both"
+SOURCES = (SOURCE_BOTH, SOURCE_FOUND, SOURCE_MARKET)
+
+#: سقف فهرست تمرکز/سیگنال‌های پیداشده
+MAX_FOCUS_SIZE = 100
+
+
+def normalize_source(value: Any) -> str:
+    """منبع نامعتبر → «هر دو» (رفتار پیش‌فرض)."""
+    text = str(value or "").strip().lower()
+    return text if text in SOURCES else SOURCE_BOTH
+
 
 def clamp_interval(seconds: Any) -> int:
     """
@@ -91,6 +109,24 @@ class AutoScanConfig:
     sweep_limit: int = 120
     #: فقط وقتی پنجرهٔ برنامه دیده می‌شود پویش کن
     only_when_visible: bool = False
+    #: منبع نمادها: found | market | both
+    source: str = SOURCE_BOTH
+    #: جهان چرخش کامل: «all» همهٔ نمادهای صرافی، «top» پرگردش‌ترین‌ها تا sweep_limit
+    universe: str = "all"
+    #: کمینهٔ گردش ۲۴ ساعته در چرخش کامل (صفر = بدون حد)
+    min_turnover: float = 0.0
+    #: پالایش هوشمند (بازار مرده، استیبل/استیبل، توکن اهرمی)
+    smart_filter: bool = True
+
+    @property
+    def sweep_active(self) -> bool:
+        """آیا چرخش روی کل بازار اجرا می‌شود؟"""
+        return bool(self.full_sweep_enabled) and normalize_source(self.source) != SOURCE_FOUND
+
+    @property
+    def focus_active(self) -> bool:
+        """آیا سیگنال‌های پیداشده/فهرست تمرکز مکرر بررسی می‌شوند؟"""
+        return normalize_source(self.source) != SOURCE_MARKET
 
     def normalized(self) -> AutoScanConfig:
         """نسخهٔ اصلاح‌شده با مقادیر درون بازهٔ مجاز."""
@@ -99,10 +135,14 @@ class AutoScanConfig:
             focus_interval=clamp_interval(self.focus_interval),
             full_sweep_enabled=bool(self.full_sweep_enabled),
             full_interval=clamp_interval(self.full_interval),
-            focus_size=max(1, min(50, int(self.focus_size or DEFAULT_FOCUS_SIZE))),
+            focus_size=max(1, min(MAX_FOCUS_SIZE, int(self.focus_size or DEFAULT_FOCUS_SIZE))),
             focus_min_confidence=max(0, min(100, int(self.focus_min_confidence or 0))),
             sweep_limit=max(10, min(1000, int(self.sweep_limit or 120))),
             only_when_visible=bool(self.only_when_visible),
+            source=normalize_source(self.source),
+            universe="top" if str(self.universe).lower() == "top" else "all",
+            min_turnover=max(0.0, _safe_float(self.min_turnover)),
+            smart_filter=bool(self.smart_filter),
         )
 
     @classmethod
@@ -120,7 +160,18 @@ class AutoScanConfig:
             ),
             sweep_limit=int(get("signals.auto_scan_sweep_limit", 120) or 0),
             only_when_visible=bool(get("signals.auto_scan_only_visible", False)),
+            source=normalize_source(get("signals.auto_scan_source", SOURCE_BOTH)),
+            universe=str(get("signals.auto_scan_universe", "all") or "all"),
+            min_turnover=_safe_float(get("signals.auto_scan_min_turnover", 0.0)),
+            smart_filter=bool(get("signals.auto_scan_smart_filter", True)),
         ).normalized()
+
+
+def _safe_float(value: Any) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 @dataclass
@@ -184,12 +235,12 @@ class AutoScanScheduler:
 
         moment = now or datetime.now(timezone.utc)
 
-        if self.config.full_sweep_enabled and self._elapsed(self.last_full_at, moment) >= (
+        if self.config.sweep_active and self._elapsed(self.last_full_at, moment) >= (
             self.config.full_interval
         ):
             return ScanJob(kind="full", symbols=(), reason="auto.reason_full_sweep")
 
-        if self.focus_symbols and self._elapsed(self.last_focus_at, moment) >= (
+        if self.config.focus_active and self.focus_symbols and self._elapsed(self.last_focus_at, moment) >= (
             self.config.focus_interval
         ):
             return ScanJob(
@@ -200,7 +251,13 @@ class AutoScanScheduler:
 
         # هنوز فهرست تمرکزی نداریم و چرخش کامل خاموش است: یک چرخش کامل
         # لازم است وگرنه سیستم هرگز شروع نمی‌شود.
-        if not self.focus_symbols and self.last_full_at is None:
+        # در حالت «فقط سیگنال‌های پیداشده» چرخش کامل هرگز خودبه‌خود اجرا
+        # نمی‌شود؛ فهرست از پویش دستی بالا می‌آید (seed_focus).
+        if (
+            not self.focus_symbols
+            and self.last_full_at is None
+            and normalize_source(self.config.source) != SOURCE_FOUND
+        ):
             return ScanJob(kind="full", symbols=(), reason="auto.reason_bootstrap")
 
         return None
@@ -216,9 +273,9 @@ class AutoScanScheduler:
         moment = now or datetime.now(timezone.utc)
 
         waits: list[float] = []
-        if self.config.full_sweep_enabled:
+        if self.config.sweep_active:
             waits.append(self.config.full_interval - self._elapsed(self.last_full_at, moment))
-        if self.focus_symbols:
+        if self.config.focus_active and self.focus_symbols:
             waits.append(self.config.focus_interval - self._elapsed(self.last_focus_at, moment))
         if not waits:
             return 0
@@ -316,6 +373,25 @@ class AutoScanScheduler:
         ranked.sort(key=lambda item: item[0], reverse=True)
         return [symbol for _confidence, symbol in ranked[: self.config.focus_size]]
 
+    def seed_focus(self, signals: list[Any], *, replace: bool = False) -> list[str]:
+        """
+        تغذیهٔ فهرست تمرکز از بیرون (نسخهٔ ۲.۴.۰).
+
+        - پس از پویش دستی: سیگنال‌های «بالا» همان نمادهایی می‌شوند که
+          سیگنال‌گیر خودکار دنبال می‌کند (`replace=True` در حالت found).
+        - در میانهٔ چرخش کامل: هر سیگنال قوی همان لحظه به فهرست اضافه
+          می‌شود تا تا پایان چرخشِ طولانی منتظر نماند.
+        """
+        fresh = self._rank(signals)
+        if replace:
+            if fresh:
+                self.focus_symbols = fresh
+            return list(self.focus_symbols)
+        if fresh:
+            remaining = [s for s in self.focus_symbols if s not in fresh]
+            self.focus_symbols = (fresh + remaining)[: self.config.focus_size]
+        return list(self.focus_symbols)
+
     def _refresh_focus(self, signals: list[Any]) -> None:
         """
         به‌روزرسانی ترتیب فهرست تمرکز پس از یک چرخهٔ تمرکز.
@@ -359,6 +435,12 @@ class AutoScanScheduler:
 
 
 __all__ = [
+    "MAX_FOCUS_SIZE",
+    "SOURCES",
+    "SOURCE_BOTH",
+    "SOURCE_FOUND",
+    "SOURCE_MARKET",
+    "normalize_source",
     "DEFAULT_FOCUS_INTERVAL",
     "DEFAULT_FOCUS_MIN_CONFIDENCE",
     "DEFAULT_FOCUS_SIZE",

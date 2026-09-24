@@ -7,13 +7,16 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QHBoxLayout,
     QLabel,
+    QMenu,
     QProgressBar,
     QSizePolicy,
     QSpinBox,
@@ -24,11 +27,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QBrush, QColor
+from PySide6.QtGui import QBrush, QColor, QKeySequence, QShortcut
 
 from localization import Translator
 from market.timeframes import SUPPORTED_TIMEFRAMES
 from ui.pages.base_page import BasePage
+from ui.signal_share import copy_to_clipboard, format_signal_text, signal_symbol
 from ui.signal_grading import (
     freshness_grade,
     CONFIDENCE_GOOD,
@@ -104,6 +108,10 @@ class SignalsPage(BasePage):
     auto_scan_changed = Signal(dict)
     #: کاربر خواست همین حالا یک چرخهٔ خودکار اجرا شود
     auto_scan_run_now = Signal()
+    #: نسخهٔ ۲.۴.۰ — گزینه‌های پایدار پویش دستی (جهان، تعداد، پالایش) تغییر کرد
+    scan_settings_changed = Signal(dict)
+    #: نسخهٔ ۲.۴.۲ — پیام کوتاه «کپی شد» برای نمایش در اعلان برنامه
+    copy_notice = Signal(str)
 
     def __init__(self, translator: Translator, parent: Any = None) -> None:
         self._history_rows: list[dict[str, Any]] = []
@@ -242,6 +250,7 @@ class SignalsPage(BasePage):
         self.history_table.setAlternatingRowColors(True)
         self.history_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.history_card.add(self.history_table)
+        self._install_copy_support(self.history_table, self.history_row_at)
         splitter.addWidget(self.history_card)
         splitter.setSizes([340, 620])
 
@@ -311,9 +320,30 @@ class SignalsPage(BasePage):
 
         self.scan_wait_check = QCheckBox(self.tr_.tr("signals.scan_include_wait"))
 
+        # ---- نسخهٔ ۲.۴.۰: دامنهٔ پویش. کاربر خواست تعداد دستی بماند، ولی
+        # گزینه‌ای باشد که کل نمادهای صرافی را پویش کند.
+        self.scan_scope_label = QLabel(self.tr_.tr("signals.scan_scope"))
+        self.scan_scope_label.setProperty("role", "muted")
+        self.scan_scope_combo = QComboBox()
+        self._fill_scope_combo(self.scan_scope_combo, "signals.scan_scope_top", "signals.scan_scope_all")
+        self.scan_scope_combo.currentIndexChanged.connect(self._on_scan_scope_changed)
+        self.scan_limit_spin.valueChanged.connect(self._emit_scan_settings)
+
+        self.scan_smart_check = QCheckBox(self.tr_.tr("signals.scan_smart_filter"))
+        self.scan_smart_check.setChecked(True)
+        self.scan_smart_check.setToolTip(self.tr_.tr("signals.scan_smart_filter_tip"))
+        self.scan_smart_check.toggled.connect(self._emit_scan_settings)
+
+        self.scan_turnover_label = QLabel(self.tr_.tr("signals.scan_min_turnover"))
+        self.scan_turnover_label.setProperty("role", "muted")
+        self.scan_turnover_spin = self._make_turnover_spin()
+        self.scan_turnover_spin.valueChanged.connect(self._emit_scan_settings)
+
         scan_row.addWidget(self.scan_button)
         scan_row.addWidget(self.scan_stop_button)
         scan_row.addSpacing(12)
+        scan_row.addWidget(self.scan_scope_label)
+        scan_row.addWidget(self.scan_scope_combo)
         scan_row.addWidget(self.scan_limit_label)
         scan_row.addWidget(self.scan_limit_spin)
         scan_row.addWidget(self.scan_confidence_label)
@@ -321,6 +351,19 @@ class SignalsPage(BasePage):
         scan_row.addWidget(self.scan_wait_check)
         scan_row.addStretch(1)
         self.scan_card.add(row)
+
+        filter_row = QWidget()
+        filter_line = QHBoxLayout(filter_row)
+        filter_line.setContentsMargins(0, 0, 0, 0)
+        filter_line.setSpacing(8)
+        filter_line.addWidget(self.scan_smart_check)
+        filter_line.addSpacing(12)
+        filter_line.addWidget(self.scan_turnover_label)
+        filter_line.addWidget(self.scan_turnover_spin)
+        filter_line.addStretch(1)
+        self.scan_card.add(filter_row)
+        self._scan_started_at = 0.0
+        self._on_scan_scope_changed(emit=False)
 
         self.scan_progress = QProgressBar()
         self.scan_progress.setRange(0, 100)
@@ -353,6 +396,18 @@ class SignalsPage(BasePage):
         self.scan_table.cellClicked.connect(self._on_scan_cell_clicked)
         self.scan_table.cellDoubleClicked.connect(self._on_scan_cell_clicked)
         self.scan_card.add(self.scan_table)
+
+        self.scan_cap_note = QLabel("")
+        self.scan_cap_note.setProperty("role", "faint")
+        self.scan_cap_note.setWordWrap(True)
+        self.scan_cap_note.setVisible(False)
+        self.scan_card.add(self.scan_cap_note)
+        self._install_copy_support(self.scan_table, self.scan_row_at)
+
+        self.scan_copy_hint = QLabel(self.tr_.tr("signals.share.table_hint"))
+        self.scan_copy_hint.setProperty("role", "faint")
+        self.scan_copy_hint.setWordWrap(True)
+        self.scan_card.add(self.scan_copy_hint)
 
         self.scan_legend = QLabel(self.tr_.tr("signals.legend_text"))
         self.scan_legend.setProperty("role", "faint")
@@ -389,6 +444,18 @@ class SignalsPage(BasePage):
         line_one.addWidget(self.auto_enable_check)
         line_one.addSpacing(12)
 
+        # نسخهٔ ۲.۴.۰ — منبع: سیگنال‌های پیداشده، کل بازار یا هر دو
+        self.auto_source_label = QLabel(self.tr_.tr("signals.auto.source"))
+        self.auto_source_label.setProperty("role", "muted")
+        self.auto_source_combo = QComboBox()
+        for source in ("both", "found", "market"):
+            self.auto_source_combo.addItem(
+                self.tr_.tr(f"signals.auto.source_{source}"), source
+            )
+        self.auto_source_combo.currentIndexChanged.connect(self._on_auto_toggled)
+        line_one.addWidget(self.auto_source_label)
+        line_one.addWidget(self.auto_source_combo)
+
         self.auto_interval_label = QLabel(self.tr_.tr("signals.auto.interval"))
         self.auto_interval_label.setProperty("role", "muted")
         self.auto_interval_spin = QSpinBox()
@@ -405,7 +472,7 @@ class SignalsPage(BasePage):
         self.auto_focus_label = QLabel(self.tr_.tr("signals.auto.focus_size"))
         self.auto_focus_label.setProperty("role", "muted")
         self.auto_focus_spin = QSpinBox()
-        self.auto_focus_spin.setRange(1, 50)
+        self.auto_focus_spin.setRange(1, 100)
         self.auto_focus_spin.setValue(10)
         self.auto_focus_spin.setFixedWidth(80)
         self.auto_focus_spin.valueChanged.connect(self._emit_auto_config)
@@ -423,8 +490,10 @@ class SignalsPage(BasePage):
         self.auto_sweep_check = QCheckBox(self.tr_.tr("signals.auto.full_sweep"))
         self.auto_sweep_check.setChecked(True)
         self.auto_sweep_check.toggled.connect(self._on_auto_toggled)
+        # از ۲.۴.۰ «منبع» جای این تیک را گرفته؛ برای سازگاری نگه داشته
+        # و با منبع هم‌گام می‌شود (منبع ≠ found یعنی چرخش روشن).
+        self.auto_sweep_check.setVisible(False)
         line_two.addWidget(self.auto_sweep_check)
-        line_two.addSpacing(12)
 
         self.auto_sweep_interval_label = QLabel(self.tr_.tr("signals.auto.full_interval"))
         self.auto_sweep_interval_label.setProperty("role", "muted")
@@ -460,6 +529,42 @@ class SignalsPage(BasePage):
         line_two.addStretch(1)
         self.auto_card.add(row_two)
 
+        # ---- سطر سه (۲.۴.۰): جهان چرخش کامل و پالایش هوشمند
+        row_three = QWidget()
+        line_three = QHBoxLayout(row_three)
+        line_three.setContentsMargins(0, 0, 0, 0)
+        line_three.setSpacing(8)
+        self.auto_universe_label = QLabel(self.tr_.tr("signals.auto.universe"))
+        self.auto_universe_label.setProperty("role", "muted")
+        self.auto_universe_combo = QComboBox()
+        self._fill_scope_combo(self.auto_universe_combo, "signals.scan_scope_top", "signals.scan_scope_all")
+        self.auto_universe_combo.setCurrentIndex(1)
+        self.auto_universe_combo.currentIndexChanged.connect(self._on_auto_toggled)
+        self.auto_sweep_limit_label = QLabel(self.tr_.tr("signals.scan_limit"))
+        self.auto_sweep_limit_label.setProperty("role", "muted")
+        self.auto_sweep_limit_spin = QSpinBox()
+        self.auto_sweep_limit_spin.setRange(10, 1000)
+        self.auto_sweep_limit_spin.setSingleStep(10)
+        self.auto_sweep_limit_spin.setValue(120)
+        self.auto_sweep_limit_spin.setFixedWidth(88)
+        self.auto_sweep_limit_spin.valueChanged.connect(self._emit_auto_config)
+        self.auto_smart_check = QCheckBox(self.tr_.tr("signals.scan_smart_filter"))
+        self.auto_smart_check.setToolTip(self.tr_.tr("signals.scan_smart_filter_tip"))
+        self.auto_smart_check.setChecked(True)
+        self.auto_smart_check.toggled.connect(self._emit_auto_config)
+        self.auto_turnover_label = QLabel(self.tr_.tr("signals.scan_min_turnover"))
+        self.auto_turnover_label.setProperty("role", "muted")
+        self.auto_turnover_spin = self._make_turnover_spin()
+        self.auto_turnover_spin.valueChanged.connect(self._emit_auto_config)
+        for widget in (
+            self.auto_universe_label, self.auto_universe_combo,
+            self.auto_sweep_limit_label, self.auto_sweep_limit_spin,
+            self.auto_smart_check, self.auto_turnover_label, self.auto_turnover_spin,
+        ):
+            line_three.addWidget(widget)
+        line_three.addStretch(1)
+        self.auto_card.add(row_three)
+
         # ---- وضعیت زنده
         self.auto_status = QLabel(self.tr_.tr("signals.auto.status_off"))
         self.auto_status.setProperty("role", "muted")
@@ -475,22 +580,44 @@ class SignalsPage(BasePage):
         self.layout_root().addWidget(self.auto_card)
         self._on_auto_toggled()
 
-    def _on_auto_toggled(self) -> None:
-        """فعال/غیرفعال کردن کنترل‌های وابسته و اعلام تغییر."""
+    def _auto_source(self) -> str:
+        """منبع انتخاب‌شدهٔ سیگنال‌گیری خودکار (both|found|market)."""
+        return str(self.auto_source_combo.currentData() or "both")
+
+    def _sync_auto_enabled(self) -> None:
+        """فعال/غیرفعال کردن کنترل‌های وابسته بدون اعلام تغییر."""
         enabled = self.auto_enable_check.isChecked()
+        source = self._auto_source()
+        sweep = source != "found"
+        focus = source != "market"
+        # تیک پنهان «چرخش کامل» همیشه با منبع هم‌گام است
+        self.auto_sweep_check.blockSignals(True)
+        self.auto_sweep_check.setChecked(sweep)
+        self.auto_sweep_check.blockSignals(False)
         for widget in (
+            self.auto_source_combo,
             self.auto_interval_spin,
-            self.auto_focus_spin,
-            self.auto_sweep_check,
             self.auto_min_confidence_spin,
             self.auto_notify_check,
             self.auto_run_button,
         ):
             widget.setEnabled(enabled)
-        # فاصلهٔ چرخش کامل فقط وقتی معنا دارد که خود چرخش روشن باشد
-        self.auto_sweep_interval_spin.setEnabled(
-            enabled and self.auto_sweep_check.isChecked()
+        self.auto_focus_spin.setEnabled(enabled and focus)
+        self.auto_sweep_check.setEnabled(enabled)
+        for widget in (
+            self.auto_sweep_interval_spin,
+            self.auto_universe_combo,
+            self.auto_smart_check,
+            self.auto_turnover_spin,
+        ):
+            widget.setEnabled(enabled and sweep)
+        self.auto_sweep_limit_spin.setEnabled(
+            enabled and sweep and self.auto_universe_combo.currentData() == "top"
         )
+
+    def _on_auto_toggled(self) -> None:
+        """فعال/غیرفعال کردن کنترل‌های وابسته و اعلام تغییر."""
+        self._sync_auto_enabled()
         self._emit_auto_config()
 
     def _emit_auto_config(self) -> None:
@@ -507,6 +634,11 @@ class SignalsPage(BasePage):
             "signals.auto_scan_focus_size": int(self.auto_focus_spin.value()),
             "signals.auto_scan_min_confidence": int(self.auto_min_confidence_spin.value()),
             "signals.auto_scan_notify": bool(self.auto_notify_check.isChecked()),
+            "signals.auto_scan_source": self._auto_source(),
+            "signals.auto_scan_universe": str(self.auto_universe_combo.currentData() or "all"),
+            "signals.auto_scan_sweep_limit": int(self.auto_sweep_limit_spin.value()),
+            "signals.auto_scan_min_turnover": float(self.auto_turnover_spin.value()) * 1000.0,
+            "signals.auto_scan_smart_filter": bool(self.auto_smart_check.isChecked()),
         }
 
     def set_auto_scan_options(self, values: dict[str, Any]) -> None:
@@ -524,6 +656,11 @@ class SignalsPage(BasePage):
             self.auto_focus_spin,
             self.auto_min_confidence_spin,
             self.auto_notify_check,
+            self.auto_source_combo,
+            self.auto_universe_combo,
+            self.auto_sweep_limit_spin,
+            self.auto_smart_check,
+            self.auto_turnover_spin,
         )
         for widget in widgets:
             widget.blockSignals(True)
@@ -549,23 +686,30 @@ class SignalsPage(BasePage):
             self.auto_notify_check.setChecked(
                 bool(values.get("signals.auto_scan_notify", True))
             )
+            source = str(values.get("signals.auto_scan_source", "both") or "both").lower()
+            if source not in ("both", "found", "market"):
+                source = "both"
+            # سازگاری: کاربری که پیش از ۲.۴.۰ چرخش کامل را خاموش کرده بود،
+            # در عمل «فقط سیگنال‌های پیداشده» را می‌خواست.
+            if source == "both" and not bool(values.get("signals.auto_scan_full_sweep", True)):
+                source = "found"
+            self._set_combo_data(self.auto_source_combo, source)
+            universe = str(values.get("signals.auto_scan_universe", "all") or "all").lower()
+            self._set_combo_data(self.auto_universe_combo, "top" if universe == "top" else "all")
+            self.auto_sweep_limit_spin.setValue(
+                int(values.get("signals.auto_scan_sweep_limit", 120) or 120)
+            )
+            self.auto_smart_check.setChecked(
+                bool(values.get("signals.auto_scan_smart_filter", True))
+            )
+            self.auto_turnover_spin.setValue(
+                self._safe_number(values.get("signals.auto_scan_min_turnover", 0.0)) / 1000.0
+            )
         finally:
             for widget in widgets:
                 widget.blockSignals(False)
 
-        enabled = self.auto_enable_check.isChecked()
-        for widget in (
-            self.auto_interval_spin,
-            self.auto_focus_spin,
-            self.auto_sweep_check,
-            self.auto_min_confidence_spin,
-            self.auto_notify_check,
-            self.auto_run_button,
-        ):
-            widget.setEnabled(enabled)
-        self.auto_sweep_interval_spin.setEnabled(
-            enabled and self.auto_sweep_check.isChecked()
-        )
+        self._sync_auto_enabled()
 
     def set_auto_scan_status(self, text: str, *, focus: list[str] | None = None) -> None:
         """نمایش وضعیت زنده و فهرست نمادهای تحت تمرکز."""
@@ -605,6 +749,104 @@ class SignalsPage(BasePage):
             "include_wait": bool(self.scan_wait_check.isChecked()),
         }
 
+    # ------------------------------------------------------------------
+    # نسخهٔ ۲.۴.۰ — دامنهٔ پویش و پالایش هوشمند
+    # ------------------------------------------------------------------
+    def _fill_scope_combo(self, combo: QComboBox, top_key: str, all_key: str) -> None:
+        combo.blockSignals(True)
+        current = combo.currentData()
+        combo.clear()
+        combo.addItem(self.tr_.tr(top_key), "top")
+        combo.addItem(self.tr_.tr(all_key), "all")
+        if current is not None:
+            self._set_combo_data(combo, current)
+        combo.blockSignals(False)
+
+    @staticmethod
+    def _set_combo_data(combo: QComboBox, value: Any) -> None:
+        index = combo.findData(value)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+
+    @staticmethod
+    def _safe_number(value: Any) -> float:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        return number if number > 0 else 0.0
+
+    def _make_turnover_spin(self) -> QDoubleSpinBox:
+        """کمینهٔ گردش ۲۴ساعته بر حسب هزار USDT (۰ = بدون محدودیت)."""
+        spin = QDoubleSpinBox()
+        spin.setDecimals(0)
+        spin.setRange(0, 10_000_000)
+        spin.setSingleStep(50)
+        spin.setValue(0)
+        spin.setSuffix(" K$")
+        spin.setFixedWidth(110)
+        spin.setToolTip(self.tr_.tr("signals.scan_min_turnover_tip"))
+        return spin
+
+    def _on_scan_scope_changed(self, *_args: Any, emit: bool = True) -> None:
+        """در حالت «کل بازار» تعداد معنا ندارد و غیرفعال می‌شود."""
+        whole = self.scan_scope_combo.currentData() == "all"
+        scanning = (not self.scan_stop_button.isHidden()) if hasattr(self, "scan_stop_button") else False
+        self.scan_limit_spin.setEnabled(not whole and not scanning)
+        if emit:
+            self._emit_scan_settings()
+
+    def _emit_scan_settings(self, *_args: Any) -> None:
+        self.scan_settings_changed.emit(self.scan_settings())
+
+    def scan_universe_options(self) -> dict[str, Any]:
+        """
+        گزینه‌های دامنهٔ پویش دستی.
+
+        جدا از `scan_options` نگه داشته شده تا قرارداد قبلی (سه کلید)
+        دست نخورد.
+        """
+        return {
+            "universe": str(self.scan_scope_combo.currentData() or "top"),
+            "min_turnover": float(self.scan_turnover_spin.value()) * 1000.0,
+            "smart_filter": bool(self.scan_smart_check.isChecked()),
+        }
+
+    def scan_settings(self) -> dict[str, Any]:
+        """کلیدهای تنظیمات پایدار پویش دستی."""
+        options = self.scan_universe_options()
+        return {
+            "signals.scan_universe": options["universe"],
+            "signals.scan_limit": int(self.scan_limit_spin.value()),
+            "signals.scan_min_turnover": options["min_turnover"],
+            "signals.scan_smart_filter": options["smart_filter"],
+        }
+
+    def set_scan_settings(self, values: dict[str, Any]) -> None:
+        """نشاندن تنظیمات ذخیره‌شدهٔ پویش دستی (بدون اعلام تغییر)."""
+        widgets = (
+            self.scan_scope_combo, self.scan_limit_spin,
+            self.scan_smart_check, self.scan_turnover_spin,
+        )
+        for widget in widgets:
+            widget.blockSignals(True)
+        try:
+            universe = str(values.get("signals.scan_universe", "top") or "top").lower()
+            self._set_combo_data(self.scan_scope_combo, "all" if universe == "all" else "top")
+            try:
+                limit = int(values.get("signals.scan_limit", 60) or 60)
+            except (TypeError, ValueError):
+                limit = 60
+            self.scan_limit_spin.setValue(max(5, min(limit, self.scan_limit_spin.maximum())))
+            self.scan_smart_check.setChecked(bool(values.get("signals.scan_smart_filter", True)))
+            self.scan_turnover_spin.setValue(
+                self._safe_number(values.get("signals.scan_min_turnover", 0.0)) / 1000.0
+            )
+        finally:
+            for widget in widgets:
+                widget.blockSignals(False)
+        self._on_scan_scope_changed(emit=False)
+
     def set_scanning(self, scanning: bool) -> None:
         """
         قفل‌کردن کنترل‌ها هنگام پویش.
@@ -617,11 +859,17 @@ class SignalsPage(BasePage):
             self.tr_.tr("signals.scan_running") if scanning else self.tr_.tr("signals.scan")
         )
         self.scan_stop_button.setVisible(scanning)
-        for widget in (self.scan_limit_spin, self.scan_confidence_spin, self.scan_wait_check):
+        for widget in (
+            self.scan_limit_spin, self.scan_confidence_spin, self.scan_wait_check,
+            self.scan_scope_combo, self.scan_smart_check, self.scan_turnover_spin,
+        ):
             widget.setEnabled(not scanning)
+        if not scanning:
+            self._on_scan_scope_changed(emit=False)
         self.scan_progress.setVisible(scanning)
         if scanning:
             self.scan_progress.setValue(0)
+            self._scan_started_at = time.monotonic()
 
     def set_scan_progress(self, done: int, total: int, symbol: str, found: int) -> None:
         """نمایش پیشرفت پویش."""
@@ -629,9 +877,26 @@ class SignalsPage(BasePage):
         self.scan_progress.setMaximum(total)
         self.scan_progress.setValue(int(done))
         self.scan_progress.setFormat(f"%v / %m  ({found})")
-        self.scan_status.setText(
-            self.tr_.tr("signals.scan_progress", done=done, total=total, symbol=symbol)
-        )
+        text = self.tr_.tr("signals.scan_progress", done=done, total=total, symbol=symbol)
+        eta = self._scan_eta_seconds(int(done), total)
+        if eta is not None:
+            text += "  ·  " + self.tr_.tr("signals.scan_eta", time=self._format_eta(eta))
+        self.scan_status.setText(text)
+
+    def _scan_eta_seconds(self, done: int, total: int) -> int | None:
+        """برآورد زمان باقی‌مانده از سرعت واقعی تا این لحظه."""
+        started = float(getattr(self, "_scan_started_at", 0.0) or 0.0)
+        if started <= 0 or done < 3 or done >= total:
+            return None
+        elapsed = time.monotonic() - started
+        if elapsed <= 0:
+            return None
+        return max(0, int(round(elapsed / done * (total - done))))
+
+    @staticmethod
+    def _format_eta(seconds: int) -> str:
+        minutes, secs = divmod(max(0, int(seconds)), 60)
+        return f"{minutes}:{secs:02d}"
 
     def set_scan_status(self, text: str) -> None:
         """نوشتن یک پیام وضعیت زیر نوار پیشرفت."""
@@ -640,6 +905,8 @@ class SignalsPage(BasePage):
 
     #: بیشترین ردیفی که جدول پویش بدون اسکرول داخلی نشان می‌دهد
     SCAN_VISIBLE_ROWS = 12
+    #: نسخهٔ ۲.۴.۱ — سقف ردیف‌های نمایش‌داده‌شده در جدول پویش (بهترین‌ها)
+    SCAN_MAX_ROWS = 200
 
     def _fit_scan_table_height(self) -> None:
         """
@@ -668,7 +935,36 @@ class SignalsPage(BasePage):
         بهترین سیگنال است — همان چیزی که کاربر خواست بالا بیاید. رنگ‌ها
         از پوستهٔ فعال گرفته می‌شوند تا در هر پوسته‌ای خوانا بمانند.
         """
+        # نسخهٔ ۲.۴.۱: پویش کل صرافی می‌تواند صدها ردیف بسازد و جدول هنگام
+        # پویش زنده هر چند صد میلی‌ثانیه از نو پر می‌شود. هر ردیف یک دکمه
+        # (ویجت واقعی) دارد و ستون‌ها «به اندازهٔ محتوا» هستند، یعنی هر setItem
+        # همهٔ ردیف‌ها را دوباره اندازه می‌گرفت — رابط هنگ می‌کرد. حالا فقط
+        # بهترین‌ها (تا سقف) نمایش داده می‌شوند و جدول یک‌جا رسم می‌شود.
+        total = len(rows)
+        rows = list(rows[: self.SCAN_MAX_ROWS])
         self._scan_rows = [dict(row) for row in rows]
+        self._scan_total_rows = total
+        header = self.scan_table.horizontalHeader()
+        from PySide6.QtWidgets import QHeaderView
+
+        self.scan_table.setUpdatesEnabled(False)
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        try:
+            self._fill_scan_rows(rows)
+        finally:
+            self._apply_scan_headers()
+            self.scan_table.setUpdatesEnabled(True)
+        if total > len(rows):
+            self.scan_cap_note.setText(
+                self.tr_.tr("signals.scan_rows_capped", shown=len(rows), total=total)
+            )
+            self.scan_cap_note.setVisible(True)
+        else:
+            self.scan_cap_note.setVisible(False)
+        self._fit_scan_table_height()
+
+    def _fill_scan_rows(self, rows: list[dict[str, Any]]) -> None:
+        """پرکردن خانه‌های جدول پویش (بدون رسم میانی)."""
         self.scan_table.setRowCount(len(rows))
 
         for index, row in enumerate(rows):
@@ -728,8 +1024,6 @@ class SignalsPage(BasePage):
             )
             self.scan_table.setCellWidget(index, self.SCAN_COL_ACTION, button)
 
-        self._fit_scan_table_height()
-
     def _freshness_item(self, row: dict[str, Any]) -> QTableWidgetItem:
         """
         ساخت خانهٔ «اعتبار» برای یک ردیف سیگنال.
@@ -769,6 +1063,71 @@ class SignalsPage(BasePage):
         symbol = item.text().strip()
         if symbol:
             self.scan_detail_requested.emit(symbol)
+
+    # ------------------------------------------------------------------
+    # کپی نام و اطلاعات سیگنال (۲.۴.۲)
+    # ------------------------------------------------------------------
+    def scan_row_at(self, row: int) -> dict[str, Any]:
+        """دادهٔ ردیف `row` جدول پویش (همان ترتیب نمایش)."""
+        item = self.scan_table.item(row, 1) if row >= 0 else None
+        if item is None:
+            return {}
+        return self.scan_row(item.text().strip())
+
+    def history_row_at(self, row: int) -> dict[str, Any]:
+        """دادهٔ ردیف `row` جدول سابقه (همان ترتیب مرتب‌شدهٔ نمایش)."""
+        if 0 <= row < len(self._history_rows):
+            return dict(self._history_rows[row])
+        return {}
+
+    def _install_copy_support(self, table: QTableWidget, row_getter: Any) -> None:
+        """منوی راست‌کلیک «کپی نماد / کپی اطلاعات» و میان‌بر Ctrl+C روی جدول."""
+        table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        table.customContextMenuRequested.connect(
+            lambda pos, t=table, g=row_getter: self._show_copy_menu(t, g, pos)
+        )
+        shortcut = QShortcut(QKeySequence(QKeySequence.StandardKey.Copy), table)
+        shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        shortcut.activated.connect(
+            lambda t=table, g=row_getter: self.copy_signal_info(g(t.currentRow()))
+        )
+        table.setToolTip(self.tr_.tr("signals.share.table_hint"))
+
+    def _show_copy_menu(self, table: QTableWidget, row_getter: Any, pos: Any) -> None:
+        index = table.indexAt(pos)
+        if not index.isValid():
+            return
+        data = row_getter(index.row())
+        if not data:
+            return
+        menu = QMenu(table)
+        symbol_action = menu.addAction(self.tr_.tr("signals.share.copy_symbol"))
+        info_action = menu.addAction(self.tr_.tr("signals.share.copy_info"))
+        symbol_action.setEnabled(bool(signal_symbol(data)))
+        chosen = menu.exec(table.viewport().mapToGlobal(pos))
+        if chosen is symbol_action:
+            self.copy_signal_symbol(data)
+        elif chosen is info_action:
+            self.copy_signal_info(data)
+
+    def copy_signal_symbol(self, data: dict[str, Any]) -> bool:
+        """کپی نام نماد یک ردیف."""
+        symbol = signal_symbol(data)
+        ok = copy_to_clipboard(symbol)
+        if ok:
+            self.copy_notice.emit(self.tr_.tr("signals.share.symbol_copied", symbol=symbol))
+        return ok
+
+    def copy_signal_info(self, data: dict[str, Any]) -> bool:
+        """کپی متن کامل سیگنال یک ردیف."""
+        if not data:
+            return False
+        ok = copy_to_clipboard(format_signal_text(data, self.tr_))
+        if ok:
+            self.copy_notice.emit(
+                self.tr_.tr("signals.share.info_copied", symbol=signal_symbol(data))
+            )
+        return ok
 
     def scan_row(self, symbol: str) -> dict[str, Any]:
         """دادهٔ خام یک ردیف نتیجهٔ پویش."""
@@ -1035,7 +1394,21 @@ class SignalsPage(BasePage):
         self.scan_limit_label.setText(self.tr_.tr("signals.scan_limit"))
         self.scan_confidence_label.setText(self.tr_.tr("signals.scan_min_confidence"))
         self.scan_wait_check.setText(self.tr_.tr("signals.scan_include_wait"))
+        self.scan_scope_label.setText(self.tr_.tr("signals.scan_scope"))
+        self._fill_scope_combo(self.scan_scope_combo, "signals.scan_scope_top", "signals.scan_scope_all")
+        self._fill_scope_combo(self.auto_universe_combo, "signals.scan_scope_top", "signals.scan_scope_all")
+        self.scan_smart_check.setText(self.tr_.tr("signals.scan_smart_filter"))
+        self.scan_turnover_label.setText(self.tr_.tr("signals.scan_min_turnover"))
+        self.auto_source_label.setText(self.tr_.tr("signals.auto.source"))
+        for index in range(self.auto_source_combo.count()):
+            source = self.auto_source_combo.itemData(index)
+            self.auto_source_combo.setItemText(index, self.tr_.tr(f"signals.auto.source_{source}"))
+        self.auto_universe_label.setText(self.tr_.tr("signals.auto.universe"))
+        self.auto_sweep_limit_label.setText(self.tr_.tr("signals.scan_limit"))
+        self.auto_smart_check.setText(self.tr_.tr("signals.scan_smart_filter"))
+        self.auto_turnover_label.setText(self.tr_.tr("signals.scan_min_turnover"))
         self.scan_legend.setText(self.tr_.tr("signals.legend_text"))
+        self.scan_copy_hint.setText(self.tr_.tr("signals.share.table_hint"))
         self._apply_scan_headers()
         if self._scan_rows:
             self.set_scan_results(list(self._scan_rows))

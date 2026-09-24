@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from app.core.models import Candle, IndicatorResult
@@ -150,7 +151,13 @@ class BaseIndicator(ABC):
         values: dict[str, list[float | None]] = {}
         for key, series in outputs.items():
             clean = series.astype(float)
-            values[key] = [None if pd.isna(v) else float(v) for v in clean.tolist()]
+            # بردار numpy به‌جای pd.isna روی تک‌تک مقدارها (۲.۴.۱): همان خروجی،
+            # ولی بدون صدها هزار فراخوان تابع در پویش کل بازار.
+            raw = clean.to_numpy(dtype=float, na_value=np.nan)
+            missing = np.isnan(raw).tolist()
+            values[key] = [
+                None if gap else value for value, gap in zip(raw.tolist(), missing)
+            ]
             last_value = clean.iloc[-1] if len(clean) else None
             latest[key] = None if last_value is None or pd.isna(last_value) else float(last_value)
 

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from localization import Translator
+from ui.signal_share import copy_to_clipboard, format_signal_text, signal_symbol
 from ui.widgets import make_button
 from ui.widgets.position_calculator import PositionCalculator
 
@@ -643,6 +644,18 @@ class SignalDetailDialog(QDialog):
         self.trade_button.clicked.connect(self._on_trade_clicked)
         layout.addWidget(self.trade_button)
 
+        # نسخهٔ ۲.۴.۲: کپی نام نماد و متن کامل سیگنال برای ارسال به جای دیگر
+        self.copy_symbol_button = make_button(self.tr_.tr("signals.share.copy_symbol"))
+        self.copy_symbol_button.setToolTip(self.tr_.tr("signals.share.copy_symbol_tip"))
+        self.copy_symbol_button.setEnabled(bool(signal_symbol(self._signal)))
+        self.copy_symbol_button.clicked.connect(self.copy_symbol)
+        layout.addWidget(self.copy_symbol_button)
+
+        self.copy_info_button = make_button(self.tr_.tr("signals.share.copy_info"))
+        self.copy_info_button.setToolTip(self.tr_.tr("signals.share.copy_info_tip"))
+        self.copy_info_button.clicked.connect(self.copy_info)
+        layout.addWidget(self.copy_info_button)
+
         layout.addStretch(1)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
@@ -654,6 +667,36 @@ class SignalDetailDialog(QDialog):
     # ------------------------------------------------------------------
     # کمکی
     # ------------------------------------------------------------------
+    def share_text(self) -> str:
+        """متن کامل سیگنال برای کپی/ارسال."""
+        return format_signal_text(self._signal, self.tr_)
+
+    def copy_symbol(self) -> bool:
+        """کپی نام نماد در کلیپ‌بورد."""
+        ok = copy_to_clipboard(signal_symbol(self._signal))
+        if ok:
+            self._flash_copied(self.copy_symbol_button, "signals.share.copy_symbol")
+        return ok
+
+    def copy_info(self) -> bool:
+        """کپی متن کامل سیگنال در کلیپ‌بورد."""
+        ok = copy_to_clipboard(self.share_text())
+        if ok:
+            self._flash_copied(self.copy_info_button, "signals.share.copy_info")
+        return ok
+
+    def _flash_copied(self, button: Any, restore_key: str) -> None:
+        """نمایش کوتاه «کپی شد ✓» روی همان دکمه."""
+        button.setText(self.tr_.tr("signals.share.copied"))
+
+        def restore() -> None:
+            try:
+                button.setText(self.tr_.tr(restore_key))
+            except RuntimeError:  # پنجره پیش‌تر بسته شده
+                pass
+
+        QTimer.singleShot(1500, restore)
+
     def _on_trade_clicked(self) -> None:
         """اعلام درخواست اقدام به کنترلر."""
         self.trade_requested.emit(self._signal)

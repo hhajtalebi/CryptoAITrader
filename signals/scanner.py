@@ -42,6 +42,64 @@ logger = get_logger(__name__)
 #: و بی‌فایده‌اند؛ پویش همهٔ آن‌ها فقط وقت و پهنای باند می‌سوزاند.
 DEFAULT_SCAN_LIMIT = 120
 
+#: نسخهٔ ۲.۴.۱ — سقف سهم CPU نخ شبکه در پویش دستی (۰ تا ۱).
+#:
+#: همهٔ کارهای ناهمگام برنامه (وب‌سوکت، داشبورد، معاملهٔ خودکار، پویش) روی
+#: یک حلقهٔ asyncio در یک نخ اجرا می‌شوند و محاسبهٔ اندیکاتورها هم هم‌گام
+#: است. پویش کل صرافی این نخ را صددرصد مشغول می‌کرد: رابط کاربری (که با GIL
+#: رقابت می‌کند) هنگ می‌کرد و پینگ وب‌سوکت‌ها جا می‌ماند. با این سقف، پس از
+#: هر نماد اگر مصرف CPU بیش از سهم مجاز بوده، پویش کمی مکث می‌کند.
+DEFAULT_CPU_DUTY = 0.6
+#: سقف سهم CPU برای پویش پس‌زمینهٔ خودکار (کاربر منتظرش نیست)
+BACKGROUND_CPU_DUTY = 0.35
+#: بلندترین مکث یک‌باره (ثانیه)؛ مانع «یخ‌زدن» ظاهری پویش می‌شود
+MAX_PACE_SLEEP = 2.0
+#: طول پنجرهٔ سنجش مصرف CPU (ثانیه)
+PACE_WINDOW_SECONDS = 10.0
+
+
+class CpuGovernor:
+    """
+    محدودکنندهٔ سهم CPU نخ جاری.
+
+    `time.thread_time()` مصرف CPU همین نخ (حلقهٔ asyncio) را می‌دهد، شامل
+    کارهای دیگری که روی همان حلقه اجرا می‌شوند؛ پس سقف روی **کل** بار نخ
+    اعمال می‌شود و پویش سهم بقیه را نمی‌خورد.
+    """
+
+    def __init__(self, duty: float | None, *, clock: Callable[[], float] = time.monotonic,
+                 cpu_clock: Callable[[], float] = time.thread_time) -> None:
+        try:
+            value = float(duty) if duty is not None else 1.0
+        except (TypeError, ValueError):
+            value = DEFAULT_CPU_DUTY
+        self.duty = max(0.05, min(1.0, value))
+        self._clock = clock
+        self._cpu_clock = cpu_clock
+        self._reset()
+        self.slept = 0.0
+
+    def _reset(self) -> None:
+        self._wall0 = self._clock()
+        self._cpu0 = self._cpu_clock()
+
+    def delay(self) -> float:
+        """مکث لازم (ثانیه) تا مصرف پنجرهٔ جاری به سقف برگردد."""
+        if self.duty >= 1.0:
+            return 0.0
+        wall = self._clock() - self._wall0
+        cpu = self._cpu_clock() - self._cpu0
+        needed = cpu / self.duty - wall
+        if wall >= PACE_WINDOW_SECONDS and needed <= 0:
+            self._reset()
+        return max(0.0, min(MAX_PACE_SLEEP, needed))
+
+    async def pace(self) -> None:
+        """نوبت‌دادن به بقیهٔ حلقه و در صورت نیاز مکث کوتاه."""
+        wait = self.delay()
+        self.slept += wait
+        await asyncio.sleep(wait)
+
 
 @dataclass(slots=True)
 class ScanProgress:
@@ -109,7 +167,13 @@ class MarketScanner:
     # ------------------------------------------------------------------
     # انتخاب نمادها
     # ------------------------------------------------------------------
-    async def candidate_symbols(self, limit: int | None = None) -> list[str]:
+    async def candidate_symbols(
+        self,
+        limit: int | None = None,
+        *,
+        universe: str = "top",
+        filters: Any = None,
+    ) -> list[str]:
         """
         فهرست نمادهایی که ارزش پویش دارند.
 
@@ -120,6 +184,13 @@ class MarketScanner:
         اگر گرفتن تیکرها شکست بخورد، به فهرست خام نمادها برمی‌گردیم تا
         پویش به‌کلی از کار نیفتد.
         """
+        from signals.scan_universe import UNIVERSE_ALL, normalize_universe
+
+        mode = normalize_universe(universe)
+        if mode == UNIVERSE_ALL or filters is not None:
+            # نسخهٔ ۲.۴.۰: کل بازار صرافی یا پالایش هوشمند (scan_universe).
+            return await self._smart_candidates(mode, limit, filters)
+
         cap = max(1, int(limit or self._scan_limit))
         try:
             tickers = await self._market.get_all_tickers()
@@ -138,6 +209,25 @@ class MarketScanner:
         symbols = await self._market.get_symbols()
         return [str(getattr(s, "symbol", s)) for s in symbols[:cap]]
 
+    async def _smart_candidates(self, mode: str, limit: int | None, filters: Any) -> list[str]:
+        """جهان پویش هوشمند: تیکرها برای اولویت، فهرست نمادها برای پوشش کامل."""
+        from signals.scan_universe import UNIVERSE_ALL, build_universe
+
+        try:
+            tickers = await self._market.get_all_tickers()
+        except Exception:  # noqa: BLE001 - بدون تیکر هم فهرست نمادها کافی است
+            logger.warning("Could not load tickers for the scan universe", exc_info=True)
+            tickers = []
+        symbols: list[Any] = []
+        if mode == UNIVERSE_ALL or not tickers:
+            try:
+                symbols = list(await self._market.get_symbols())
+            except Exception:  # noqa: BLE001
+                logger.warning("Could not load the exchange symbol list", exc_info=True)
+                symbols = []
+        cap = None if mode == UNIVERSE_ALL else max(1, int(limit or self._scan_limit))
+        return build_universe(tickers, symbols, mode=mode, limit=cap, filters=filters)
+
     # ------------------------------------------------------------------
     # پویش
     # ------------------------------------------------------------------
@@ -150,6 +240,10 @@ class MarketScanner:
         min_confidence: int = 0,
         include_wait: bool = False,
         on_progress: Callable[[ScanProgress], None] | None = None,
+        universe: str = "top",
+        filters: Any = None,
+        on_signal: Callable[[TradingSignal], None] | None = None,
+        cpu_duty: float | None = DEFAULT_CPU_DUTY,
     ) -> ScanResult:
         """
         پویش نمادها و بازگرداندن سیگنال‌ها به ترتیب ضریب اطمینان.
@@ -160,6 +254,10 @@ class MarketScanner:
             min_confidence : سیگنال‌های ضعیف‌تر از این حد کنار گذاشته می‌شوند
             include_wait   : آیا «انتظار» هم در نتیجه بیاید
             on_progress    : پس‌فراخوانِ گزارش پیشرفت
+            universe       : «top» پرگردش‌ترین‌ها تا limit؛ «all» همهٔ نمادهای صرافی
+            filters        : UniverseFilter برای پالایش هوشمند (اختیاری)
+            on_signal      : هر سیگنالِ پذیرفته‌شده همان لحظه گزارش می‌شود
+                             (نمایش زنده؛ نتیجهٔ نیمه‌کاره با توقف گم نمی‌شود)
 
         **لغو:** این متد یک کوروتین معمولی است، پس `asyncio.CancelledError`
         را دست‌نخورده بالا می‌فرستد تا لایهٔ بالا بتواند پویش را قطع کند؛
@@ -168,11 +266,53 @@ class MarketScanner:
         **تضمین:** شکست یک نماد، کل پویش را متوقف نمی‌کند. بازارهای بزرگ
         همیشه چند نماد تازه‌فهرست‌شده یا بی‌کندل دارند.
         """
+        from market.engine import bulk_fetch
+
+        with bulk_fetch():
+            return await self._scan(
+                symbols, timeframes, limit=limit, min_confidence=min_confidence,
+                include_wait=include_wait, on_progress=on_progress, universe=universe,
+                filters=filters, on_signal=on_signal, cpu_duty=cpu_duty,
+            )
+
+    async def _wait_for_cooldown(self) -> None:
+        """
+        در مکث محدودیت نرخ صرافی، پویش صبر می‌کند.
+
+        بدون این، هر نمادِ باقی‌مانده فوراً با خطای «مکث» شکست می‌خورد (و
+        به‌سراغ کندل ذخیره‌شده در پایگاه داده می‌رفت) — یعنی صدها نماد
+        «پویش‌شده» بدون داده و فشار بی‌دلیل روی دیسک.
+        """
+        for _attempt in range(10):
+            value = getattr(self._market, "rest_cooldown_remaining", 0.0)
+            # فقط عدد واقعی؛ موتورهای ساختگی/Mock نباید پویش را معطل کنند
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return
+            remaining = float(value)
+            if remaining <= 0:
+                return
+            await asyncio.sleep(min(remaining, 30.0))
+
+    async def _scan(
+        self,
+        symbols: Sequence[str] | None,
+        timeframes: Iterable[str] | None,
+        *,
+        limit: int | None,
+        min_confidence: int,
+        include_wait: bool,
+        on_progress: Callable[[ScanProgress], None] | None,
+        universe: str,
+        filters: Any,
+        on_signal: Callable[[TradingSignal], None] | None,
+        cpu_duty: float | None,
+    ) -> ScanResult:
         started = time.monotonic()
+        governor = CpuGovernor(cpu_duty)
         frames = list(timeframes or [])
         targets = [str(s).strip().upper() for s in (symbols or []) if str(s).strip()]
         if not targets:
-            targets = await self.candidate_symbols(limit)
+            targets = await self.candidate_symbols(limit, universe=universe, filters=filters)
         elif limit:
             targets = targets[: int(limit)]
 
@@ -190,6 +330,8 @@ class MarketScanner:
             nonlocal done
             async with semaphore:
                 signal: TradingSignal | None = None
+                await governor.pace()
+                await self._wait_for_cooldown()
                 try:
                     signal = await self._signals.generate(symbol, frames or None)
                 except asyncio.CancelledError:
@@ -206,6 +348,11 @@ class MarketScanner:
                         keep = include_wait or signal.direction is not SignalDirection.WAIT
                         if keep and int(signal.confidence or 0) >= int(min_confidence):
                             result.signals.append(signal)
+                            if on_signal is not None:
+                                try:
+                                    on_signal(signal)
+                                except Exception:  # noqa: BLE001 - نمایش نباید پویش را بکشد
+                                    logger.debug("Scan signal callback failed", exc_info=True)
                     if on_progress is not None:
                         try:
                             on_progress(

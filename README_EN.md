@@ -2,11 +2,28 @@
 
 **Professional desktop app for crypto market analysis and futures signal generation**
 
-Version 2.3.2 · Windows 10/11 · Python 3.11+ (tested up to 3.13) · Persian & English
+Version 2.4.2 · Windows 10/11 · Python 3.11+ (tested up to 3.13) · Persian & English
 
 [راهنمای فارسی](README.md)
 
-> **Current delivery 2.3.2:** LBank connectivity — WebSocket now uses the official
+> **Current delivery 2.4.2:** heavy scan computation now runs in a separate low-priority
+> worker process (the UI no longer freezes), the performance page refreshes lazily and off
+> the UI thread, repeated scans stop re-saving the same signal, a stall watchdog logs any UI
+> freeze, and you can copy a signal's symbol or full info from the tables and the details
+> dialog. [Release report](docs/RELEASE_2.4.2_FA.md).
+>
+> **Previous delivery 2.4.1:** fixes the heavy load / freezes during whole-market scans:
+> scans no longer write candles to disk or flood the shared cache, CPU share is capped,
+> the network loop stays responsive, indicators are ~45% faster and the results table is
+> light. [Release report](docs/RELEASE_2.4.1_FA.md).
+>
+> **Previous delivery 2.4.0:** Signals → Scan can cover the top symbols by turnover
+> (manual count, as before) or the **whole exchange**, with a smart filter, a minimum
+> 24h turnover, live results and an ETA. Automatic signals get a selectable source —
+> signals found above, the whole market, or both — and the full rotation covers every
+> exchange symbol. [Release report](docs/RELEASE_2.4.0_FA.md).
+>
+> **Previous delivery 2.3.2:** LBank connectivity — WebSocket now uses the official
 > `wss://api.lbank.info/ws/V2/` with fallback domains, client pings and proxy fallback;
 > LBank error 10004 ("request too frequent") is treated as a rate limit with a short
 > cooldown instead of an authentication failure. [Release report](docs/RELEASE_2.3.2_FA.md).

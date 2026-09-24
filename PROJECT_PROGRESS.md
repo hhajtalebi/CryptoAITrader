@@ -1,4 +1,52 @@
-## وضعیت جاری ۲.۳.۲ — اتصال LBank
+## وضعیت جاری ۲.۴.۲ — سبکی رابط و کپی سیگنال
+
+گزارش کاربر پس از 2.4.1: «هنوز خیلی سنگین است و هنگ می‌کند» + «امکان کپی نام و اطلاعات
+سیگنال در جدول یا مودال». علت‌های یافته: (۱) کاروان GIL — محاسبهٔ pandas پویش روی نخ
+پس‌زمینه نخ رابط را پس از هر فراخوانی Qt معطل می‌کرد (پروفایل: ~۹۵٪ زمان هر نماد در
+`compute_timeframe_analysis`)؛ (۲) تایمر ۳۰ ثانیه‌ای پیگیری نتیجه روی نخ رابط
+`outcome_repository.performance()` (تا ۵۰۰۰ ردیف) را اجرا می‌کرد، حتی وقتی صفحه پنهان بود؛
+(۳) پویش‌های پیاپی همان سیگنال را بی‌وقفه ذخیره و پیگیری می‌کردند (رشد پایگاه داده)؛
+(۴) ترمینال معاملات هر ثانیه حتی پنهان رسم می‌شد. اصلاح: `signals/compute_pool.py`
+(`ComputePool` با spawn، ≤۲ کارگر، اولویت پایین، fallback محلی، بستن در بیکاری) فقط در
+`is_bulk_fetch()`؛ `SignalEngine.set_compute_pool`؛ `Application.compute_pool()`
+(`performance.process_pool`، متغیر `CRYPTOAI_NO_PROCESS_POOL` که conftest روشن می‌کند)؛
+`Application._should_store_scanned` (۳۰ دقیقه/۵ واحد)؛ `_refresh_outcome_view` تنبل با
+`run_blocking` و `ShowWatcher`؛ `_terminal_timer_tick`؛ `UiStallWatchdog`؛
+`multiprocessing.freeze_support()` در main.py. کپی: `ui/signal_share.py`، دکمه‌های
+`SignalDetailDialog.copy_symbol/copy_info`، منوی راست‌کلیک و Ctrl+C در `SignalsPage`
+(`copy_notice` → toast). آزمون: `tests/test_v242_lightweight_and_copy.py`. گزارش:
+`docs/RELEASE_2.4.2_FA.md`. 2.4.0، 2.4.1 و 2.4.2 هنوز commit نشده‌اند.
+
+## تحویل قبلی ۲.۴.۱ — سبک‌سازی پویش کل بازار
+
+گزارش کاربر پس از 2.4.0: «بخش سیگنال خوب شد ولی سیستم خیلی سنگین است، هنگ می‌کند
+و کل سیستم را درگیر می‌کند.» علت‌ها: (۱) هر کندلِ پویش (~۴۰۰۰ درخواست برای کل صرافی)
+با ORM در SQLite نوشته می‌شد (دیسک و CPU)؛ (۲) کندل‌های پویش حافظهٔ نهان ۵۰۰تایی را پر
+و تیکر/قیمت داغ را بیرون می‌انداختند؛ (۳) محاسبهٔ هم‌گام اندیکاتورها روی تنها حلقهٔ
+asyncio تا ۴۰۰ms قفل می‌ساخت و با GIL رابط را کند می‌کرد؛ (۴) هر اندیکاتور DataFrame را
+از نو می‌ساخت (~۳۵٪ CPU)؛ (۵) جدول پویش با صدها ردیف و ستون «به اندازهٔ محتوا» هر ۸۰۰ms
+از نو رسم می‌شد. اصلاح: `market.engine.bulk_fetch()` (ContextVar)، `signals.scanner.CpuGovernor`
+(دستی ۰٫۶، خودکار ۰٫۳۵)، انتظار در مکث نرخ، دروازهٔ محاسبه در `SignalEngine`،
+`IndicatorEngine._calculate(frame_holder)`، numpy در `BaseIndicator.calculate`، سقف ۲۰۰ ردیف
+و تازه‌سازی تطبیقی. آزمون: `tests/test_v241_performance.py`. گزارش: `docs/RELEASE_2.4.1_FA.md`.
+2.4.0 و 2.4.1 هنوز commit نشده‌اند.
+
+## تحویل قبلی ۲.۴.۰ — پویش کل بازار و منبع سیگنال‌گیری خودکار
+
+درخواست کاربر: پویش سیگنال‌ها فقط روی تعداد محدودی نماد (پیش‌فرض ۶۰) اجرا می‌شد؛
+تعداد دستی بماند ولی گزینه‌ای برای پویش همهٔ نمادهای صرافی باشد. سیگنال‌گیری
+خودکار باید «چرخش کامل» را روی همهٔ نمادها انجام دهد و منبعش بین سیگنال‌های
+پیداشده و کل بازار قابل‌انتخاب باشد. پیاده‌سازی: `signals/scan_universe.py` (جهان
+پویش، پالایش هوشمند، اولویت نقدشوندگی/نوسان)، `MarketScanner.scan(universe, filters,
+on_signal)`، `Application.scan_market(universe, min_turnover, smart_filter, on_signal)`،
+`AutoScanConfig.source/universe/min_turnover/smart_filter` + `seed_focus`، کنترل‌های
+تازه در `ui/pages/signals_page.py` و نتیجهٔ زنده/پیشرفت در `MainController`. کلیدهای
+تازه: `signals.auto_scan_{source,universe,min_turnover,smart_filter}` و
+`signals.scan_{universe,limit,min_turnover,smart_filter}`. آزمون:
+`tests/test_v240_scan_universe.py`. گزارش: `docs/RELEASE_2.4.0_FA.md`. 2.3.2 با دستور
+کاربر commit/push شد (`80ce0ab`)؛ 2.4.0 هنوز commit نشده است.
+
+## تحویل تاریخی ۲.۳.۲ — اتصال LBank
 
 گزارش کاربر: روی LBank حدود ۲۰ ثانیه آنلاین و بعد آفلاین؛ وب‌سوکت LBank هرگز وصل
 نمی‌شد (صرافی‌های دیگر سالم). علت‌ها: جدول خطای LBank جابه‌جا بود و 10004
@@ -7,7 +55,7 @@ provider.ping هم خطا را می‌بلعید؛ وب‌سوکت فقط `www.l
 می‌شناخت. اصلاح: `market/providers/lbank/{constants,rest_client,provider,websocket_client}.py`،
 `retry_async(no_retry_on=...)`، آمار عیب‌یابی در `RedundantStream.stats()`؛ تست
 `tests/test_v232_lbank.py`. گزارش: `docs/RELEASE_2.3.2_FA.md`. stubهای Qt اکنون در
-`.cache/qtstub` داخل مخزن (نادیده در snapshot) ساخته می‌شوند. هیچ commit/push انجام نشده.
+`.cache/qtstub` داخل مخزن (نادیده در snapshot) ساخته می‌شوند. با دستور کاربر commit/push شد (`80ce0ab`).
 
 ## تحویل تاریخی ۲.۳.۱ — اتصال پایدار و داشبورد
 

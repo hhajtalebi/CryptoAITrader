@@ -227,3 +227,10 @@ def destroy_window(window, app=None) -> None:
     if target is not None:
         target.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         target.processEvents()
+
+
+# نسخهٔ ۲.۴.۲: آزمون‌ها استخر فرایند محاسبه را بالا نمی‌آورند (سرعت و
+# پایداری)؛ آزمون‌های مخصوص استخر آن را مستقیم می‌سازند.
+import os as _os  # noqa: E402
+
+_os.environ.setdefault("CRYPTOAI_NO_PROCESS_POOL", "1")

@@ -202,6 +202,16 @@ class SettingKey(str, Enum):
     SIGNAL_AUTO_SCAN_MIN_CONFIDENCE = "signals.auto_scan_min_confidence"
     SIGNAL_AUTO_SCAN_SWEEP_LIMIT = "signals.auto_scan_sweep_limit"
     SIGNAL_AUTO_SCAN_NOTIFY = "signals.auto_scan_notify"
+    #: نسخهٔ ۲.۴.۰ — منبع (found|market|both)، جهان چرخش و پالایش هوشمند
+    SIGNAL_AUTO_SCAN_SOURCE = "signals.auto_scan_source"
+    SIGNAL_AUTO_SCAN_UNIVERSE = "signals.auto_scan_universe"
+    SIGNAL_AUTO_SCAN_MIN_TURNOVER = "signals.auto_scan_min_turnover"
+    SIGNAL_AUTO_SCAN_SMART_FILTER = "signals.auto_scan_smart_filter"
+    #: پویش دستی: جهان (top|all)، تعداد، کمینهٔ گردش و پالایش هوشمند
+    SIGNAL_SCAN_UNIVERSE = "signals.scan_universe"
+    SIGNAL_SCAN_LIMIT = "signals.scan_limit"
+    SIGNAL_SCAN_MIN_TURNOVER = "signals.scan_min_turnover"
+    SIGNAL_SCAN_SMART_FILTER = "signals.scan_smart_filter"
 
     # ---- پیگیری نتیجهٔ واقعی سیگنال‌ها ----
     SIGNAL_TRACK_OUTCOMES = "signals.track_outcomes"
@@ -487,6 +497,14 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     SettingKey.SIGNAL_AUTO_SCAN_MIN_CONFIDENCE.value: 55,
     SettingKey.SIGNAL_AUTO_SCAN_SWEEP_LIMIT.value: 120,
     SettingKey.SIGNAL_AUTO_SCAN_NOTIFY.value: True,
+    SettingKey.SIGNAL_AUTO_SCAN_SOURCE.value: "both",
+    SettingKey.SIGNAL_AUTO_SCAN_UNIVERSE.value: "all",
+    SettingKey.SIGNAL_AUTO_SCAN_MIN_TURNOVER.value: 0.0,
+    SettingKey.SIGNAL_AUTO_SCAN_SMART_FILTER.value: True,
+    SettingKey.SIGNAL_SCAN_UNIVERSE.value: "top",
+    SettingKey.SIGNAL_SCAN_LIMIT.value: 60,
+    SettingKey.SIGNAL_SCAN_MIN_TURNOVER.value: 0.0,
+    SettingKey.SIGNAL_SCAN_SMART_FILTER.value: True,
     # پیگیری نتیجه پیش‌فرض **روشن** است: برخلاف پویش خودکار، هزینه‌اش
     # ناچیز است (یک درخواست قیمت برای نمادهای باز) و بدون آن، آمار
     # عملکرد هرگز شکل نمی‌گیرد. کاربری که سیگنال می‌سازد باید بتواند
@@ -583,6 +601,14 @@ SETTING_CATEGORIES: dict[str, list[str]] = {
         SettingKey.SIGNAL_AUTO_SCAN_MIN_CONFIDENCE.value,
         SettingKey.SIGNAL_AUTO_SCAN_SWEEP_LIMIT.value,
         SettingKey.SIGNAL_AUTO_SCAN_NOTIFY.value,
+        SettingKey.SIGNAL_AUTO_SCAN_SOURCE.value,
+        SettingKey.SIGNAL_AUTO_SCAN_UNIVERSE.value,
+        SettingKey.SIGNAL_AUTO_SCAN_MIN_TURNOVER.value,
+        SettingKey.SIGNAL_AUTO_SCAN_SMART_FILTER.value,
+        SettingKey.SIGNAL_SCAN_UNIVERSE.value,
+        SettingKey.SIGNAL_SCAN_LIMIT.value,
+        SettingKey.SIGNAL_SCAN_MIN_TURNOVER.value,
+        SettingKey.SIGNAL_SCAN_SMART_FILTER.value,
         SettingKey.SIGNAL_TRACK_OUTCOMES.value,
         SettingKey.SIGNAL_TRACK_INTERVAL.value,
         SettingKey.SIGNAL_TRACK_BATCH.value,
