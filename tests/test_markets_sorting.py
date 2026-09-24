@@ -55,13 +55,23 @@ def order_of(page: MarketsPage) -> list[str]:
 # ---------------------------------------------------------------------------
 # مرتب‌سازی
 # ---------------------------------------------------------------------------
-def test_default_sort_is_by_quote_value(page: MarketsPage) -> None:
+def test_default_sort_is_market_cap_then_volume(page: MarketsPage) -> None:
     """
-    پیش‌فرض باید «ارزش معاملات» باشد، نه حجم خام و نه الفبا.
+    v2.5.1: پیش‌فرض «ارزش بازار + حجم» است — خواستهٔ کاربر: «بیت‌کوین،
+    اتریوم و… نمادهای باارزش‌اند و باید اول بیایند». TINY با وجود بیشترین
+    حجم خام آخر است.
+    """
+    assert page._sort_mode == "market_cap"
+    assert order_of(page) == ["BTC", "ETH", "TINY"]
 
-    ETH بیشترین ارزش (۱۵۰ میلیون) و TINY کمترین (۹ هزار) را دارد، هرچند
-    حجم TINY از همه بیشتر است.
+
+def test_value_sort_is_by_quote_value(page: MarketsPage) -> None:
     """
+    حالت «ارزش معاملات»: ETH بیشترین ارزش (۱۵۰ میلیون) و TINY کمترین (۹
+    هزار) را دارد، هرچند حجم TINY از همه بیشتر است.
+    """
+    page._sort_mode = "value"
+    page._filter("")
     assert order_of(page) == ["ETH", "BTC", "TINY"]
 
 

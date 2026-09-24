@@ -56,6 +56,12 @@ class LBankEndpoints:
 
     # مسیرهای خصوصی (نیازمند امضا) — فقط خواندنی در نسخه اول
     USER_INFO: Final[str] = "/v2/supplement/user_info.do"
+    # v2.5.1: «اطلاعات حساب» (فهرست balances با asset/free/locked) و قالب
+    # قدیمی user_info.do (نگاشت‌های free/freeze/asset). `supplement/user_info.do`
+    # در بخش «کیف پول/برداشت» مستندات است و روی کلید فقط‌خواندنی ممکن است
+    # «بدون مجوز» بدهد؛ پس موجودی به ترتیب از این سه مسیر خوانده می‌شود.
+    USER_INFO_ACCOUNT: Final[str] = "/v2/supplement/user_info_account.do"
+    USER_INFO_LEGACY: Final[str] = "/v2/user_info.do"
     ORDERS_INFO: Final[str] = "/v2/supplement/orders_info.do"
     ORDERS_INFO_HISTORY: Final[str] = "/v2/supplement/orders_info_history.do"
 

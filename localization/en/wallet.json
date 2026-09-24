@@ -60,7 +60,9 @@
     "m_value": "Spot value",
     "m_available_usdt": "Free USDT",
     "m_locked_value": "Value in orders",
-    "m_assets": "Assets"
+    "m_assets": "Assets",
+    "search": "Search asset…",
+    "hide_small": "Hide balances under 1 USDT"
   },
   "futures_tab": {
     "title": "Perpetual contracts account (USDT-M)",
@@ -97,5 +99,29 @@
     "m_unrealized": "Unrealized P&L",
     "m_used_margin": "Used margin",
     "m_start": "Starting balance"
+  },
+  "auto_sync": "Auto refresh",
+  "auto_sync_tip": "Spot and futures balances are read from the exchange every 60 seconds.",
+  "report": {
+    "spot": "Spot",
+    "futures": "Futures",
+    "ok": "{section}: {count} assets received.",
+    "empty": "{section}: the exchange answered but reports no balance.",
+    "failed": "{section}: not received — {error}",
+    "unknown_fields": "{section}: answered, but no balance field was recognised (fields: {fields}). Please send this text to support.",
+    "sync_error": "Last sync: {error}",
+    "never": "Not synced yet; wait a moment or press “Sync”."
+  },
+  "hint": {
+    "permission": "Fix: in LBank → API management enable “Read” for this key, and if it has an IP whitelist add your current IP.",
+    "futures_permission": "Futures fix: the API key needs the “Contract” permission (LBank → API management). Without it only spot is shown.",
+    "signature": "Fix: re-enter the Secret key without extra spaces in Settings → Exchange accounts. The key must be HmacSHA256 (not RSA).",
+    "key": "Fix: the API key is invalid or expired; create a new key in LBank and replace it in Settings.",
+    "clock": "Fix: sync the Windows clock with the internet (Settings → Time → Sync now); a clock offset makes requests fail.",
+    "region": "The exchange is not answering because of a regional restriction.",
+    "network": "Fix: check your internet/VPN; the app retries every 60 seconds.",
+    "generic": "If it persists, press “Test connection” in Settings → Exchange accounts.",
+    "blocked": "Fix: the LBank futures domain (lbkperp.lbank.com) is behind Cloudflare, which rejected the request before the API key was checked — so the key is not the problem (spot uses another domain and works). Turn on a system-wide VPN/proxy or pick another server/country — some data-centre and country IPs are refused — then press Sync.",
+    "blocked_region": "Fix: Cloudflare blocks the LBank futures domain for your current IP's country/region (code 1009); the API key is not the problem. Sync again through a system-wide VPN/proxy on a server in an allowed country."
   }
 }

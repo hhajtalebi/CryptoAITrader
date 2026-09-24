@@ -8,7 +8,7 @@
   "added_to_watchlist": "{symbol} added to the watchlist",
   "all_symbols": "All symbols ({count})",
   "already_in_watchlist": "{symbol} is already in the watchlist",
-  "click_hint": "Click any coin to see full details.",
+  "click_hint": "Click: details · Right-click: symbol menu (add to watchlist, analyse, signal, alert, copy)",
   "count": "{count} markets loaded",
   "detail_atr": "ATR",
   "detail_change": "Change",
@@ -64,5 +64,14 @@
     "gainers": "Gainers",
     "losers": "Losers",
     "volume": "Top Volume"
+  },
+  "sort_market_cap": "Market cap & volume (BTC, ETH, …)",
+  "turnover_usdt": "24h volume (USDT)",
+  "menu": {
+    "details": "Symbol details",
+    "analyze": "Analyse this symbol",
+    "signal": "Signal for this symbol",
+    "copy_symbol": "Copy symbol name",
+    "copy_price": "Copy price (USDT)"
   }
 }

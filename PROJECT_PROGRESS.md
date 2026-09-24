@@ -1,4 +1,27 @@
-## وضعیت جاری ۲.۵.۰ — معامله از سیگنال، کیف پول سه‌زبانه، موجودی کاغذی
+## وضعیت جاری ۲.۵.۲ — فیوچرز LBank: HTTP 403 از Cloudflare
+
+گزارش کاربر پس از 2.5.1: اسپات ✓ (۳ دارایی)، فیوچرز ✗ `NetworkError: HTTP 403 … /cfd/openApi/v1/prv/account`.
+`lbkperp.lbank.com` پشت Cloudflare است (`api.lbkex.com` نه). رفع: `BROWSER_HEADERS` در `_contract_client`،
+`LBankRestClient._classify_forbidden` + `_cloudflare_code`/`CLOUDFLARE_REASONS` ← `AccessBlockedError`
+(`app/exceptions/errors.py`, زیرکلاس `NetworkError`) در `no_retry_on`، شکستن حلقهٔ دارایی‌های فیوچرز پس از
+مسدودی، `wallet.hint.blocked/blocked_region` در `_wallet_error_hint`. کد Cloudflare واقعی کاربر هنوز نامعلوم؛
+گزارش بعدی کیف پول آن را نشان می‌دهد. گزارش: `docs/RELEASE_2.5.2_FA.md`. **commit نشده** (آخرین commit: `982cce2`).
+
+## وضعیت قبلی ۲.۵.۱ — نمایش دارایی کیف پول، واچ‌لیست، ترتیب و قیمت بازارها
+
+خواسته‌های کاربر: کیف پول هیچ دارایی (کل/اسپات/فیوچرز) نشان نمی‌داد؛ ساخت واچ‌لیست با کلیک راست روی ردیف/نماد
+بازار؛ «افزودن به واچ‌لیست» مودال کار نمی‌کرد؛ ترتیب نمادها بر پایهٔ ارزش و حجم (BTC، ETH بالا)؛ قیمت دقیق تتری.
+پیاده‌سازی: `LBankRestClient.signed_headers()` (امضا در سرآیند + بدنه)، `LBankEndpoints.USER_INFO_ACCOUNT/
+USER_INFO_LEGACY`، `LBankProvider._spot_rows`/`last_sync_report`/زنجیرهٔ مسیرهای اسپات، `ExchangeAccountService`
+(شکست اسپات با فیوچرز سالم غیرکشنده، `details["report"]`)، `WalletPage` (`status_panel`/`set_sync_report`،
+`auto_sync_checkbox`، `spot_search`/`hide_small_checkbox`)، `MainController.start_wallet_auto_sync`/`sync_wallet(silent=)`/
+`_fill_wallet_report`/`_wallet_error_hint`؛ `SymbolRepository.add_to_watchlist(symbol, exchange=None)` رکورد را می‌سازد،
+`is_in_watchlist`، `MainController.set_watchlist_membership`/`_sync_symbol_table`؛ `market/market_rank.py`
+(`sort_by_market_value`, `price_decimals`, `quote_usdt_prices`)، `MarketsPage.build_context_menu` و حالت
+`market_cap`. آزمون: `tests/test_v251_wallet_watchlist_markets.py`. گزارش: `docs/RELEASE_2.5.1_FA.md`.
+**این تغییرها commit نشده‌اند** (دستور صریح کاربر)؛ آخرین commit: `982cce2` (2.5.0).
+
+## وضعیت قبلی ۲.۵.۰ — معامله از سیگنال، کیف پول سه‌زبانه، موجودی کاغذی
 
 خواسته‌های کاربر: اشتراک سیگنال در شبکه‌های اجتماعی؛ جست‌وجوی بالا کشیده و گرد؛ «اقدام به معامله» با
 ورود/SL/TP1–3 و بستن با اهداف (پاسخ کاربر: پلکانی ⅓/⅓/باقی، SL به ورود پس از TP1)، بستن مودال و رفتن به جدول

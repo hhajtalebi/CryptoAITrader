@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "crypto-ai-trader"
-version = "2.5.0"
+version = "2.5.2"
 description = "نرم‌افزار دسکتاپ تحلیل بازار ارز دیجیتال و تولید سیگنال Futures با کمک هوش مصنوعی"
 readme = "README.md"
 requires-python = ">=3.11"

@@ -21,6 +21,7 @@ from collections.abc import Callable
 from app.core.constants import ConnectionStatus
 from app.core.models import Candle, OrderBook, SymbolInfo, Ticker
 from app.exceptions import ExchangeError, RateLimitError, TimeframeError, ValidationError
+from app.exceptions.errors import AccessBlockedError
 from app.logging import get_logger
 from market.providers.base import ExchangeProvider, ProviderCapabilities
 from market.providers.lbank.constants import (
@@ -58,6 +59,48 @@ _FUTURES_UNREALIZED_KEYS = (
     "unrealized", "unrealizedPnl", "unrealisedPnl", "unrealProfit", "unRealizedProfit",
     "profitUnreal", "floatingPnl", "upl",
 )
+
+_FUTURES_ALL_KEYS = (
+    _FUTURES_TOTAL_KEYS + _FUTURES_WALLET_KEYS + _FUTURES_AVAILABLE_KEYS
+    + _FUTURES_FROZEN_KEYS + _FUTURES_MARGIN_KEYS + _FUTURES_UNREALIZED_KEYS
+)
+
+#: حدس بر پایهٔ بخشی از نام فیلد: (نشانه‌ها، نشانه‌های ممنوع) — v2.5.1
+_FUTURES_HINTS: dict[tuple[str, ...], tuple[tuple[str, ...], tuple[str, ...]]] = {
+    _FUTURES_TOTAL_KEYS: (("equity", "marginbalance", "totalbalance", "netasset"), ("rate", "ratio")),
+    _FUTURES_WALLET_KEYS: (("walletbalance", "balance", "static"), ("margin", "avail", "rate", "frozen", "total")),
+    _FUTURES_AVAILABLE_KEYS: (("avail", "withdraw", "canuse", "usable"), ("rate", "ratio")),
+    _FUTURES_FROZEN_KEYS: (("frozen", "freeze", "lock"), ("rate", "ratio")),
+    _FUTURES_MARGIN_KEYS: (("positionmargin", "usemargin", "usedmargin", "currmargin", "posmargin"), ("rate", "ratio")),
+    _FUTURES_UNREALIZED_KEYS: (("unreal", "positionprofit", "floating", "upl"), ("rate", "ratio")),
+}
+
+
+def _payload_fields(data: Any, depth: int = 0) -> set[str]:
+    """نام کلیدهای پاسخ (برای عیب‌یابی؛ بدون مقدار)."""
+    names: set[str] = set()
+    if depth > 3:
+        return names
+    if isinstance(data, list):
+        for item in data[:5]:
+            names |= _payload_fields(item, depth + 1)
+    elif isinstance(data, dict):
+        for key, value in data.items():
+            names.add(str(key)[:40])
+            if isinstance(value, (dict, list)):
+                names |= _payload_fields(value, depth + 1)
+    return names
+
+
+def _error_text(exc: Exception | None) -> str:
+    """متن کوتاه خطا با کد صرافی (بدون کلید/امضا)."""
+    if exc is None:
+        return ""
+    details = getattr(exc, "details", None) or {}
+    code = details.get("error_code") if isinstance(details, dict) else None
+    message = str(getattr(exc, "message", "") or exc)[:200]
+    name = exc.__class__.__name__
+    return f"{name}: {message}" + (f" (code {code})" if code not in (None, "") else "")
 
 
 class LBankProvider(ExchangeProvider):
@@ -102,6 +145,8 @@ class LBankProvider(ExchangeProvider):
         #: جزئیات آخرین همگام‌سازی موجودی (v2.5.0 — زبانه‌های کیف پول)
         self.last_spot_details: dict[str, dict[str, float]] = {}
         self.last_futures_details: dict[str, dict[str, float]] = {}
+        #: v2.5.1 — نتیجهٔ هر بخش در آخرین همگام‌سازی برای نمایش در کیف پول
+        self.last_sync_report: dict[str, dict[str, Any]] = {}
 
     # ------------------------------------------------------------------
     # چرخه عمر
@@ -339,6 +384,13 @@ class LBankProvider(ExchangeProvider):
     # ------------------------------------------------------------------
     # داده خصوصی (فقط خواندنی)
     # ------------------------------------------------------------------
+    def _sync_report(self) -> dict[str, dict[str, Any]]:
+        """گزارش آخرین همگام‌سازی؛ برای نمونه‌های ساخته‌شده با __new__ هم امن."""
+        report = self.__dict__.get("last_sync_report")
+        if not isinstance(report, dict):
+            report = self.__dict__["last_sync_report"] = {}
+        return report
+
     async def get_account_balance(self) -> dict[str, float]:
         """
         دریافت موجودی حساب.
@@ -346,66 +398,123 @@ class LBankProvider(ExchangeProvider):
         فقط دارایی‌هایی که موجودی غیرصفر دارند برگردانده می‌شوند تا خروجی
         سبک بماند.
         """
-        data = await self._client.post_signed(LBankEndpoints.USER_INFO)
+        data, endpoint = await self._spot_account_payload()
         # v2.5.0: جزئیات آزاد/قفل برای زبانهٔ «اسپات» کیف پول نگه داشته می‌شود
         self.last_spot_details = self._parse_spot_details(data)
-        return self._parse_balances(data)
+        balances = self._parse_balances(data)
+        self._sync_report()["spot"] = {
+            "ok": True, "endpoint": endpoint, "assets": len(balances), "error": "",
+        }
+        return balances
+
+    #: ترتیب مسیرهای موجودی اسپات (v2.5.1)
+    SPOT_BALANCE_ENDPOINTS: tuple[str, ...] = (
+        LBankEndpoints.USER_INFO_ACCOUNT,
+        LBankEndpoints.USER_INFO_LEGACY,
+        LBankEndpoints.USER_INFO,
+    )
+
+    async def _spot_account_payload(self) -> tuple[Any, str]:
+        """
+        پاسخ موجودی اسپات از نخستین مسیری که جواب بدهد (v2.5.1).
+
+        `supplement/user_info.do` در مستند رسمی زیر «کیف پول/برداشت» است و
+        کلید فقط‌خواندنی ممکن است برایش «بدون مجوز» بگیرد؛ پس اول «اطلاعات
+        حساب» و قالب قدیمی امتحان می‌شود. خطای نرخ درخواست بی‌درنگ بالا
+        می‌رود (امتحان مسیر بعدی فقط فشار را بیشتر می‌کند). اگر هیچ مسیری
+        جواب ندهد، خطای نخستین مسیر — معمولاً گویاترین — پرتاب می‌شود.
+        """
+        first_error: Exception | None = None
+        for endpoint in self.SPOT_BALANCE_ENDPOINTS:
+            try:
+                data = await self._client.post_signed(endpoint)
+            except RateLimitError as exc:
+                self._record_spot_error(endpoint, exc)
+                raise
+            except Exception as exc:  # noqa: BLE001 - مسیر بعدی امتحان می‌شود
+                logger.info("LBank spot balance via %s failed: %s", endpoint, exc.__class__.__name__)
+                first_error = first_error or exc
+                continue
+            return data, endpoint
+        assert first_error is not None
+        self._record_spot_error(self.SPOT_BALANCE_ENDPOINTS[0], first_error)
+        raise first_error
+
+    def _record_spot_error(self, endpoint: str, exc: Exception) -> None:
+        """ثبت علت شکست اسپات برای نمایش در کیف پول (بدون کلید)."""
+        self._sync_report()["spot"] = {
+            "ok": False, "endpoint": endpoint, "assets": 0,
+            "error": _error_text(exc),
+        }
 
     @staticmethod
-    def _parse_spot_details(data: Any) -> dict[str, dict[str, float]]:
-        """دارایی → {free, locked, total} از پاسخ user_info.do (v2.5.0)."""
+    def _spot_rows(data: Any) -> dict[str, dict[str, float]]:
+        """
+        دارایی → {free, locked, total} از هر سه قالب پاسخ موجودی (v2.5.1).
+
+        ۱) فهرست `[{coin, usableAmt, freezeAmt, assetAmt}]` (supplement/user_info.do)
+        ۲) `{"balances": [{asset, free, locked}]}` (supplement/user_info_account.do)
+        ۳) `{"free": {coin: n}, "freeze": {coin: n}, "asset": {coin: n}}` (user_info.do)
+        """
+        details: dict[str, dict[str, float]] = {}
+        safe = LBankParser._safe_float
+
+        def add(asset: Any, free: Any, locked: Any, total: Any = None) -> None:
+            code = str(asset or "").strip().upper()
+            if not code:
+                return
+            free_v = safe(free, 0.0) or 0.0
+            locked_v = safe(locked, 0.0) or 0.0
+            total_v = safe(total, None) if total not in (None, "") else None
+            total_v = float(total_v) if total_v is not None else free_v + locked_v
+            total_v = max(total_v, free_v + locked_v)
+            if total_v <= 0:
+                return
+            details[code] = {"free": free_v, "locked": locked_v, "total": total_v}
+
+        if isinstance(data, dict) and isinstance(data.get("free"), dict):
+            free_map = data.get("free") or {}
+            freeze_map = data.get("freeze") or data.get("locked") or {}
+            asset_map = data.get("asset") or {}
+            for code in set(free_map) | set(freeze_map) | set(asset_map):
+                add(code, free_map.get(code), freeze_map.get(code), asset_map.get(code))
+            return details
+
         rows: Any = []
         if isinstance(data, list):
             rows = data
         elif isinstance(data, dict):
             rows = data.get("balances") or data.get("data") or data.get("info") or []
-        details: dict[str, dict[str, float]] = {}
+            if isinstance(rows, dict) and isinstance(rows.get("free"), dict):
+                return LBankProvider._spot_rows(rows)
         if not isinstance(rows, list):
             return details
         for row in rows:
             if not isinstance(row, dict):
                 continue
-            asset = str(row.get("asset") or row.get("coin") or "").upper()
-            free = LBankParser._safe_float(row.get("free", row.get("usableAmt")), 0.0) or 0.0
-            locked = LBankParser._safe_float(row.get("locked", row.get("freezeAmt")), 0.0) or 0.0
-            if asset and free + locked > 0:
-                details[asset] = {"free": free, "locked": locked, "total": free + locked}
+            asset = row.get("asset") or row.get("coin") or row.get("currency")
+            # از الگوی «a or b» استفاده نمی‌کنیم: مقدار صفرِ معتبر در کلید
+            # اول باعث می‌شود مقدار کلید دوم اشتباهاً جایش بنشیند.
+            free = row.get("free", row.get("usableAmt"))
+            locked = row.get("locked", row.get("freezeAmt"))
+            add(asset, free, locked, row.get("assetAmt"))
         return details
+
+    @staticmethod
+    def _parse_spot_details(data: Any) -> dict[str, dict[str, float]]:
+        """دارایی → {free, locked, total} از پاسخ موجودی اسپات (v2.5.0/2.5.1)."""
+        return LBankProvider._spot_rows(data)
 
     @staticmethod
     def _parse_balances(data: Any) -> dict[str, float]:
         """
-        تبدیل پاسخ خام user_info.do به نگاشت «دارایی → موجودی».
+        تبدیل پاسخ خام موجودی به نگاشت «دارایی → موجودی».
 
-        نکتهٔ مهم: این نقطهٔ پایانی **فهرست** برمی‌گرداند، نه دیکشنری.
-        پیش‌تر فقط حالت دیکشنری خوانده می‌شد، پس موجودی همیشه خالی
-        درمی‌آمد؛ اتصال «موفق» بود ولی کیف پول چیزی نشان نمی‌داد.
-        هر دو حالت پشتیبانی می‌شود تا اگر صرافی قالب را عوض کرد نشکند.
-
-        جدا از متد شبکه نگه داشته شده تا بدون تماس با صرافی آزمون شود.
+        نکتهٔ تاریخی: supplement/user_info.do **فهرست** برمی‌گرداند و
+        user_info.do نگاشت‌های free/freeze؛ هر سه قالب پشتیبانی می‌شوند
+        (`_spot_rows`). جدا از متد شبکه نگه داشته شده تا بدون صرافی آزمون شود.
         """
-        rows: Any = []
-        if isinstance(data, list):
-            rows = data
-        elif isinstance(data, dict):
-            rows = data.get("balances") or data.get("data") or data.get("info") or []
-
-        balances: dict[str, float] = {}
-        if not isinstance(rows, list):
-            return balances
-
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            asset = str(row.get("asset") or row.get("coin") or "").upper()
-            # از الگوی «a or b» استفاده نمی‌کنیم: مقدار صفرِ معتبر در کلید
-            # اول باعث می‌شود مقدار کلید دوم اشتباهاً جایش بنشیند.
-            free = LBankParser._safe_float(row.get("free", row.get("usableAmt")), 0.0) or 0.0
-            locked = LBankParser._safe_float(row.get("locked", row.get("freezeAmt")), 0.0) or 0.0
-            total = free + locked
-            if asset and total > 0:
-                balances[asset] = total
-        return balances
+        return {asset: info["total"] for asset, info in LBankProvider._spot_rows(data).items()}
 
     async def get_futures_balance(self) -> dict[str, float]:
         """
@@ -448,22 +557,40 @@ class LBankProvider(ExchangeProvider):
         details: dict[str, dict[str, float]] = {}
         last_error: Exception | None = None
         answered = False
+        fields: set[str] = set()
         for asset in CONTRACT_ASSETS:
             try:
                 data = await self._client.post_contract_signed(
                     LBankContractEndpoints.ACCOUNT,
                     {"productGroup": CONTRACT_PRODUCT_GROUP, "asset": asset},
                 )
+            except AccessBlockedError as exc:
+                # v2.5.1: دیوار آتش همان دامنه همهٔ دارایی‌ها را رد می‌کند؛ ادامه
+                # فقط درخواست رد‌شدهٔ بیشتر (و مسدودی سخت‌تر) می‌سازد.
+                last_error = exc
+                break
             except Exception as exc:  # noqa: BLE001 - نبود یک دارایی خطای کلی نیست
                 last_error = exc
                 continue
             answered = True
+            fields.update(_payload_fields(data))
             for name, info in self._parse_futures_details(data, asset).items():
                 balances[name] = balances.get(name, 0.0) + float(info.get("total") or 0.0)
                 merged = details.setdefault(name, {})
                 for key, value in info.items():
                     merged[key] = merged.get(key, 0.0) + float(value or 0.0)
 
+        report = {
+            "ok": answered, "endpoint": LBankContractEndpoints.ACCOUNT,
+            "assets": len(balances), "error": "" if answered else _error_text(last_error),
+            "fields": sorted(fields)[:40],
+        }
+        if answered and not balances and fields:
+            # پاسخ رسید ولی هیچ فیلد شناخته‌شده‌ای عدد مثبت نداشت — یا حساب
+            # قرارداد واقعاً خالی است یا نام فیلدها تازه است؛ نام‌ها برای
+            # عیب‌یابی نگه داشته می‌شوند (هیچ مقدار حساسی در آن‌ها نیست).
+            report["note"] = "no_positive_fields"
+        self._sync_report()["futures"] = report
         if not answered and last_error is not None:
             raise last_error
         self.last_futures_details = details
@@ -495,6 +622,14 @@ class LBankProvider(ExchangeProvider):
         وگرنه walletBalance/balance، وگرنه آزاد + درگیر.
         """
         rows: Any = data
+        if isinstance(data, dict) and not any(
+            key in data for key in _FUTURES_ALL_KEYS
+        ):
+            # قالب تودرتو مثل {"account": {...}} یا {"USDT": {...}}
+            inner = [v for v in data.values() if isinstance(v, (dict, list)) and v]
+            if len(inner) == 1 and not (data.get("data") or data.get("assets") or data.get("list")):
+                data = inner[0]
+                rows = data
         if isinstance(data, dict):
             nested = data.get("data") or data.get("assets") or data.get("list")
             if nested is None and any(
@@ -513,6 +648,19 @@ class LBankProvider(ExchangeProvider):
                     value = LBankParser._safe_float(row.get(key), None)
                     if value is not None:
                         return float(value)
+            # v2.5.1: نام فیلدهای `prv/account` مستند نیست؛ اگر نام دقیق
+            # پیدا نشد، بر پایهٔ بخشی از نام حدس زده می‌شود (مثل
+            # «availableBalance»، «positionProfit»، «frozenMargin»).
+            group = _FUTURES_HINTS.get(keys)
+            if group:
+                for key, raw in row.items():
+                    lowered = str(key).lower()
+                    if any(bad in lowered for bad in group[1]):
+                        continue
+                    if any(hint in lowered for hint in group[0]):
+                        value = LBankParser._safe_float(raw, None)
+                        if value is not None:
+                            return float(value)
             return 0.0
 
         details: dict[str, dict[str, float]] = {}
@@ -560,7 +708,7 @@ class LBankProvider(ExchangeProvider):
         if not self._client.has_credentials:
             return False, "API key and secret are not configured"
         try:
-            await self._client.post_signed(LBankEndpoints.USER_INFO)
+            await self._spot_account_payload()
             return True, "Credentials verified successfully"
         except Exception as exc:  # noqa: BLE001 - نتیجه آزمایش باید همیشه برگردد
             message = getattr(exc, "message", str(exc))

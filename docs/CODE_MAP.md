@@ -9762,3 +9762,26 @@ self._scorecard_timer.timeout.connect(self._scorecard_tick)
 | `ui/widgets/position_calculator.py` | TP2/TP3، `signal_entry`, `trade_values`, `set_capital_source` | مودال جزئیات |
 | `ui/widgets/chrome.py` | `SearchBox` کشسان (`SEARCH_MIN/MAX_WIDTH`, `SEARCH_HEIGHT`) | `TopBar` |
 
+
+## مکمل نسخهٔ 2.5.1
+
+| فایل | نقش | اتصال |
+|---|---|---|
+| `market/market_rank.py` (تازه) | `MARKET_CAP_ORDER/RANK`، `split_symbol`، `turnover_usdt`، `sort_by_market_value`، `quote_usdt_prices`، `price_decimals`، `compact_number` | `MarketsPage` (حالت `market_cap`، ستون قیمت/حجم)، `MainController.refresh_markets` |
+| `market/providers/lbank/rest_client.py` | `signed_headers()`؛ `post_signed` امضا را در سرآیند و بدنه می‌فرستد | همهٔ درخواست‌های خصوصی اسپات |
+| `market/providers/lbank/constants.py` | `USER_INFO_ACCOUNT`، `USER_INFO_LEGACY` | زنجیرهٔ موجودی اسپات |
+| `market/providers/lbank/provider.py` | `_spot_rows` (سه قالب)، `last_sync_report`، حدس فیلدهای حساب قرارداد، `fields`/`note` در گزارش | `ExchangeAccountService.sync_balances` |
+| `app/core/exchange_account_service.py` | شکست یک بخش غیرکشنده؛ `details["report"]` با `_clean_report` (بدون کلید) | `MainController._fill_wallet_report` |
+| `ui/pages/wallet_page.py` | `status_panel`/`set_sync_report`/`report_text`، `auto_sync_toggled`/`auto_sync_checkbox`، `spot_search`، `hide_small_checkbox`، `SMALL_BALANCE_USDT` | `MainController.start_wallet_auto_sync`، `_on_wallet_auto_sync_toggled`، `_on_wallet_activated` |
+| `app/database/repositories/symbol_repository.py` | `add_to_watchlist(symbol, exchange=None)` با ساخت رکورد، `is_in_watchlist`، `remove_from_watchlist` از هر صرافی، `_normalize_symbol`، `_find_record` | `MainController.set_watchlist_membership`، `_sync_symbol_table` |
+| `ui/pages/markets_page.py` | `build_context_menu`، سیگنال‌های `analyze_requested`/`signal_requested`، `_price_text`، `_high_text`، `_turnover_text`، `_quote_prices` | `MainController._coin_analyze/_coin_signal/create_price_alert/set_watchlist_membership` |
+| `ui/controllers/main_controller.py` | `set_watchlist_membership`، `_sync_symbol_table`، `WALLET_AUTO_SYNC_MS`، `sync_wallet(silent=)`، `_fill_wallet_report`، `_wallet_error_hint` | صفحه‌های بازار/کیف پول/مودال نماد |
+
+## مکمل نسخهٔ 2.5.2
+
+| فایل | نقش | اتصال |
+|---|---|---|
+| `app/exceptions/errors.py` | `AccessBlockedError(NetworkError)`: رد پیش از API (Cloudflare/فایروال) | `no_retry_on` کلاینت LBank، حلقهٔ فیوچرز |
+| `market/providers/lbank/rest_client.py` | `BROWSER_HEADERS`، `CLOUDFLARE_REASONS`، `_cloudflare_code`، `_classify_forbidden` (401/403) | `_handle_response`، `_contract_client` |
+| `market/providers/lbank/provider.py` | `fetch_futures_balance` پس از `AccessBlockedError` می‌شکند | `ExchangeAccountService.sync_balances` |
+| `ui/controllers/main_controller.py` | `_wallet_error_hint` ← `wallet.hint.blocked` / `blocked_region` | پنل گزارش کیف پول |

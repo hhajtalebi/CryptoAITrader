@@ -76,6 +76,8 @@ ANALYSIS_INDICATORS: tuple[str, ...] = (
 )
 
 #: بیشینه تعداد نماد در جدول بازارها (فهرست کامل صرافی هزاران ردیف است)
+# v2.5.1: نشانگر مهاجرت یک‌بارهٔ ترتیب پیش‌فرض بازارها از «value» به «market_cap»
+MARKETS_SORT_MIGRATION_KEY = "ui.markets_sort_v251_migrated"
 MARKET_ROW_LIMIT = 300
 
 #: تعداد نقطهٔ نگه‌داشته‌شده برای نمودار کوچک ستون «روند»
@@ -438,7 +440,11 @@ class MainController(QObject):
         self.trades.export_requested.connect(self.export_trades)
         self.trades.clear_requested.connect(self.clear_trade_history)
         self.markets.alert_requested.connect(self.create_price_alert)
+        # v2.5.1: منوی کلیک راست جدول بازارها
+        self.markets.analyze_requested.connect(lambda sym: self._coin_analyze(sym, ""))
+        self.markets.signal_requested.connect(lambda sym: self._coin_signal(sym, ""))
         self.wallet.sync_requested.connect(self.sync_wallet)
+        self.wallet.auto_sync_toggled.connect(self._on_wallet_auto_sync_toggled)
         self.wallet.range_changed.connect(lambda _r: self.refresh_wallet())
         if hasattr(self.wallet, "paper_sync_requested"):
             self.wallet.paper_sync_requested.connect(self.sync_paper_balance_with_wallet)
@@ -496,6 +502,8 @@ class MainController(QObject):
         # زده نمی‌شد خالی می‌ماند و صفحه بی‌استفاده به نظر می‌رسید.
         # حالا اولین ورود به صفحه، خودش تحلیل را اجرا می‌کند.
         self.analysis.on_activated = self._on_analysis_activated
+        # v2.5.1: ورود به کیف پول، اگر موجودی کهنه باشد، همگام‌سازی می‌کند
+        self.wallet.on_activated = self._on_wallet_activated
         self.settings_page.load_values(self.app.settings.export_all())
         self.apply_display_preferences()
         self._sync_user_chrome()
@@ -591,6 +599,7 @@ class MainController(QObject):
         self.start_live_chart()
         self.start_connection_keepalive()
         self.start_scorecard_timer()
+        self.start_wallet_auto_sync()
         if hasattr(self.reports, "set_scorecard_auto"):
             self.reports.set_scorecard_auto(
                 self.app.settings.get_bool("signals.scorecard_auto", False)
@@ -1155,28 +1164,43 @@ class MainController(QObject):
             return
         self.status(self.tr_.tr("markets.loading"))
 
-        async def collect() -> tuple[list[dict[str, Any]], list[str]]:
+        async def collect() -> tuple[list[dict[str, Any]], list[str], list[Any]]:
             """دریافت تیکرها و نمادها."""
             tickers = await self.app.market.get_all_tickers()
-            rows = [
-                {
+            # v2.5.1: دقت قیمت هر نماد از فهرست نمادهای صرافی (کش یک‌ساعته)
+            # تا قیمت تتری دقیقاً با همان رقم اعشار صرافی نمایش داده شود.
+            infos: dict[str, Any] = {}
+            try:
+                infos = {info.symbol: info for info in await self.app.market.get_symbols()}
+            except Exception:  # noqa: BLE001 - نبود دقت فقط یعنی حدس رقم اعشار
+                logger.debug("Symbol precision unavailable", exc_info=True)
+            rows = []
+            for ticker in tickers:
+                info = infos.get(ticker.symbol)
+                rows.append({
                     "symbol": ticker.symbol,
                     "price": ticker.last_price,
                     "change_percent": ticker.change_percent,
                     "high": ticker.high_24h,
                     "volume": ticker.volume_24h,
-                }
-                for ticker in tickers
-            ]
+                    # ارزش معاملات ۲۴ ساعته به ارز مرجع (برای LBank: turnover)
+                    "quote_volume": ticker.turnover_24h,
+                    "price_precision": getattr(info, "price_precision", None),
+                })
             self._remember_prices(rows)
-            # پرگردش‌ترین بازارها بالا؛ فهرست کامل صرافی برای جدول زیاد است
-            rows.sort(key=lambda row: row.get("volume") or 0.0, reverse=True)
-            symbols = [row["symbol"] for row in rows]
-            return rows[:MARKET_ROW_LIMIT], symbols
+            # v2.5.1: ترتیب «ارزش بازار + ارزش معاملات» پیش از برش ۳۰۰ ردیفی.
+            # قبلاً حجم خام (تعداد واحد) مبنا بود: ارزهای بسیار ارزان با حجم
+            # عددی بزرگ بالای بیت‌کوین می‌نشستند.
+            from market.market_rank import quote_usdt_prices, sort_by_market_value
 
-        def apply(payload: tuple[list[dict[str, Any]], list[str]]) -> None:
+            rows = sort_by_market_value(rows, quote_usdt_prices(rows))
+            symbols = [row["symbol"] for row in rows]
+            return rows[:MARKET_ROW_LIMIT], symbols, list(infos.values())
+
+        def apply(payload: tuple[list[dict[str, Any]], list[str], list[Any]]) -> None:
             """نمایش بازارها و پر کردن همه فهرست‌های نماد."""
-            rows, symbols = payload
+            rows, symbols, infos = payload
+            self._sync_symbol_table(infos)
             self._symbols = symbols
             self.markets.set_palette(self.themes.palette)
             # ستاره‌ها باید پیش از ترسیم ردیف‌ها شناخته شده باشند
@@ -1215,40 +1239,73 @@ class MainController(QObject):
             on_finished=lambda: self.markets.refresh_button.finish_busy(),
         )
 
+    def _sync_symbol_table(self, infos: list[Any]) -> None:
+        """
+        پرکردن جدول `symbols` از فهرست نمادهای صرافی — یک بار در هر اجرا.
+
+        v2.5.1: این جدول تا امروز هیچ‌وقت پر نمی‌شد و واچ‌لیست به همین دلیل
+        ذخیره نمی‌شد (افزودن نماد رکوردی پیدا نمی‌کرد). حالا هم اینجا پر
+        می‌شود و هم افزودن به واچ‌لیست در نبود رکورد، آن را می‌سازد.
+        """
+        exchange = self.app.settings.active_exchange
+        if not infos or getattr(self, "_symbols_synced_for", None) == exchange:
+            return
+        try:
+            self.app.symbol_repository.sync_symbols(exchange, list(infos))
+            self._symbols_synced_for = exchange
+        except Exception:  # noqa: BLE001 - نبود همگام‌سازی نباید بازارها را ببرد
+            logger.warning("Symbol table sync failed", exc_info=True)
+
     def add_to_watchlist(self) -> None:
-        """افزودن نماد انتخاب‌شده به فهرست پیگیری."""
+        """افزودن نماد انتخاب‌شده به فهرست پیگیری (دکمهٔ بالای جدول)."""
         symbol = self.markets.selected_symbol()
         if not symbol:
             self.status(self.tr_.tr("markets.select_symbol_first"))
+            self._toast(self.tr_.tr("markets.select_symbol_first"), level="warning")
             return
-        exchange = self.app.settings.active_exchange
-        added = self.app.symbol_repository.add_to_watchlist(symbol, exchange)
-        key = "markets.added_to_watchlist" if added else "markets.already_in_watchlist"
-        self.status(self.tr_.tr(key, symbol=symbol))
-        self.refresh_dashboard()
+        self.set_watchlist_membership(symbol, True)
 
     def _on_watchlist_toggled(self, symbol: str, added: bool) -> None:
-        """
-        کلیک روی ستارهٔ جدول بازارها.
+        """ستارهٔ جدول بازارها یا منوی کلیک راست (v2.5.1: مسیر واحد)."""
+        self.set_watchlist_membership(symbol, added)
 
-        صفحه پیش از ارسال سیگنال، ستاره را جابه‌جا کرده است؛ اینجا فقط
-        پایگاه داده را هم‌راستا می‌کنیم و اگر ذخیره شکست خورد، ستاره را
-        به وضعیت واقعی برمی‌گردانیم.
+    def set_watchlist_membership(self, symbol: str, added: bool) -> bool:
         """
+        تنها مسیر افزودن/برداشتن نماد از واچ‌لیست (v2.5.1).
+
+        دکمه، ستاره، منوی کلیک راست و مدال جزئیات همه از اینجا می‌گذرند تا
+        پس از ذخیره، ستاره‌های جدول، پنل واچ‌لیست، داشبورد و جریان زنده
+        یک‌جا تازه شوند. قبلاً مدال `add_to_watchlist(symbol)` را بدون
+        صرافی صدا می‌زد (TypeError بی‌صدا) و مسیر دکمه ستاره‌ها را تازه
+        نمی‌کرد؛ و چون جدول نمادها خالی بود، هیچ مسیری واقعاً ذخیره نمی‌کرد.
+        """
+        symbol = str(symbol or "").strip()
+        if not symbol:
+            return False
         exchange = self.app.settings.active_exchange
+        repo = self.app.symbol_repository
         try:
             if added:
-                self.app.symbol_repository.add_to_watchlist(symbol, exchange)
-                key = "markets.added_to_watchlist"
+                changed = repo.add_to_watchlist(symbol, exchange)
+                key = "markets.added_to_watchlist" if changed else "markets.already_in_watchlist"
+                level = "success" if changed else "info"
             else:
-                self.app.symbol_repository.remove_from_watchlist(symbol, exchange)
+                changed = repo.remove_from_watchlist(symbol, exchange)
                 key = "markets.removed_from_watchlist"
-            self.status(self.tr_.tr(key, symbol=symbol))
+                level = "info"
         except Exception:  # noqa: BLE001 - نباید جدول را بشکند
-            logger.exception("Watchlist toggle failed for %s", symbol)
-        self.markets.set_watchlist(self.app.symbol_repository.get_watchlist())
+            logger.exception("Watchlist update failed for %s", symbol)
+            self._toast(self.tr_.tr("watchlist.save_failed", symbol=symbol), level="error")
+            self.markets.set_watchlist(repo.get_watchlist())
+            return False
+        text = self.tr_.tr(key, symbol=symbol)
+        self.status(text)
+        self._toast(text, level=level)
+        self.markets.set_watchlist(repo.get_watchlist())
         self.refresh_watchlist_panel()
+        self._update_streamed_symbols()
         self.refresh_dashboard()
+        return True
 
     # ------------------------------------------------------------------
     # فهرست‌های دیده‌بانی (مورد ۵.۳)
@@ -3631,22 +3688,8 @@ class MainController(QObject):
         self.markets.search_input.setText(symbol)
 
     def _coin_watchlist_toggled(self, symbol: str, added: bool) -> None:
-        """افزودن یا برداشتن نماد از واچ‌لیست از داخل مدال."""
-        try:
-            if added:
-                self.app.symbol_repository.add_to_watchlist(symbol)
-                self.status(self.tr_.tr("markets.added_to_watchlist", symbol=symbol))
-                self._toast(
-                    self.tr_.tr("markets.added_to_watchlist", symbol=symbol),
-                    level="success",
-                )
-            else:
-                self.app.symbol_repository.remove_from_watchlist(symbol)
-                self.status(self.tr_.tr("markets.remove_from_watchlist"))
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Watchlist update failed: %s", exc)
-            return
-        self.refresh_dashboard()
+        """افزودن یا برداشتن نماد از واچ‌لیست از داخل مدال (v2.5.1: مسیر واحد)."""
+        self.set_watchlist_membership(symbol, added)
 
     # ------------------------------------------------------------------
     # تحلیل نوشتاری سیگنال و خروجی PDF
@@ -4573,7 +4616,19 @@ class MainController(QObject):
 
     def _apply_display_settings(self) -> None:
         """اعمال تنظیمات نمایش روی صفحه‌ها."""
-        sort_mode = str(self.app.settings.get("ui.markets_sort", "value") or "value")
+        settings = self.app.settings
+        sort_mode = str(settings.get("ui.markets_sort", "market_cap") or "market_cap")
+        # v2.5.1: مهاجرت یک‌باره — «value» پیش‌فرض قبلی بود و تقریباً همیشه
+        # انتخاب کاربر نیست؛ به ترتیب تازهٔ «ارزش بازار + حجم» می‌رود. انتخاب
+        # صریح دیگر (رشد، الفبا…) دست نمی‌خورد و پس از این هم «value» محترم است.
+        if not settings.get(MARKETS_SORT_MIGRATION_KEY, False):
+            try:
+                if sort_mode == "value":
+                    sort_mode = "market_cap"
+                    settings.set("ui.markets_sort", sort_mode, notify=False)
+                settings.set(MARKETS_SORT_MIGRATION_KEY, True, notify=False)
+            except Exception:  # noqa: BLE001 - نبود ذخیره فقط یعنی تکرار مهاجرت
+                logger.debug("markets sort migration not saved", exc_info=True)
         combo = getattr(self.markets, "sort_combo", None)
         if combo is not None:
             index = combo.findData(sort_mode)
@@ -6274,9 +6329,12 @@ class MainController(QObject):
     # ------------------------------------------------------------------
     # کیف پول
     # ------------------------------------------------------------------
-    def sync_wallet(self) -> None:
+    def sync_wallet(self, silent: bool = False) -> None:
         """
         گرفتن موجودی تازه از صرافی و سپس تازه‌سازی صفحه.
+
+        `silent` برای همگام‌سازی خودکار دوره‌ای است: پیام نوار وضعیت نمی‌دهد
+        و اگر همگام‌سازی دیگری در راه باشد کاری نمی‌کند (v2.5.1).
 
         پیش‌تر دکمهٔ «همگام‌سازی» فقط همان دادهٔ ذخیره‌شده را دوباره رسم
         می‌کرد و هیچ درخواستی به صرافی نمی‌رفت؛ برای همین کیف پول حتی با
@@ -6290,12 +6348,17 @@ class MainController(QObject):
         )
         if account is None:
             self.wallet.set_connected(False)
-            self.status(self.tr_.tr("wallet.no_account"))
+            if not silent:
+                self.status(self.tr_.tr("wallet.no_account"))
             return
+        if getattr(self, "_wallet_sync_running", False):
+            return
+        self._wallet_sync_running = True
 
         account_id = int(account["id"])
         self.wallet.set_busy(True)
-        self.status(self.tr_.tr("wallet.syncing"))
+        if not silent:
+            self.status(self.tr_.tr("wallet.syncing"))
 
         # از همان سازندهٔ مشترک استفاده می‌شود تا منطق ساخت ارائه‌دهنده در
         # دو جا تکرار (و واگرا) نشود.
@@ -6311,7 +6374,14 @@ class MainController(QObject):
 
         def done(result: dict[str, Any]) -> None:
             """نمایش نتیجه؛ خطا هم باید دیده شود نه اینکه بی‌صدا رد شود."""
+            self._wallet_sync_running = False
+            self._wallet_synced_at = time.monotonic()
             self.wallet.set_busy(False)
+            if silent:
+                # refresh_wallet → _paper_account: نخستین موجودی واقعی خودکار
+                # مبنای حساب کاغذی می‌شود
+                self.refresh_wallet()
+                return
             if result.get("balances"):
                 self.status(self.tr_.tr("wallet.sync_done"))
             else:
@@ -6326,8 +6396,11 @@ class MainController(QObject):
 
         def failed(text: str, exc: Any = None) -> None:
             """شکست همگام‌سازی نباید بی‌صدا بماند."""
+            self._wallet_sync_running = False
+            self._wallet_synced_at = time.monotonic()
             self.wallet.set_busy(False)
-            self._on_error(self.tr_.tr("wallet.sync_failed"), exc)
+            if not silent:
+                self._on_error(self.tr_.tr("wallet.sync_failed"), exc)
             self.refresh_wallet()
 
         self.runner.submit(
@@ -6392,9 +6465,135 @@ class MainController(QObject):
             )
             details = dict((account.get("extra_config") or {}).get("wallet_details") or {})
             self._fill_wallet_tabs(by_wallet, details, balances)
+            self._fill_wallet_report(account, details)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Wallet refresh failed")
             self._on_error(self.tr_.tr("common.state.error"), exc)
+
+    # ---------------------------------------------------------- v2.5.1
+    #: فاصلهٔ همگام‌سازی خودکار موجودی (میلی‌ثانیه)
+    WALLET_AUTO_SYNC_MS = 60_000
+    #: اگر آخرین همگام‌سازی کهنه‌تر از این باشد، ورود به کیف پول همگام می‌کند
+    WALLET_STALE_SECONDS = 30.0
+
+    def start_wallet_auto_sync(self) -> None:
+        """
+        همگام‌سازی خودکار موجودی: یک بار بلافاصله و سپس هر ۶۰ ثانیه.
+
+        قبلاً موجودی فقط با دکمهٔ «همگام‌سازی» خوانده می‌شد؛ کاربری که آن را
+        نمی‌زد (یا خطای آن را نمی‌دید) کیف پول را همیشه خالی می‌دید. هزینه
+        ناچیز است: یک درخواست اسپات + چهار درخواست قرارداد در دقیقه، در
+        برابر سقف ۲۰۰ درخواست در ۱۰ ثانیهٔ LBank.
+        """
+        if getattr(self, "_wallet_timer", None) is None:
+            self._wallet_timer = QTimer(self.window)
+            self._wallet_timer.setInterval(self.WALLET_AUTO_SYNC_MS)
+            self._wallet_timer.timeout.connect(lambda: self.sync_wallet(silent=True))
+        enabled = bool(self.app.settings.get("wallet.auto_sync", True))
+        self.wallet.auto_sync_checkbox.blockSignals(True)
+        self.wallet.auto_sync_checkbox.setChecked(enabled)
+        self.wallet.auto_sync_checkbox.blockSignals(False)
+        if enabled:
+            self._wallet_timer.start()
+        else:
+            self._wallet_timer.stop()
+        # همیشه یک بار در شروع (حتی اگر خودکار خاموش باشد)
+        self.sync_wallet(silent=True)
+
+    def _on_wallet_auto_sync_toggled(self, enabled: bool) -> None:
+        """کلید «تازه‌سازی خودکار» کیف پول."""
+        try:
+            self.app.settings.set("wallet.auto_sync", bool(enabled))
+        except Exception:  # noqa: BLE001
+            logger.debug("Could not persist wallet.auto_sync", exc_info=True)
+        timer = getattr(self, "_wallet_timer", None)
+        if timer is None:
+            return
+        if enabled:
+            timer.start()
+            self.sync_wallet(silent=True)
+        else:
+            timer.stop()
+
+    def _on_wallet_activated(self) -> None:
+        """ورود به صفحهٔ کیف پول: همگام‌سازی اگر داده کهنه است."""
+        last = getattr(self, "_wallet_synced_at", None)
+        if last is None or time.monotonic() - last > self.WALLET_STALE_SECONDS:
+            self.sync_wallet(silent=True)
+
+    def _fill_wallet_report(self, account: dict[str, Any], details: dict[str, Any]) -> None:
+        """
+        نوار وضعیت همگام‌سازی کیف پول (v2.5.1).
+
+        برای اسپات و فیوچرز جدا می‌گوید چه آمد و اگر نیامد چرا — با
+        راهنمای رفع (مجوز کلید، فهرست IP، مجوز قرارداد).
+        """
+        if not hasattr(self.wallet, "set_sync_report"):
+            return
+        report = dict(details.get("report") or {})
+        last_error = str(account.get("last_error") or "")
+        lines: list[tuple[str, str]] = []
+        hints: list[str] = []
+        tr = self.tr_.tr
+        if not account.get("last_sync_at") and not report:
+            if last_error:
+                lines.append(("error", tr("wallet.report.sync_error", error=self._localize_exchange_message(last_error))))
+                hints.append(self._wallet_error_hint(last_error))
+            else:
+                lines.append(("warn", tr("wallet.report.never")))
+            self.wallet.set_sync_report(lines, " ".join(h for h in hints if h))
+            return
+        for section in ("spot", "futures"):
+            info = report.get(section)
+            label = tr(f"wallet.report.{section}")
+            if not isinstance(info, dict):
+                continue
+            if info.get("ok"):
+                count = int(info.get("assets") or 0)
+                if count:
+                    lines.append(("ok", tr("wallet.report.ok", section=label, count=self.tr_.format_number(count, 0))))
+                elif info.get("note") == "no_positive_fields" and info.get("fields"):
+                    lines.append(("warn", tr("wallet.report.unknown_fields", section=label,
+                                             fields=", ".join(info.get("fields")[:12]))))
+                else:
+                    lines.append(("warn", tr("wallet.report.empty", section=label)))
+            else:
+                error = str(info.get("error") or last_error or "")
+                lines.append(("error", tr("wallet.report.failed", section=label, error=error or "—")))
+                hints.append(self._wallet_error_hint(error, futures=(section == "futures")))
+        if not report and last_error:
+            lines.append(("error", tr("wallet.report.sync_error", error=self._localize_exchange_message(last_error))))
+            hints.append(self._wallet_error_hint(last_error))
+        elif last_error and all(level != "error" for level, _ in lines):
+            lines.append(("warn", tr("wallet.report.sync_error", error=self._localize_exchange_message(last_error))))
+        unique_hints = list(dict.fromkeys(h for h in hints if h))
+        self.wallet.set_sync_report(lines, " ".join(unique_hints))
+
+    def _wallet_error_hint(self, error: str, *, futures: bool = False) -> str:
+        """راهنمای رفع بر پایهٔ متن/کد خطا."""
+        text = str(error or "").lower()
+        tr = self.tr_.tr
+        # v2.5.1: رد درخواست پیش از رسیدن به API (Cloudflare/فایروال) — مشکل
+        # کلید نیست؛ باید پیش از بررسی کدهای مجوز تشخیص داده شود.
+        if "cloudflare" in text or "blocked" in text or "http 403" in text or "forbidden" in text:
+            if "1009" in text or "country" in text:
+                return tr("wallet.hint.blocked_region")
+            return tr("wallet.hint.blocked")
+        if "10022" in text or "permission" in text or "10009" in text or "10067" in text:
+            return tr("wallet.hint.futures_permission" if futures else "wallet.hint.permission")
+        if any(code in text for code in ("10007", "10010", "10003", "signature")):
+            return tr("wallet.hint.signature")
+        if any(code in text for code in ("10005", "10008", "176", "177", "authentication")):
+            return tr("wallet.hint.key")
+        if "10600" in text or "timestamp" in text:
+            return tr("wallet.hint.clock")
+        if "10205" in text or "region" in text:
+            return tr("wallet.hint.region")
+        if any(word in text for word in ("network", "timeout", "timed out", "connect")):
+            return tr("wallet.hint.network")
+        if futures:
+            return tr("wallet.hint.futures_permission")
+        return tr("wallet.hint.generic")
 
     def _asset_usdt_price(self, code: str, prices: dict[str, Any] | None = None) -> float:
         """قیمت تتری دارایی: جدول زنده → قیمت‌های همگام‌سازی → ۰."""
@@ -6490,12 +6689,14 @@ class MainController(QObject):
             locked_value += locked * price if price else 0.0
             rows.append({"asset": code, "total": total, "value": value, "price": price,
                          "free": info.get("free"), "locked": info.get("locked")})
-        rows.sort(key=lambda r: -r["value"])
+        # v2.5.1: بیشترین ارزش تتری بالا (مثل صرافی‌ها)؛ دارایی بی‌قیمت آخر
+        rows.sort(key=lambda r: (not r["price"], -r["value"], r["asset"]))
         spot_rows = []
         for r in rows:
             change = self._change_percent(f"{r['asset']}/USDT") if r["price"] and r["asset"] not in ("USDT", "USD") else None
             spot_rows.append({
                 "asset": r["asset"],
+                "value": r["value"] if r["price"] else None,
                 "free_text": fmt(r["free"], 8) if r["free"] is not None else "—",
                 "locked_text": fmt(r["locked"], 8) if r["locked"] is not None else "—",
                 "total_text": fmt(r["total"], 8),

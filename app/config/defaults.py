@@ -429,7 +429,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     SettingKey.MARKET_MANUAL_TOMAN_RATE.value: 0.0,
     SettingKey.SECURITY_STORE_SECRETS_IN_DB.value: True,
     # نمایش
-    SettingKey.UI_MARKETS_SORT.value: "value",
+    # v2.5.1: «ارزش بازار + حجم» (BTC، ETH… بالا) — خواستهٔ صریح کاربر
+    SettingKey.UI_MARKETS_SORT.value: "market_cap",
     # قلم پیش‌فرض «ب کودک» است؛ درخواست صریح کاربر برای فارسی‌نویسی.
     SettingKey.UI_FONT_FAMILY.value: "vazirmatn",
     SettingKey.UI_FONT_SCALE.value: 100,

@@ -42,7 +42,7 @@ from market.providers.lbank.constants import (
     REGION_BLOCKED_ERROR_CODES,
     RETRYABLE_ERROR_CODES,
 )
-from app.exceptions.errors import TransientExchangeError
+from app.exceptions.errors import AccessBlockedError, TransientExchangeError
 from market.rate_limiter import AsyncRateLimiter, retry_async
 
 logger = get_logger(__name__)
@@ -52,6 +52,39 @@ logger = get_logger(__name__)
 CONTRACT_RATE_LIMIT_ERROR_CODES = frozenset({10012, 183})
 CONTRACT_AUTH_ERROR_CODES = frozenset({10003, 10007, 10008, 10009, 10010, 176, 177})
 CONTRACT_RETRYABLE_ERROR_CODES = frozenset({10004})
+
+
+# v2.5.1: سرآیندهای معمول مرورگر برای دامنهٔ پشت Cloudflare (قرارداد)
+BROWSER_HEADERS: dict[str, str] = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+# کدهای رایج صفحهٔ خطای Cloudflare و معنی کوتاه‌شان
+CLOUDFLARE_REASONS: dict[str, str] = {
+    "1006": "your IP address is banned",
+    "1007": "your IP address is banned",
+    "1008": "your IP address is banned",
+    "1009": "access from your country/region is blocked",
+    "1010": "browser signature blocked",
+    "1012": "access denied",
+    "1020": "access denied by firewall rule",
+}
+
+
+def _cloudflare_code(body: str) -> str:
+    """کد چهاررقمی خطای Cloudflare از متن/HTML صفحهٔ رد درخواست."""
+    import re
+
+    for pattern in (r"error code:?\s*(1\d{3})", r"Error\s*(1\d{3})", r"cf-error-code[^0-9]{0,20}(1\d{3})"):
+        match = re.search(pattern, body or "", flags=re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return ""
 
 
 class LBankRestClient:
@@ -164,7 +197,7 @@ class LBankRestClient:
             max_attempts=self._max_retries,
             retry_on=(NetworkError, TransientExchangeError),
             operation_name=f"GET {endpoint}",
-            no_retry_on=(RateLimitError,),
+            no_retry_on=(RateLimitError, AccessBlockedError),
         )
 
     @property
@@ -217,16 +250,24 @@ class LBankRestClient:
                 "API credentials are not configured", details={"endpoint": endpoint}
             )
 
+        timestamp = str(int(time.time() * 1000))
+        echostr = self._random_echostr()
         payload: dict[str, Any] = dict(params or {})
         payload.update(
             {
                 "api_key": self._api_key,
                 "signature_method": "HmacSHA256",
-                "timestamp": str(int(time.time() * 1000)),
-                "echostr": self._random_echostr(),
+                "timestamp": timestamp,
+                "echostr": echostr,
             }
         )
         payload["sign"] = self._build_signature(payload)
+        # v2.5.1: مستند رسمی («Request Format») و کتابخانهٔ رسمی LBank
+        # (lbank-connector-python) سه مقدار timestamp/signature_method/echostr
+        # را در **سرآیند** می‌فرستند. قبلاً فقط در بدنه بودند و سرور امضا را
+        # با سرآیند خالی می‌سنجید — درخواست خصوصی (موجودی) شکست می‌خورد و
+        # کیف پول هیچ دارایی‌ای نشان نمی‌داد. هر دو جا فرستاده می‌شود.
+        headers = self.signed_headers(timestamp, echostr, content_type="application/x-www-form-urlencoded")
 
         async def _do_request() -> Any:
             await self._rate_limiter.acquire()
@@ -236,7 +277,7 @@ class LBankRestClient:
                 response = await self._client.post(
                     endpoint,
                     data=payload,
-                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    headers=headers,
                 )
             except httpx.TimeoutException as exc:
                 raise TimeoutErrorApp(f"Signed request timed out: {endpoint}") from exc
@@ -248,7 +289,7 @@ class LBankRestClient:
             _do_request,
             max_attempts=self._max_retries,
             retry_on=(NetworkError,),
-            no_retry_on=(RateLimitError,),
+            no_retry_on=(RateLimitError, AccessBlockedError),
             operation_name=f"POST {endpoint}",
         )
 
@@ -283,12 +324,7 @@ class LBankRestClient:
         )
         payload["sign"] = self._build_signature(payload)
 
-        headers = {
-            "Content-Type": "application/json",
-            "timestamp": timestamp,
-            "signature_method": "HmacSHA256",
-            "echostr": echostr,
-        }
+        headers = self.signed_headers(timestamp, echostr, content_type="application/json")
 
         async def _do_request() -> Any:
             await self._rate_limiter.acquire()
@@ -305,7 +341,7 @@ class LBankRestClient:
             _do_request,
             max_attempts=self._max_retries,
             retry_on=(NetworkError,),
-            no_retry_on=(RateLimitError,),
+            no_retry_on=(RateLimitError, AccessBlockedError),
             operation_name=f"POST {endpoint}",
         )
 
@@ -315,9 +351,22 @@ class LBankRestClient:
             self._contract_http = httpx.AsyncClient(
                 base_url=LBANK_CONTRACT_URL,
                 timeout=self._timeout,
-                headers={"User-Agent": "CryptoAITrader/1.5"},
+                # v2.5.1: دامنهٔ قرارداد پشت Cloudflare است و «بررسی امضای مرورگر»
+                # آن عامل کاربر ناآشنا («CryptoAITrader/1.5») را با 403 (کد 1010)
+                # رد می‌کند؛ سرآیندهای معمول مرورگر فرستاده می‌شود.
+                headers=dict(BROWSER_HEADERS),
             )
         return self._contract_http
+
+    @staticmethod
+    def signed_headers(timestamp: str, echostr: str, *, content_type: str) -> dict[str, str]:
+        """سرآیندهای امضای LBank (اسپات و قرارداد، v2.5.1)."""
+        return {
+            "Content-Type": content_type,
+            "timestamp": str(timestamp),
+            "signature_method": "HmacSHA256",
+            "echostr": str(echostr),
+        }
 
     def _build_signature(self, payload: dict[str, Any]) -> str:
         """
@@ -357,6 +406,51 @@ class LBankRestClient:
             return None
         return value if value > 0 else None
 
+    @staticmethod
+    def _classify_forbidden(response: httpx.Response, endpoint: str) -> Exception | None:
+        """
+        تشخیص علت 401/403 (v2.5.1).
+
+        اگر بدنه JSON صرافی با کد خطا باشد ← None (مسیر عادی کدهای LBank).
+        صفحهٔ Cloudflare ← `AccessBlockedError` با کد و معنی (1015 ← محدودیت نرخ).
+        هیچ کلید یا امضایی در متن خطا نمی‌آید؛ فقط کد، معنی و Ray ID.
+        """
+        status = response.status_code
+        try:
+            body = response.text or ""
+        except Exception:  # noqa: BLE001 - بدنهٔ خراب فقط یعنی تشخیص کمتر
+            body = ""
+        try:
+            payload = response.json()
+        except Exception:  # noqa: BLE001
+            payload = None
+        if isinstance(payload, dict) and any(
+            key in payload for key in ("error_code", "result", "success", "msg")
+        ):
+            return None
+        headers = getattr(response, "headers", {}) or {}
+        server = str(headers.get("server", "") or "").lower()
+        ray = str(headers.get("cf-ray", "") or "")
+        cloudflare = "cloudflare" in server or bool(ray) or "cloudflare" in body.lower()
+        code = _cloudflare_code(body) if cloudflare else ""
+        if code == "1015":
+            return RateLimitError(
+                "LBank rate limit exceeded (Cloudflare 1015)",
+                details={"endpoint": endpoint, "status": status, "cf_code": code},
+            )
+        reason = CLOUDFLARE_REASONS.get(code, "") if code else ""
+        if cloudflare:
+            label = f"Cloudflare {code}" if code else "Cloudflare"
+            text = f"HTTP {status} blocked by {label}" + (f" — {reason}" if reason else "")
+        else:
+            reason = "access forbidden (IP whitelist / region / firewall)"
+            text = f"HTTP {status} — {reason}"
+        details: dict[str, Any] = {"endpoint": endpoint, "status": status,
+                                   "cloudflare": cloudflare, "cf_code": code, "reason": reason}
+        if ray:
+            details["cf_ray"] = ray[:40]
+        return AccessBlockedError(f"{text} while calling {endpoint}", details=details)
+
     def _handle_response(
         self, response: httpx.Response, endpoint: str, *, contract: bool = False
     ) -> Any:
@@ -379,7 +473,12 @@ class LBankRestClient:
                 f"LBank server error ({response.status_code})",
                 details={"endpoint": endpoint, "status": response.status_code},
             )
-        if response.status_code >= 400:
+        if response.status_code in (401, 403):
+            blocked = self._classify_forbidden(response, endpoint)
+            if blocked is not None:
+                raise blocked
+            # بدنهٔ JSON صرافی (مثلاً کد خطای کلید) — همان مسیر عادی پایین
+        elif response.status_code >= 400:
             raise NetworkError(
                 f"HTTP {response.status_code} while calling {endpoint}",
                 details={"status": response.status_code},

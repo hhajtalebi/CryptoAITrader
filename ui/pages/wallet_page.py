@@ -19,7 +19,9 @@ from typing import Any
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
+    QCheckBox,
     QFrame,
+    QLineEdit,
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
@@ -146,11 +148,17 @@ class WalletPage(BasePage):
     asset_activated = Signal(str)
     #: کاربر «همگام‌سازی موجودی کاغذی با کیف پول» را زد (v2.5.0)
     paper_sync_requested = Signal()
+    #: کلید «تازه‌سازی خودکار موجودی» (v2.5.1)
+    auto_sync_toggled = Signal(bool)
 
     def __init__(self, translator: Translator, parent: Any = None) -> None:
         self._assets: list[dict[str, Any]] = []
         self._spot_rows: list[dict[str, Any]] = []
         self._futures_rows: list[dict[str, Any]] = []
+        self._spot_all: list[dict[str, Any]] = []
+        self._spot_summary: dict[str, Any] = {}
+        self._report_lines: list[tuple[str, str]] = []
+        self._report_hint = ""
         self._theme: Any = None
         super().__init__(translator, parent)
 
@@ -171,6 +179,13 @@ class WalletPage(BasePage):
         set_role(self.sync_label, "faint")
         self.header.add_action(self.sync_label)
 
+        # v2.5.1: موجودی بدون فشار دکمه هر ۶۰ ثانیه از صرافی خوانده می‌شود
+        self.auto_sync_checkbox = QCheckBox(self.tr_.tr("wallet.auto_sync"))
+        self.auto_sync_checkbox.setChecked(True)
+        self.auto_sync_checkbox.setToolTip(self.tr_.tr("wallet.auto_sync_tip"))
+        self.auto_sync_checkbox.toggled.connect(self.auto_sync_toggled)
+        self.header.add_action(self.auto_sync_checkbox)
+
         # پشتهٔ محتوا: حالت عادی یا حالت «حساب متصل نیست»
         self.stack = QStackedWidget(self)
         self.layout_root().addWidget(self.stack, 1)
@@ -187,6 +202,12 @@ class WalletPage(BasePage):
         زبانهٔ «نمای کلی» همان چیدمان قبلی است به‌علاوهٔ پنل حساب کاغذی؛
         اسپات و فیوچرز هر کدام نوار خلاصه و جدول جزئیات خودشان را دارند.
         """
+        holder = QWidget(self)
+        holder_layout = QVBoxLayout(holder)
+        holder_layout.setContentsMargins(0, 0, 0, 0)
+        holder_layout.setSpacing(8)
+        holder_layout.addWidget(self._build_status_panel())
+
         self.tabs = QTabWidget(self)
         self.tabs.setDocumentMode(True)
         # هر زبانه درون ناحیهٔ پیمایش است تا در نمایشگر لپ‌تاپ فشرده نشود
@@ -194,7 +215,67 @@ class WalletPage(BasePage):
         self.tabs.addTab(self._scrollable(self._build_spot_tab()), "")
         self.tabs.addTab(self._scrollable(self._build_futures_tab()), "")
         self._retranslate_tabs()
-        return self.tabs
+        holder_layout.addWidget(self.tabs, 1)
+        return holder
+
+    def _build_status_panel(self) -> QWidget:
+        """
+        نوار وضعیت همگام‌سازی (v2.5.1).
+
+        برای هر بخش (اسپات/فیوچرز) یک سطر ✓/✗ با تعداد دارایی یا علت دقیق
+        شکست و یک راهنمای رفع مشکل. قبلاً خطا فقط یک لحظه در نوار وضعیت
+        پایین می‌آمد و کاربر فقط «کیف پول خالی» می‌دید.
+        """
+        self.status_panel = QFrame(self)
+        set_role(self.status_panel, "card")
+        layout = QVBoxLayout(self.status_panel)
+        layout.setContentsMargins(14, 8, 14, 8)
+        layout.setSpacing(2)
+        self.status_lines = QLabel("")
+        self.status_lines.setWordWrap(True)
+        self.status_lines.setTextFormat(Qt.TextFormat.RichText)
+        self.status_lines.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.status_hint = QLabel("")
+        self.status_hint.setWordWrap(True)
+        set_role(self.status_hint, "faint")
+        layout.addWidget(self.status_lines)
+        layout.addWidget(self.status_hint)
+        self.status_panel.setVisible(False)
+        return self.status_panel
+
+    def set_sync_report(self, lines: list[tuple[str, str]], hint: str = "") -> None:
+        """
+        نمایش گزارش همگام‌سازی.
+
+        `lines`: فهرست (سطح، متن) با سطح `ok` | `warn` | `error`.
+        """
+        self._report_lines = [(str(level), str(text)) for level, text in (lines or [])]
+        self._report_hint = str(hint or "")
+        self._render_report()
+
+    def report_text(self) -> str:
+        """متن ساده گزارش (برای آزمون و کپی)."""
+        return "\n".join(text for _level, text in self._report_lines)
+
+    def _render_report(self) -> None:
+        import html as _html
+
+        colors = self._theme.colors if self._theme is not None else None
+        palette = {
+            "ok": getattr(colors, "success", "#26d07c"),
+            "warn": getattr(colors, "warning", "#f5a524"),
+            "error": getattr(colors, "danger", "#ff5c5c"),
+        }
+        icons = {"ok": "✓", "warn": "!", "error": "✗"}
+        parts = [
+            f'<span style="color:{palette.get(level, palette["warn"])}; font-weight:700">'
+            f'{icons.get(level, "•")}</span>&nbsp;{_html.escape(text)}'
+            for level, text in self._report_lines
+        ]
+        self.status_lines.setText("<br>".join(parts))
+        self.status_hint.setText(self._report_hint)
+        self.status_hint.setVisible(bool(self._report_hint))
+        self.status_panel.setVisible(bool(parts or self._report_hint))
 
     @staticmethod
     def _scrollable(content: QWidget) -> QWidget:
@@ -326,7 +407,19 @@ class WalletPage(BasePage):
         card_layout.setSpacing(8)
         self.spot_title = QLabel("")
         set_role(self.spot_title, "section")
-        card_layout.addWidget(self.spot_title)
+        spot_head = QHBoxLayout()
+        spot_head.addWidget(self.spot_title)
+        spot_head.addStretch(1)
+        # v2.5.1: جست‌وجوی دارایی و پنهان‌کردن موجودی‌های خُرد (مثل صرافی‌ها)
+        self.spot_search = QLineEdit()
+        self.spot_search.setClearButtonEnabled(True)
+        self.spot_search.setMaximumWidth(220)
+        self.spot_search.textChanged.connect(lambda _t: self._apply_spot_filter())
+        self.hide_small_checkbox = QCheckBox("")
+        self.hide_small_checkbox.toggled.connect(lambda _c: self._apply_spot_filter())
+        spot_head.addWidget(self.spot_search)
+        spot_head.addWidget(self.hide_small_checkbox)
+        card_layout.addLayout(spot_head)
         self.spot_table = QTableWidget(0, len(SPOT_COLUMNS), card)
         configure_table(self.spot_table, stretch_column=0)
         self.spot_table.cellClicked.connect(lambda row, _c: self._emit_row_asset(self._spot_rows, row))
@@ -506,11 +599,30 @@ class WalletPage(BasePage):
         هر ردیف: `asset` و متن‌های `free_text, locked_text, total_text,
         price_text, value_text, share_text, change_text` (+ `change` عددی).
         """
-        self._spot_rows = list(rows or [])
+        self._spot_all = list(rows or [])
+        self._spot_summary = dict(summary or {})
         self.spot_strip.set_values(summary)
+        self._apply_spot_filter()
+
+    #: آستانهٔ «موجودی خُرد» به تتر
+    SMALL_BALANCE_USDT = 1.0
+
+    def _apply_spot_filter(self) -> None:
+        """فیلتر جست‌وجو و موجودی خُرد روی جدول اسپات (v2.5.1)."""
+        needle = self.spot_search.text().strip().upper()
+        hide_small = self.hide_small_checkbox.isChecked()
+        rows = []
+        for row in self._spot_all:
+            if needle and needle not in str(row.get("asset", "")).upper():
+                continue
+            value = row.get("value")
+            if hide_small and isinstance(value, (int, float)) and value < self.SMALL_BALANCE_USDT:
+                continue
+            rows.append(row)
+        self._spot_rows = rows
         self._fill_table(self.spot_table, SPOT_COLUMNS, self._spot_rows)
         self.spot_empty.setText(self.tr_.tr("wallet.spot_tab.empty"))
-        self.spot_empty.setVisible(not self._spot_rows)
+        self.spot_empty.setVisible(not self._spot_all)
 
     def set_futures(self, rows: list[dict[str, Any]], summary: dict[str, Any],
                     *, note: str = "", colors: dict[str, str] | None = None) -> None:
@@ -584,6 +696,8 @@ class WalletPage(BasePage):
             self._fill_table(self.spot_table, SPOT_COLUMNS, self._spot_rows)
         if self._futures_rows:
             self._fill_table(self.futures_table, FUTURES_COLUMNS, self._futures_rows)
+        if self._report_lines:
+            self._render_report()
 
     def retranslate(self) -> None:
         """بازسازی متن‌ها پس از تغییر زبان."""
@@ -639,6 +753,10 @@ class WalletPage(BasePage):
         self.paper_sync_button.setText(self.tr_.tr("wallet.paper.sync"))
         self.paper_sync_button.setToolTip(self.tr_.tr("wallet.paper.sync_tip"))
         self.spot_title.setText(self.tr_.tr("wallet.spot_tab.title"))
+        self.spot_search.setPlaceholderText(self.tr_.tr("wallet.spot_tab.search"))
+        self.hide_small_checkbox.setText(self.tr_.tr("wallet.spot_tab.hide_small"))
+        self.auto_sync_checkbox.setText(self.tr_.tr("wallet.auto_sync"))
+        self.auto_sync_checkbox.setToolTip(self.tr_.tr("wallet.auto_sync_tip"))
         self.futures_title.setText(self.tr_.tr("wallet.futures_tab.title"))
 
     def _render_legend(self, segments: list[tuple[str, float, str]]) -> None:

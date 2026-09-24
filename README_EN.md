@@ -2,11 +2,20 @@
 
 **Professional desktop app for crypto market analysis and futures signal generation**
 
-Version 2.5.0 · Windows 10/11 · Python 3.11+ (tested up to 3.13) · Persian & English
+Version 2.5.2 · Windows 10/11 · Python 3.11+ (tested up to 3.13) · Persian & English
 
 [راهنمای فارسی](README.md)
 
-> **Current delivery 2.5.0:** share signals (Telegram, WhatsApp, X, email, Rubika/Eitaa/Bale), a
+> **Current delivery 2.5.2:** LBank futures HTTP 403 (Cloudflare firewall) — browser-like headers, the exact
+> Cloudflare block code and reason in the wallet report, no retries of rejected requests, and a fix hint.
+> [Release report](docs/RELEASE_2.5.2_FA.md).
+>
+> **Previous delivery 2.5.1:** the wallet shows assets again (LBank signature headers, fallback
+> balance endpoints, a sync report with the cause and fix of any error, auto-sync every 60 s); the
+> watchlist really saves and can be built from a right-click menu on any market row; markets are ordered
+> by market cap and volume (BTC, ETH first) with exact USDT prices. [Release report](docs/RELEASE_2.5.1_FA.md).
+>
+> **Previous delivery 2.5.0:** share signals (Telegram, WhatsApp, X, email, Rubika/Eitaa/Bale), a
 > stretched rounded search bar, "Act on this trade" with the calculator's entry/SL/TP1–3 and staged exits
 > (⅓ at TP1 + stop to entry, ⅓ at TP2, rest at TP3), a rebuilt trade-history table, a prefilled position
 > calculator, a three-tab wallet (Overview/Spot/Futures) with the LBank futures balance fixed, and a paper

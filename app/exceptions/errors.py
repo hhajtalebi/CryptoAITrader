@@ -87,6 +87,19 @@ class NetworkError(AppError):
     default_user_key = "errors.network"
 
 
+class AccessBlockedError(NetworkError):
+    """
+    درخواست پیش از رسیدن به API رد شد (HTTP 401/403 بدون پاسخ JSON صرافی).
+
+    معمولاً دیوار آتش Cloudflare جلوی دامنهٔ صرافی است: محدودیت کشور/منطقه
+    (کد 1009)، قانون فایروال (1020)، امضای مرورگر (1010) یا IP مسدود
+    (1006–1008). تکرار فوری بی‌فایده است و ممکن است مسدودی را سخت‌تر کند.
+    کد و معنی در details["cf_code"] / details["reason"] است.
+    """
+
+    default_user_key = "errors.network"
+
+
 class TimeoutErrorApp(NetworkError):
     """درخواست در مهلت تعیین‌شده پاسخ نداد."""
 

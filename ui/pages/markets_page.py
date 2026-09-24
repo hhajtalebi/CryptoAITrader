@@ -18,10 +18,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QBrush, QColor
+from PySide6.QtCore import QPoint, Qt, Signal
+from PySide6.QtGui import QBrush, QColor, QGuiApplication
 from PySide6.QtWidgets import (
     QCheckBox,
+    QMenu,
     QComboBox,
     QHBoxLayout,
     QLabel,
@@ -34,6 +35,15 @@ from PySide6.QtWidgets import (
 )
 
 from localization import Translator
+from market.market_rank import (
+    USD_QUOTES,
+    compact_number,
+    price_decimals,
+    quote_usdt_prices,
+    sort_by_market_value,
+    split_symbol,
+    turnover_usdt,
+)
 from ui.pages.base_page import BasePage
 from ui.widgets import (
     Card,
@@ -68,7 +78,9 @@ CHIP_FILTERS = ("gainers", "losers", "volume")
 
 #: حالت‌های مرتب‌سازی. کاربر گفت «ارزها ابتدا باید بر اساس ارزش آن‌ها
 #: دسته‌بندی بشه»، پس پیش‌فرض «ارزش معاملات» است نه ترتیب الفبایی صرافی.
+#: v2.5.1 — پیش‌فرض «ارزش بازار + حجم»: BTC، ETH، XRP… اول، سپس پرمعامله‌ترین‌ها.
 SORT_MODES: list[tuple[str, str]] = [
+    ("market_cap", "markets.sort_market_cap"),
     ("value", "markets.sort_value"),
     ("volume", "markets.sort_volume"),
     ("gainers", "markets.sort_gainers"),
@@ -114,12 +126,16 @@ class MarketsPage(BasePage):
     watchlist_toggled = Signal(str, bool)
     #: کاربر خواست برای نماد انتخاب‌شده هشدار قیمتی بسازد
     alert_requested = Signal(str)
+    #: منوی کلیک راست (v2.5.1): تحلیل / سیگنال برای نماد
+    analyze_requested = Signal(str)
+    signal_requested = Signal(str)
 
     title_key = "nav.markets"
     subtitle_key = "markets.subtitle"
 
     def __init__(self, translator: Translator, parent: Any = None) -> None:
-        self._sort_mode: str = "value"
+        self._sort_mode: str = "market_cap"
+        self._quote_prices: dict[str, float] = {}
         self._all_rows: list[dict[str, Any]] = []
         self._watchlist: set[str] = set()
         self._quote_filter = "USDT"
@@ -234,6 +250,9 @@ class MarketsPage(BasePage):
         self.table.horizontalHeader().setSortIndicatorShown(False)
         self.table.horizontalHeader().sectionClicked.connect(self._on_header_clicked)
         self.table.cellClicked.connect(self._on_cell_clicked)
+        # v2.5.1: کلیک راست روی هر ردیف (نماد یا هر خانهٔ دیگر) ← منوی نماد
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._show_context_menu)
         self.card.add(self.table)
 
         # دو زبانه: همهٔ بازارها، و مدیریت فهرست‌های دیده‌بانی. جدول
@@ -269,7 +288,7 @@ class MarketsPage(BasePage):
             self.tr_.tr("markets.price_toman"),
             self.tr_.tr("common.change"),
             self.tr_.tr("common.high"),
-            self.tr_.tr("common.volume"),
+            self.tr_.tr("markets.turnover_usdt"),
             self.tr_.tr("markets.trend"),
         ])
         configure_table(self.table, stretch_column=COL_SYMBOL)
@@ -355,22 +374,22 @@ class MarketsPage(BasePage):
             index = self._row_index.get(symbol)
             if index is None:
                 continue
-            price = row.get("price", 0.0) or 0.0
             change = float(row.get("change_percent", 0.0) or 0.0)
+            usdt_price = self._usdt_price(row)
 
             usd = self.table.item(index, COL_PRICE_USD)
             if usd is not None:
-                usd.setText(self.tr_.format_number(price, self._price_decimals(price)))
+                usd.setText(self._price_text(row))
             toman = self.table.item(index, COL_PRICE_TOMAN)
             if toman is not None:
-                toman.setText(self._toman_text(price))
+                toman.setText(self._toman_text(usdt_price))
             change_item = self.table.item(index, COL_CHANGE)
             if change_item is not None:
                 change_item.setText(f"\u200e{change:+.2f}%")
                 self._tint(change_item, 1 if change > 0 else (-1 if change < 0 else 0))
             volume = self.table.item(index, COL_VOLUME)
             if volume is not None:
-                volume.setText(self.tr_.format_number(row.get("volume", 0.0) or 0.0, 0))
+                volume.setText(self._turnover_text(row))
 
     def apply_price_updates(self, updates: dict[str, dict[str, Any]]) -> None:
         """
@@ -384,31 +403,40 @@ class MarketsPage(BasePage):
             return
 
         for symbol, update in updates.items():
-            row = self._row_index.get(symbol)
-            if row is None:
-                continue
-
             price = update.get("price")
             if price is None:
+                continue
+            base, quote = split_symbol(symbol)
+            if quote == "USDT" and base:
+                # قیمت مرجع جفت‌های غیرتتری (مثلاً ETH/BTC) هم زنده بماند —
+                # حتی وقتی ردیف BTC/USDT در زبانهٔ فعلی دیده نمی‌شود.
+                try:
+                    self._quote_prices[base] = float(price)
+                except (TypeError, ValueError):
+                    pass
+            row = self._row_index.get(symbol)
+            if row is None:
                 continue
             direction = int(update.get("tick_direction") or 0)
 
             # به‌روزرسانی دادهٔ پشتیبان تا فیلتر بعدی مقدار تازه را ببیند
+            stored_row: dict[str, Any] = {"symbol": symbol, "price": price}
             for stored in self._all_rows:
                 if stored.get("symbol") == symbol:
                     stored["price"] = price
                     if update.get("change_percent") is not None:
                         stored["change_percent"] = update["change_percent"]
+                    stored_row = stored
                     break
 
             usd_item = self.table.item(row, COL_PRICE_USD)
             if usd_item is not None:
-                usd_item.setText(self.tr_.format_number(price, self._price_decimals(price)))
+                usd_item.setText(self._price_text(stored_row))
                 self._tint(usd_item, direction)
 
             toman_item = self.table.item(row, COL_PRICE_TOMAN)
             if toman_item is not None:
-                toman_item.setText(self._toman_text(price))
+                toman_item.setText(self._toman_text(self._usdt_price(stored_row)))
                 self._tint(toman_item, direction)
 
             change = update.get("change_percent")
@@ -454,17 +482,21 @@ class MarketsPage(BasePage):
             except (TypeError, ValueError):
                 return 0.0
 
-        def value_of(row: dict[str, Any]) -> float:
-            """ارزش معاملات؛ اگر صرافی خودش داده بود، همان مبنا است."""
-            for key in ("quote_volume", "turnover", "value"):
-                raw = row.get(key)
-                if raw:
-                    try:
-                        return float(raw)
-                    except (TypeError, ValueError):
-                        continue
-            return price_of(row) * volume_of(row)
+        quotes = self._quote_prices
 
+        def value_of(row: dict[str, Any]) -> float:
+            """ارزش معاملات به تتر؛ اگر صرافی خودش داده بود، همان مبنا است."""
+            _base, quote = split_symbol(str(row.get("symbol", "")))
+            if quote and quote not in USD_QUOTES and quote not in quotes:
+                # ارز مرجع بی‌قیمت: همان مبنای خام (بهتر از صفر)
+                return turnover_usdt({**row, "symbol": _base}, None)
+            return turnover_usdt(row, quotes.get(quote))
+
+        def usdt_price_of(row: dict[str, Any]) -> float:
+            return self._usdt_price(row) or price_of(row)
+
+        if mode == "market_cap":
+            return sort_by_market_value(rows, quotes)
         if mode == "value":
             return sorted(rows, key=value_of, reverse=True)
         if mode == "volume":
@@ -474,9 +506,9 @@ class MarketsPage(BasePage):
         if mode == "losers":
             return sorted(rows, key=change_of)
         if mode == "price_desc":
-            return sorted(rows, key=price_of, reverse=True)
+            return sorted(rows, key=usdt_price_of, reverse=True)
         if mode == "price_asc":
-            return sorted(rows, key=price_of)
+            return sorted(rows, key=usdt_price_of)
         if mode == "name":
             return sorted(rows, key=lambda r: str(r.get("symbol", "")).upper())
         return list(rows)
@@ -532,6 +564,7 @@ class MarketsPage(BasePage):
             if needle
             else list(self._all_rows)
         )
+        self._quote_prices = quote_usdt_prices(self._all_rows)
         rows = self._apply_quick_filters(rows)
         rows = self.sort_rows(rows)
 
@@ -546,22 +579,23 @@ class MarketsPage(BasePage):
             change = float(row.get("change_percent", 0.0) or 0.0)
             change_direction = 1 if change > 0 else (-1 if change < 0 else 0)
 
+            usdt_price = self._usdt_price(row)
             cells = [
                 (COL_SYMBOL, symbol, 0),
-                (COL_PRICE_USD, self.tr_.format_number(price, self._price_decimals(price)), 0),
-                (COL_PRICE_TOMAN, self._toman_text(price), 0),
+                (COL_PRICE_USD, self._price_text(row), 0),
+                (COL_PRICE_TOMAN, self._toman_text(usdt_price), 0),
                 # نشانگر چپ‌به‌راست: بدون آن، «+۲.۳۴٪» در چیدمان راست‌به‌چپ
                 # به شکل «۲.۳۴٪+» نمایش داده می‌شود.
                 (COL_CHANGE, f"\u200e{change:+.2f}%", change_direction),
-                (COL_HIGH, self.tr_.format_number(row.get("high", 0.0) or 0.0, 4), 0),
-                (COL_VOLUME, self.tr_.format_number(row.get("volume", 0.0) or 0.0, 0), 0),
+                (COL_HIGH, self._high_text(row), 0),
+                (COL_VOLUME, self._turnover_text(row), 0),
             ]
             numeric_values = {
-                COL_PRICE_USD: float(price or 0.0),
-                COL_PRICE_TOMAN: float(price or 0.0) * (self._toman_rate or 0.0),
+                COL_PRICE_USD: float(usdt_price or price or 0.0),
+                COL_PRICE_TOMAN: float(usdt_price or 0.0) * (self._toman_rate or 0.0),
                 COL_CHANGE: change,
                 COL_HIGH: float(row.get("high", 0.0) or 0.0),
-                COL_VOLUME: float(row.get("volume", 0.0) or 0.0),
+                COL_VOLUME: self._turnover_value(row),
             }
             for column, value, tint in cells:
                 if column in numeric_values:
@@ -575,6 +609,8 @@ class MarketsPage(BasePage):
                     )
                 if tint:
                     self._tint(item, tint)
+                if column == COL_PRICE_USD:
+                    item.setToolTip(self._price_tooltip(row))
                 self.table.setItem(index, column, item)
 
             # ستارهٔ واچ‌لیست
@@ -645,9 +681,7 @@ class MarketsPage(BasePage):
             result = [row for row in result if float(row.get("change_percent") or 0.0) != 0]
 
         if "volume" in chips:
-            result = sorted(
-                result, key=lambda row: float(row.get("volume") or 0.0), reverse=True
-            )[:50]
+            result = sorted(result, key=self._turnover_value, reverse=True)[:50]
         return result
 
     def _on_quote_changed(self, quote: str) -> None:
@@ -713,21 +747,146 @@ class MarketsPage(BasePage):
         return self.tr_.format_number(value, 0)
 
     @staticmethod
-    def _price_decimals(price: Any) -> int:
+    def _price_decimals(price: Any, precision: Any = None) -> int:
         """
-        تعداد رقم اعشار متناسب با بزرگی قیمت.
+        تعداد رقم اعشار متناسب با بزرگی قیمت (v2.5.1: دقت صرافی در اولویت).
 
-        نمایش بیت‌کوین با ۸ رقم اعشار و شیبا با ۲ رقم، هر دو بی‌فایده‌اند.
+        نمایش بیت‌کوین با ۸ رقم اعشار و شیبا با ۲ رقم، هر دو بی‌فایده‌اند؛
+        قبلاً هر قیمت زیر ۱ با ۸ رقم ثابت نمایش داده می‌شد و قیمت ارزهای
+        بسیار ارزان (۰٫۰۰۰۰۰۰۰۱۲) صفر یا گرد دیده می‌شد.
         """
         try:
-            value = abs(float(price))
+            value = float(price)
         except (TypeError, ValueError):
             return 2
-        if value >= 1000:
-            return 2
-        if value >= 1:
-            return 4
-        return 8
+        return price_decimals(value, precision)
+
+    # --------------------------------------------------- قیمت تتری (v2.5.1)
+    def _usdt_price(self, row: dict[str, Any]) -> float:
+        """
+        قیمت تتری نماد.
+
+        جفت‌های X/USDT همان قیمت؛ جفت‌های X/BTC یا X/ETH با قیمت تتری ارز
+        مرجع تبدیل می‌شوند. قبلاً قیمت ETH/BTC (مثلاً ۰٫۰۳۸) زیر ستون «قیمت
+        (USDT)» نمایش داده می‌شد و تومانش هم غلط بود.
+        """
+        try:
+            price = float(row.get("price") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        _base, quote = split_symbol(str(row.get("symbol", "")))
+        if not quote or quote in USD_QUOTES:
+            return price
+        rate = self._quote_prices.get(quote)
+        return price * rate if rate else 0.0
+
+    def _price_text(self, row: dict[str, Any]) -> str:
+        """متن ستون قیمت تتری با دقت صرافی/چهار رقم معنادار."""
+        usdt = self._usdt_price(row)
+        if usdt <= 0:
+            return "—"
+        _base, quote = split_symbol(str(row.get("symbol", "")))
+        precision = row.get("price_precision") if (not quote or quote in USD_QUOTES) else None
+        return self.tr_.format_number(usdt, self._price_decimals(usdt, precision))
+
+    def _high_text(self, row: dict[str, Any]) -> str:
+        """
+        بیشترین قیمت ۲۴ ساعته با همان دقت قیمت (v2.5.1).
+
+        قبلاً ثابت ۴ رقم اعشار بود و برای ارزهای ریز «0.0000» نشان می‌داد.
+        بیشترین قیمت به ارز مرجع جفت است (همان واحد تیکر).
+        """
+        high = float(row.get("high", 0.0) or 0.0)
+        if high <= 0:
+            return "—"
+        return self.tr_.format_number(high, self._price_decimals(high, row.get("price_precision")))
+
+    def _price_tooltip(self, row: dict[str, Any]) -> str:
+        """قیمت اصلی جفت‌های غیرتتری در راهنمای ابزار."""
+        _base, quote = split_symbol(str(row.get("symbol", "")))
+        if not quote or quote in USD_QUOTES:
+            return ""
+        try:
+            native = float(row.get("price") or 0.0)
+        except (TypeError, ValueError):
+            return ""
+        return f"{native:.{price_decimals(native)}f} {quote}"
+
+    def _turnover_value(self, row: dict[str, Any]) -> float:
+        """ارزش معاملات ۲۴ ساعته به تتر."""
+        _base, quote = split_symbol(str(row.get("symbol", "")))
+        return turnover_usdt(row, self._quote_prices.get(quote))
+
+    def _turnover_text(self, row: dict[str, Any]) -> str:
+        """۱٫۲۵B / ۳۴۰٫۱۲M — خوانا مثل صرافی‌ها."""
+        value = self._turnover_value(row)
+        if value <= 0:
+            return "—"
+        number, suffix = compact_number(value)
+        return self.tr_.format_number(number, 2 if suffix else 0) + suffix
+
+    # ------------------------------------------------ منوی کلیک راست (v2.5.1)
+    def _show_context_menu(self, pos: QPoint) -> None:
+        """کلیک راست روی ردیف ← منوی نماد (واچ‌لیست، جزئیات، تحلیل، …)."""
+        row = self.table.rowAt(pos.y())
+        if row < 0:
+            return
+        item = self.table.item(row, COL_SYMBOL)
+        if item is None or not item.text():
+            return
+        self.table.selectRow(row)
+        menu = self.build_context_menu(item.text())
+        menu.exec(self.table.viewport().mapToGlobal(pos))
+        menu.deleteLater()
+
+    def build_context_menu(self, symbol: str) -> QMenu:
+        """
+        ساخت منوی نماد (جدا از نمایش تا آزمون‌پذیر باشد).
+
+        گزینهٔ اول همیشه افزودن/برداشتن از واچ‌لیست است — خواستهٔ اصلی
+        کاربر — و بقیه میان‌بُر کارهای رایج روی همان نماد.
+        """
+        menu = QMenu(self.table)
+        menu.setObjectName("marketsContextMenu")
+        starred = symbol in self._watchlist
+        watch = menu.addAction(
+            ("☆  " + self.tr_.tr("markets.remove_from_watchlist"))
+            if starred
+            else ("★  " + self.tr_.tr("markets.add_to_watchlist"))
+        )
+        watch.setData("watchlist")
+        watch.triggered.connect(lambda _c=False, s=symbol: self._on_star_clicked(s))
+        menu.addSeparator()
+        entries = (
+            ("details", "🔍  " + self.tr_.tr("markets.menu.details"), lambda s=symbol: self.coin_activated.emit(s)),
+            ("analyze", "📈  " + self.tr_.tr("markets.menu.analyze"), lambda s=symbol: self.analyze_requested.emit(s)),
+            ("signal", "⚡  " + self.tr_.tr("markets.menu.signal"), lambda s=symbol: self.signal_requested.emit(s)),
+            ("alert", "🔔  " + self.tr_.tr("alerts.add"), lambda s=symbol: self.alert_requested.emit(s)),
+        )
+        for key, text, handler in entries:
+            action = menu.addAction(text)
+            action.setData(key)
+            action.triggered.connect(lambda _c=False, h=handler: h())
+        menu.addSeparator()
+        copy_symbol = menu.addAction("⧉  " + self.tr_.tr("markets.menu.copy_symbol"))
+        copy_symbol.setData("copy_symbol")
+        copy_symbol.triggered.connect(lambda _c=False, s=symbol: self._copy_text(s))
+        row = self.row_data(symbol)
+        copy_price = menu.addAction("⧉  " + self.tr_.tr("markets.menu.copy_price"))
+        copy_price.setData("copy_price")
+        copy_price.setEnabled(self._usdt_price(row) > 0)
+        copy_price.triggered.connect(
+            lambda _c=False, r=row: self._copy_text(
+                f"{self._usdt_price(r):.{self._price_decimals(self._usdt_price(r), r.get('price_precision'))}f}"
+            )
+        )
+        return menu
+
+    @staticmethod
+    def _copy_text(text: str) -> None:
+        clipboard = QGuiApplication.clipboard()
+        if clipboard is not None:
+            clipboard.setText(str(text))
 
     def _on_alert_clicked(self) -> None:
         """درخواست ساخت هشدار برای نماد انتخاب‌شده."""

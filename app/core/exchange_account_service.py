@@ -271,21 +271,34 @@ class ExchangeAccountService:
             provider = provider_factory(
                 account["exchange"], creds["api_key"], creds["api_secret"]
             )
-            balances = await provider.get_account_balance()
+            # v2.5.1: شکست اسپات دیگر کل همگام‌سازی را نمی‌برد؛ اگر فیوچرز
+            # جواب بدهد همان نمایش داده می‌شود و علت شکست اسپات در گزارش
+            # کیف پول می‌آید. فقط وقتی هر دو شکست بخورند خطا بالا می‌رود.
+            spot_error: Exception | None = None
+            try:
+                balances = await provider.get_account_balance()
+            except Exception as exc:  # noqa: BLE001
+                spot_error = exc
+                balances = {}
 
             # موجودی فیوچرز جداست؛ بدون این، کاربری که سرمایه‌اش را به کیف
             # پول قراردادها منتقل کرده، کیف پول را تقریباً خالی می‌بیند.
             futures: dict[str, float] = {}
+            futures_ok = False
             fetch_futures = getattr(provider, "get_futures_balance", None)
             if callable(fetch_futures):
                 try:
                     futures = await fetch_futures() or {}
+                    report_now = getattr(provider, "last_sync_report", None) or {}
+                    futures_ok = bool((report_now.get("futures") or {}).get("ok", bool(futures)))
                 except Exception as exc:  # noqa: BLE001 - نبود فیوچرز خطا نیست
                     logger.info(
                         "Futures balance skipped for account id=%s: %s",
                         account_id,
                         exc.__class__.__name__,
                     )
+            if spot_error is not None and not futures_ok:
+                raise spot_error
 
             spot_only: dict[str, float] = dict(balances or {})
             combined: dict[str, float] = dict(balances or {})
@@ -339,8 +352,19 @@ class ExchangeAccountService:
                     "spot_value_usdt": spot_value,
                     "futures_value_usdt": futures_value,
                     "prices": prices,
+                    "report": _clean_report(
+                        getattr(provider, "last_sync_report", None),
+                        spot_error, creds,
+                    ),
                 },
             )
+            # وضعیت حساب: اسپات شکست خورده ولی فیوچرز آمده ← هشدار نه خطا
+            if spot_error is not None:
+                self._repository.set_status(
+                    account_id, status="connected",
+                    error=_sanitize(str(spot_error), creds["api_key"], creds["api_secret"]),
+                    synced=True,
+                )
             return {
                 "balances": balances or {},
                 "total_value_usdt": total,
@@ -406,3 +430,35 @@ def _clean_details(raw: Any) -> dict[str, dict[str, float]]:
                 continue
         cleaned[str(asset).upper()] = row
     return cleaned
+
+
+def _clean_report(raw: Any, spot_error: Exception | None, creds: dict[str, str]) -> dict[str, Any]:
+    """
+    گزارش هر بخش همگام‌سازی برای نمایش در کیف پول (v2.5.1).
+
+    فقط ok/endpoint/assets/error/fields ذخیره می‌شود و متن خطا از کلید و
+    رمز پاک می‌گردد.
+    """
+    report: dict[str, Any] = {}
+    source = raw if isinstance(raw, dict) else {}
+    for section in ("spot", "futures"):
+        info = source.get(section)
+        if not isinstance(info, dict):
+            continue
+        report[section] = {
+            "ok": bool(info.get("ok")),
+            "endpoint": str(info.get("endpoint") or "")[:80],
+            "assets": int(info.get("assets") or 0),
+            "error": _sanitize(str(info.get("error") or ""), creds.get("api_key", ""),
+                               creds.get("api_secret", ""))[:240],
+            "fields": [str(f)[:40] for f in (info.get("fields") or [])][:40],
+            "note": str(info.get("note") or "")[:40],
+        }
+    if spot_error is not None and not (report.get("spot") or {}).get("error"):
+        report["spot"] = {
+            "ok": False, "endpoint": "", "assets": 0, "fields": [], "note": "",
+            "error": _sanitize(str(spot_error), creds.get("api_key", ""),
+                               creds.get("api_secret", ""))[:240],
+        }
+    return report
+
