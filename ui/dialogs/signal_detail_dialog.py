@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QMenu,
     QScrollArea,
     QTextEdit,
     QVBoxLayout,
@@ -30,7 +31,15 @@ from PySide6.QtWidgets import (
 )
 
 from localization import Translator
-from ui.signal_share import copy_to_clipboard, format_signal_text, signal_symbol
+from ui.signal_share import (
+    SHARE_TARGETS,
+    copy_to_clipboard,
+    format_signal_text,
+    open_url,
+    share_mode,
+    share_url,
+    signal_symbol,
+)
 from ui.widgets import make_button
 from ui.widgets.position_calculator import PositionCalculator
 
@@ -334,17 +343,36 @@ class SignalDetailDialog(QDialog):
         layout.addWidget(self.calculator)
         return frame
 
-    def set_account_balance(self, amount: float, risk_percent: float = 0.0) -> None:
+    def set_account_balance(
+        self, amount: float, risk_percent: float = 0.0, source_text: str = ""
+    ) -> None:
         """
         نشاندن سرمایه و درصد ریسک واقعی کاربر در ماشین‌حساب.
 
-        کنترلر این را از کیف پول و تنظیمات ریسک می‌دهد؛ خود پنجره به
-        پایگاه داده دسترسی ندارد و نباید داشته باشد.
+        کنترلر این را از کیف پول/موجودی کاغذی و تنظیمات ریسک می‌دهد؛ خود
+        پنجره به پایگاه داده دسترسی ندارد و نباید داشته باشد.
         """
         if amount > 0:
             self.calculator.set_capital(amount)
         if risk_percent > 0:
             self.calculator.set_risk_percent(risk_percent)
+        if source_text:
+            self.calculator.set_capital_source(source_text)
+
+    def trade_payload(self) -> dict[str, Any]:
+        """
+        سیگنال + اعداد فعلی ماشین‌حساب (v2.5.0).
+
+        معامله با همان ورود/حد ضرر/TP1..TP3/اهرم/سرمایهٔ ماشین‌حساب باز
+        می‌شود؛ اگر کاربر عددی را ویرایش کرده باشد، همان اعمال می‌شود.
+        """
+        payload = dict(self._signal)
+        payload["plan"] = self.calculator.trade_values()
+        return payload
+
+    def trade_opened(self) -> None:
+        """پس از باز شدن موفق معامله، پنجره بسته می‌شود (خواستهٔ کاربر)."""
+        self.accept()
 
     def _build_meta(self) -> QWidget:
         """اطلاعات تکمیلی: روند، ساختار بازار، زمان و منبع."""
@@ -656,6 +684,18 @@ class SignalDetailDialog(QDialog):
         self.copy_info_button.clicked.connect(self.copy_info)
         layout.addWidget(self.copy_info_button)
 
+        # نسخهٔ ۲.۵.۰: اشتراک در شبکه‌های اجتماعی و پیام‌رسان‌ها
+        self.share_button = make_button(self.tr_.tr("signals.share.share"))
+        self.share_button.setToolTip(self.tr_.tr("signals.share.share_tip"))
+        self.share_menu = QMenu(self.share_button)
+        self.share_actions: dict[str, Any] = {}
+        for target, _mode in SHARE_TARGETS:
+            action = self.share_menu.addAction(self.tr_.tr(f"signals.share.to_{target}"))
+            action.triggered.connect(lambda _checked=False, t=target: self.share_to(t))
+            self.share_actions[target] = action
+        self.share_button.setMenu(self.share_menu)
+        layout.addWidget(self.share_button)
+
         layout.addStretch(1)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
@@ -685,6 +725,33 @@ class SignalDetailDialog(QDialog):
             self._flash_copied(self.copy_info_button, "signals.share.copy_info")
         return ok
 
+    #: بازکنندهٔ نشانی؛ آزمون‌ها جایگزینش می‌کنند تا مرورگر باز نشود
+    url_opener = staticmethod(open_url)
+
+    def share_to(self, target: str) -> str:
+        """
+        اشتراک متن سیگنال در یک مقصد؛ نشانی بازشده را برمی‌گرداند.
+
+        برای روبیکا/ایتا/بله که پیوند اشتراک متن ندارند، متن اول کپی
+        می‌شود و پیامی کوتاه می‌گوید «در گفت‌وگو بچسبانید».
+        """
+        text = self.share_text()
+        mode = share_mode(target)
+        if not mode:
+            return ""
+        if mode == "copy":
+            copy_to_clipboard(text)
+            self.share_button.setText(self.tr_.tr("signals.share.copied_paste"))
+            QTimer.singleShot(
+                2500, lambda: _safe_set_text(self.share_button, self.tr_.tr("signals.share.share"))
+            )
+        url = share_url(
+            target, text, subject=f"{signal_symbol(self._signal)} — {self.tr_.tr('signals.share.subject')}"
+        )
+        if url:
+            self.url_opener(url)
+        return url
+
     def _flash_copied(self, button: Any, restore_key: str) -> None:
         """نمایش کوتاه «کپی شد ✓» روی همان دکمه."""
         button.setText(self.tr_.tr("signals.share.copied"))
@@ -699,7 +766,7 @@ class SignalDetailDialog(QDialog):
 
     def _on_trade_clicked(self) -> None:
         """اعلام درخواست اقدام به کنترلر."""
-        self.trade_requested.emit(self._signal)
+        self.trade_requested.emit(self.trade_payload())
 
     def _entry_text(self) -> str:
         """قالب‌بندی محدودهٔ ورود که ممکن است تک‌قیمت یا بازه باشد."""
@@ -752,3 +819,11 @@ class SignalDetailDialog(QDialog):
         if direction == "SHORT":
             return "bearish"
         return "neutral"
+
+
+def _safe_set_text(widget: Any, text: str) -> None:
+    """تغییر متن ویجتی که شاید تا الان بسته شده باشد."""
+    try:
+        widget.setText(text)
+    except RuntimeError:
+        pass

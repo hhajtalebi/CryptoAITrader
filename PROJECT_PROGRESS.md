@@ -1,4 +1,19 @@
-## وضعیت جاری ۲.۴.۲ — سبکی رابط و کپی سیگنال
+## وضعیت جاری ۲.۵.۰ — معامله از سیگنال، کیف پول سه‌زبانه، موجودی کاغذی
+
+خواسته‌های کاربر: اشتراک سیگنال در شبکه‌های اجتماعی؛ جست‌وجوی بالا کشیده و گرد؛ «اقدام به معامله» با
+ورود/SL/TP1–3 و بستن با اهداف (پاسخ کاربر: پلکانی ⅓/⅓/باقی، SL به ورود پس از TP1)، بستن مودال و رفتن به جدول
+باز؛ بازسازی جدول تاریخچه و عنوان‌ها؛ ماشین‌حساب پرشده از سیگنال؛ بی‌درنگ؛ کیف پول سه‌زبانه (نمای کلی/اسپات/
+فیوچرز) با اعداد دقیق فیوچرز؛ موجودی کاغذی جعلی برابر کیف پول واقعی. پیاده‌سازی: `trading/staged_targets.py`
+(`next_step`)، `trading/trade_monitor.evaluate_staged`، `PaperTradeRepository.partial_close/realized_pnl_since`،
+`trading/paper_account.py`، `MainController._on_trade_requested(signal, dialog=)`/`_apply_trade_step`/
+`_paper_account`/`sync_paper_balance_with_wallet`/`_fill_wallet_tabs`، `WalletPage` (سه زبانه، `MetricStrip`،
+`paper_sync_requested`)، `TradesPage.HISTORY_COLUMNS` (۱۶ ستون، عنوان هنگام ساخت، به‌روزرسانی درجا)،
+`PositionCalculator` (TP2/TP3، `signal_entry`, `trade_values`)، `SignalDetailDialog` (`share_to`, `trade_payload`,
+`trade_opened`)، `LBankRestClient._handle_response(contract=True)` (پاسخ `success:true`/`result:""` قبلاً «LBank
+error 0» می‌شد — علت نمایش‌ندادن فیوچرز)، `LBankProvider._parse_futures_details`، `wallet_details` در
+`extra_config`. گزارش: `docs/RELEASE_2.5.0_FA.md`. commit/push فقط با دستور صریح.
+
+## وضعیت قبلی ۲.۴.۲ — سبکی رابط و کپی سیگنال
 
 گزارش کاربر پس از 2.4.1: «هنوز خیلی سنگین است و هنگ می‌کند» + «امکان کپی نام و اطلاعات
 سیگنال در جدول یا مودال». علت‌های یافته: (۱) کاروان GIL — محاسبهٔ pandas پویش روی نخ

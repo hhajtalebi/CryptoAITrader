@@ -306,18 +306,50 @@ class ExchangeAccountService:
                         total += float(amount) * float(price)
                     except (TypeError, ValueError):
                         continue
+            # v2.5.0: جزئیات هر کیف پول (آزاد/قفل/مارجین/سود شناور) و ارزش
+            # تتری هر بخش جدا نگه داشته می‌شود تا زبانه‌های اسپات و فیوچرز
+            # کیف پول اعداد دقیق نشان دهند.
+            spot_details = _clean_details(getattr(provider, "last_spot_details", None))
+            futures_details = _clean_details(getattr(provider, "last_futures_details", None))
+            spot_value = 0.0
+            futures_value = 0.0
+            prices: dict[str, float] = {}
+            if price_lookup is not None:
+                for asset in set(spot_only) | set(futures):
+                    try:
+                        price = price_lookup(asset)
+                        if inspect.isawaitable(price):
+                            price = await price
+                        prices[asset] = float(price)
+                    except (TypeError, ValueError):
+                        continue
+                    except Exception:  # noqa: BLE001 - قیمت یک دارایی نباید همه را ببرد
+                        continue
+                spot_value = sum(float(a) * prices.get(k, 0.0) for k, a in spot_only.items())
+                futures_value = sum(float(a) * prices.get(k, 0.0) for k, a in futures.items())
             self._repository.update_balances(
                 account_id,
                 balances=balances or {},
                 total_value_usdt=total,
                 spot=spot_only,
                 futures=futures,
+                details={
+                    "spot": spot_details,
+                    "futures": futures_details,
+                    "spot_value_usdt": spot_value,
+                    "futures_value_usdt": futures_value,
+                    "prices": prices,
+                },
             )
             return {
                 "balances": balances or {},
                 "total_value_usdt": total,
                 "spot": dict(spot_only),
                 "futures": dict(futures),
+                "spot_details": spot_details,
+                "futures_details": futures_details,
+                "spot_value_usdt": spot_value,
+                "futures_value_usdt": futures_value,
             }
         except Exception as exc:  # noqa: BLE001
             clean = _sanitize(str(exc), creds["api_key"], creds["api_secret"])
@@ -356,3 +388,21 @@ class ExchangeAccountService:
 
 
 __all__ = ["SECRET_NAMESPACE", "ExchangeAccountService"]
+
+
+def _clean_details(raw: Any) -> dict[str, dict[str, float]]:
+    """جزئیات موجودی قابل ذخیره در JSON (فقط اعداد، کلید حروف بزرگ)."""
+    if not isinstance(raw, dict):
+        return {}
+    cleaned: dict[str, dict[str, float]] = {}
+    for asset, info in raw.items():
+        if not isinstance(info, dict):
+            continue
+        row: dict[str, float] = {}
+        for key, value in info.items():
+            try:
+                row[str(key)] = float(value or 0.0)
+            except (TypeError, ValueError):
+                continue
+        cleaned[str(asset).upper()] = row
+    return cleaned

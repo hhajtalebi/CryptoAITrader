@@ -124,6 +124,25 @@ class PaperTradeRepository(BaseRepository[PaperTradeRecord]):
                 stmt = stmt.where(PaperTradeRecord.user_id == int(user_id))
             return float(session.scalar(stmt) or 0.0)
 
+    def realized_pnl_since(
+        self, user_id: int | None = None, since: datetime | None = None
+    ) -> float:
+        """
+        جمع سود/زیان خالص معاملات **کاغذی** بسته‌شده از یک لحظه (v2.5.0).
+
+        پایهٔ موجودی جعلی کاغذی است: با «همگام‌سازی با کیف پول» لحظهٔ
+        شروع جابه‌جا می‌شود و سودهای قبلی دیگر شمرده نمی‌شوند.
+        """
+        with self._db.session_scope() as session:
+            stmt = select(func.coalesce(func.sum(PaperTradeRecord.pnl), 0.0)).where(
+                PaperTradeRecord.status == "closed", PaperTradeRecord.mode != "live"
+            )
+            if since is not None:
+                stmt = stmt.where(PaperTradeRecord.closed_at >= since)
+            if user_id is not None:
+                stmt = stmt.where(PaperTradeRecord.user_id == int(user_id))
+            return float(session.scalar(stmt) or 0.0)
+
     def update_protection(self, trade_id: int, *, stop_loss: float) -> bool:
         """حفظ حد ضرر مؤثر برای تاریخچه و پایش پس از راه‌اندازی دوباره."""
         with self._db.session_scope() as session:
@@ -177,17 +196,82 @@ class PaperTradeRepository(BaseRepository[PaperTradeRecord]):
             direction = 1.0 if record.side == "long" else -1.0
             gross = (price - entry) * direction * float(record.quantity or 0.0)
             total_fee = float(record.fee or 0.0) + float(fee or 0.0)
+            # v2.5.0: سود ناخالص بستن‌های جزئی (TP1/TP2) پیش‌تر ثبت شده و
+            # کارمزدشان در `record.fee` است؛ اینجا به نتیجهٔ نهایی افزوده می‌شود.
+            extra = dict(record.extra or {})
+            realized = float(extra.get("realized_gross") or 0.0)
+            base_quantity = max(
+                float(record.quantity or 0.0), float(extra.get("original_quantity") or 0.0)
+            )
 
             record.exit_price = price
             record.fee = total_fee
-            record.pnl = gross - total_fee
-            margin = entry * float(record.quantity or 0.0) / float(record.leverage or 1.0)
+            record.pnl = gross + realized - total_fee
+            margin = entry * base_quantity / float(record.leverage or 1.0)
             record.pnl_percent = record.pnl / margin * 100.0 if margin > 0 else 0.0
             record.status = "closed"
             record.closed_at = _utcnow()
             if note:
                 record.note = note
             logger.info("Paper trade closed: id=%s pnl=%.4f", trade_id, record.pnl)
+            return _to_dict(record)
+
+    def partial_close(
+        self,
+        trade_id: int,
+        *,
+        quantity: float,
+        exit_price: float,
+        fee: float = 0.0,
+        target_index: int | None = None,
+        new_stop_loss: float | None = None,
+    ) -> dict[str, Any] | None:
+        """
+        بستن بخشی از یک معاملهٔ باز (v2.5.0 — اهداف پلکانی).
+
+        حجم باز کم می‌شود، سود ناخالص آن بخش در `extra.realized_gross`
+        انباشته می‌شود، کارمزدش به `fee` افزوده می‌شود و هر بستن در
+        `extra.partials` ثبت می‌گردد تا تاریخچه نشان دهد کدام هدف خورده.
+        اگر `new_stop_loss` داده شود (پس از TP1 = نقطهٔ ورود)، حد ضرر
+        جابه‌جا می‌شود.
+        """
+        with self._db.session_scope() as session:
+            record = session.get(PaperTradeRecord, int(trade_id))
+            if record is None or record.status != "open":
+                return None
+            open_quantity = float(record.quantity or 0.0)
+            amount = min(float(quantity or 0.0), open_quantity)
+            if amount <= 0 or amount >= open_quantity:
+                return None
+            price = float(exit_price or 0.0)
+            entry = float(record.entry_price or 0.0)
+            direction = 1.0 if record.side == "long" else -1.0
+            gross = (price - entry) * direction * amount
+
+            extra = dict(record.extra or {})
+            extra.setdefault("original_quantity", open_quantity)
+            extra["realized_gross"] = float(extra.get("realized_gross") or 0.0) + gross
+            partials = list(extra.get("partials") or [])
+            partials.append({
+                "target": None if target_index is None else int(target_index) + 1,
+                "quantity": amount,
+                "price": price,
+                "gross": gross,
+                "fee": float(fee or 0.0),
+                "at": _utcnow().isoformat(timespec="seconds"),
+            })
+            extra["partials"] = partials
+            if target_index is not None:
+                extra["targets_hit"] = max(int(extra.get("targets_hit") or 0), int(target_index) + 1)
+            record.extra = extra
+            record.quantity = open_quantity - amount
+            record.fee = float(record.fee or 0.0) + float(fee or 0.0)
+            if new_stop_loss is not None and new_stop_loss > 0:
+                record.stop_loss = float(new_stop_loss)
+            logger.info(
+                "Paper trade partial close: id=%s qty=%s @ %s (target %s)",
+                trade_id, amount, price, target_index,
+            )
             return _to_dict(record)
 
     def cancel_trade(self, trade_id: int) -> bool:

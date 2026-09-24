@@ -2,11 +2,17 @@
 
 **Professional desktop app for crypto market analysis and futures signal generation**
 
-Version 2.4.2 · Windows 10/11 · Python 3.11+ (tested up to 3.13) · Persian & English
+Version 2.5.0 · Windows 10/11 · Python 3.11+ (tested up to 3.13) · Persian & English
 
 [راهنمای فارسی](README.md)
 
-> **Current delivery 2.4.2:** heavy scan computation now runs in a separate low-priority
+> **Current delivery 2.5.0:** share signals (Telegram, WhatsApp, X, email, Rubika/Eitaa/Bale), a
+> stretched rounded search bar, "Act on this trade" with the calculator's entry/SL/TP1–3 and staged exits
+> (⅓ at TP1 + stop to entry, ⅓ at TP2, rest at TP3), a rebuilt trade-history table, a prefilled position
+> calculator, a three-tab wallet (Overview/Spot/Futures) with the LBank futures balance fixed, and a paper
+> balance that mirrors the real wallet. [Release report](docs/RELEASE_2.5.0_FA.md).
+>
+> **Previous delivery 2.4.2:** heavy scan computation now runs in a separate low-priority
 > worker process (the UI no longer freezes), the performance page refreshes lazily and off
 > the UI thread, repeated scans stop re-saving the same signal, a stall watchdog logs any UI
 > freeze, and you can copy a signal's symbol or full info from the tables and the details

@@ -180,6 +180,74 @@ def format_signal_text(signal: dict[str, Any] | None, translator: Any = None) ->
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# اشتراک در شبکه‌های اجتماعی — نسخهٔ ۲.۵.۰
+# ---------------------------------------------------------------------------
+#: مقصدهای اشتراک به ترتیب نمایش در منو.
+#: `mode="url"` یعنی متن در خود نشانی قرار می‌گیرد؛ `mode="copy"` یعنی
+#: پیام‌رسان نشانی اشتراک عمومی ندارد، پس متن اول در کلیپ‌بورد کپی و بعد
+#: نسخهٔ وب آن باز می‌شود تا کاربر فقط بچسباند.
+SHARE_TARGETS: tuple[tuple[str, str], ...] = (
+    ("telegram", "url"),
+    ("whatsapp", "url"),
+    ("x", "url"),
+    ("email", "url"),
+    ("rubika", "copy"),
+    ("eitaa", "copy"),
+    ("bale", "copy"),
+)
+
+#: نشانی وب پیام‌رسان‌هایی که پیوند اشتراک متن ندارند
+COPY_TARGET_URLS = {
+    "rubika": "https://web.rubika.ir/",
+    "eitaa": "https://web.eitaa.com/",
+    "bale": "https://web.bale.ai/",
+}
+
+
+def share_mode(target: str) -> str:
+    """`url` یا `copy` (یا رشتهٔ خالی برای مقصد ناشناخته)."""
+    return dict(SHARE_TARGETS).get(str(target or "").lower(), "")
+
+
+def share_url(target: str, text: str, *, subject: str = "") -> str:
+    """
+    نشانی اشتراک یک متن در مقصد داده‌شده.
+
+    خالص و بدون Qt است تا آزمون شود. متن با `quote` کامل رمزگذاری
+    می‌شود (فاصله → %20، خط تازه → %0A) چون `+` در برخی پیام‌رسان‌ها
+    عیناً نمایش داده می‌شود.
+    """
+    from urllib.parse import quote  # noqa: PLC0415
+
+    target = str(target or "").lower()
+    body = quote(str(text or ""), safe="")
+    if target == "telegram":
+        # t.me/share/url پارامتر url را لازم دارد؛ فاصلهٔ خالی کافی است و
+        # کل پیام در text می‌نشیند.
+        return f"https://t.me/share/url?url=%20&text={body}"
+    if target == "whatsapp":
+        return f"https://wa.me/?text={body}"
+    if target == "x":
+        return f"https://x.com/intent/post?text={body}"
+    if target == "email":
+        return f"mailto:?subject={quote(str(subject or ''), safe='')}&body={body}"
+    return COPY_TARGET_URLS.get(target, "")
+
+
+def open_url(url: str) -> bool:
+    """باز کردن نشانی در مرورگر/برنامهٔ پیش‌فرض سیستم."""
+    if not url:
+        return False
+    try:
+        from PySide6.QtCore import QUrl  # noqa: PLC0415
+        from PySide6.QtGui import QDesktopServices  # noqa: PLC0415
+
+        return bool(QDesktopServices.openUrl(QUrl(url)))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def copy_to_clipboard(text: str) -> bool:
     """قرار دادن متن در کلیپ‌بورد سیستم؛ شکست بی‌صدا و با بازگشت False."""
     if not text:

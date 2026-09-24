@@ -314,9 +314,13 @@ QDoubleSpinBox::up-arrow:disabled, QDoubleSpinBox::down-arrow:disabled {{
     opacity: 0.3;
 }}
 QLineEdit[role="search"] {{
-    border-radius: {radius_pill}px; padding: 8px 16px;
+    border-radius: 19px; padding: 6px 16px;
     background-color: {surface_alt};
+    border: {border_width}px solid {border};
+    min-height: 24px;
 }}
+QLineEdit[role="search"]:hover {{ border-color: {border_strong}; }}
+QLineEdit[role="search"]:focus {{ border-color: {primary}; background-color: {surface}; }}
 QLineEdit:disabled, QTextEdit:disabled {{ color: {text_faint}; }}
 
 QComboBox {{

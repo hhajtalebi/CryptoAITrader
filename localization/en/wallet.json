@@ -40,5 +40,62 @@
   "transfer": "Transfer",
   "value": "Value",
   "wallet_type": "Wallet",
-  "withdraw": "Withdraw"
+  "withdraw": "Withdraw",
+  "tabs": {
+    "overview": "Overview",
+    "spot": "Spot",
+    "futures": "Futures"
+  },
+  "spot_tab": {
+    "title": "Spot wallet assets",
+    "empty": "The spot wallet has no assets (or has not been synced yet).",
+    "col_asset": "Asset",
+    "col_free": "Free",
+    "col_locked": "In orders",
+    "col_total": "Total",
+    "col_price": "Price (USDT)",
+    "col_value": "Value (USDT)",
+    "col_share": "Share",
+    "col_change": "24h change",
+    "m_value": "Spot value",
+    "m_available_usdt": "Free USDT",
+    "m_locked_value": "Value in orders",
+    "m_assets": "Assets"
+  },
+  "futures_tab": {
+    "title": "Perpetual contracts account (USDT-M)",
+    "col_asset": "Asset",
+    "col_equity": "Equity",
+    "col_wallet": "Wallet balance",
+    "col_available": "Available margin",
+    "col_margin": "Position margin",
+    "col_frozen": "Frozen (orders)",
+    "col_unrealized": "Unrealized P&L",
+    "col_value": "Value (USDT)",
+    "m_equity": "Equity",
+    "m_wallet": "Wallet balance",
+    "m_available": "Available margin",
+    "m_used_margin": "Used margin",
+    "m_unrealized": "Unrealized P&L",
+    "m_margin_ratio": "Margin ratio",
+    "empty": "The exchange returned no futures balance. If you hold funds in futures, make sure the API key has Contract permission and sync again.",
+    "no_details": "Margin details not received yet — press Sync."
+  },
+  "paper": {
+    "title": "Paper account (practice)",
+    "card_title": "Paper account equity",
+    "sync": "Sync with real wallet",
+    "sync_tip": "Resets the paper balance to the real wallet's total value; earlier paper P&L leaves the balance (history is kept).",
+    "synced": "Paper balance synced with wallet: {amount}",
+    "sync_no_wallet": "Sync the real wallet first; its value is still zero.",
+    "source_wallet": "Start = real wallet ({amount}) since {time}",
+    "source_settings": "Start = risk settings ({amount}) — no exchange account connected",
+    "m_balance": "Balance",
+    "m_equity": "Equity",
+    "m_available": "Available",
+    "m_realized": "Realized P&L",
+    "m_unrealized": "Unrealized P&L",
+    "m_used_margin": "Used margin",
+    "m_start": "Starting balance"
+  }
 }

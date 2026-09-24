@@ -93,6 +93,13 @@ class PositionCalculator(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(10)
 
+        # منبع سرمایه (موجودی کاغذی/کیف پول) — کاربر باید بداند عدد از کجاست
+        self.capital_source_label = QLabel("", self)
+        set_role(self.capital_source_label, "faint")
+        self.capital_source_label.setWordWrap(True)
+        self.capital_source_label.setVisible(False)
+        root.addWidget(self.capital_source_label)
+
         root.addWidget(self._build_inputs())
         root.addWidget(self._build_results())
 
@@ -120,6 +127,9 @@ class PositionCalculator(QWidget):
         self.entry_input = self._money_input(maximum=1e12, value=0.0, decimals=PRICE_DECIMALS)
         self.stop_input = self._money_input(maximum=1e12, value=0.0, decimals=PRICE_DECIMALS)
         self.target_input = self._money_input(maximum=1e12, value=0.0, decimals=PRICE_DECIMALS)
+        # v2.5.0: TP2 و TP3 — معامله با مدیریت پلکانی هر سه هدف را لازم دارد
+        self.target2_input = self._money_input(maximum=1e12, value=0.0, decimals=PRICE_DECIMALS)
+        self.target3_input = self._money_input(maximum=1e12, value=0.0, decimals=PRICE_DECIMALS)
 
         self.leverage_input = QSpinBox(frame)
         self.leverage_input.setRange(1, MAX_LEVERAGE)
@@ -136,6 +146,8 @@ class PositionCalculator(QWidget):
             ("sizing.entry", self.entry_input),
             ("sizing.stop_loss", self.stop_input),
             ("sizing.take_profit", self.target_input),
+            ("sizing.take_profit_2", self.target2_input),
+            ("sizing.take_profit_3", self.target3_input),
             ("sizing.leverage", self.leverage_input),
             ("sizing.fee_percent", self.fee_input),
         ):
@@ -217,6 +229,11 @@ class PositionCalculator(QWidget):
         self._set_silently(self.risk_input, float(percent or 0))
         self.recalculate()
 
+    def set_capital_source(self, text: str) -> None:
+        """نمایش منبع عدد سرمایه (مثلاً «موجودی کاغذی = کیف پول»)."""
+        self.capital_source_label.setText(str(text or ""))
+        self.capital_source_label.setVisible(bool(text))
+
     def load_signal(self, signal: dict[str, Any]) -> None:
         """
         پر کردن ورودی‌ها از یک سیگنال.
@@ -224,27 +241,64 @@ class PositionCalculator(QWidget):
         سرمایه و درصد ریسک دست‌نخورده می‌مانند: آن‌ها به کاربر تعلق دارند
         نه به سیگنال، و بازنویسی‌شان یعنی کاربر باید هر بار دوباره
         واردشان کند.
+
+        v2.5.0: سیگنال‌های پویشگر و تاریخچه قیمت ورود را به‌صورت بازهٔ
+        `entry_min`/`entry_max` دارند نه `entry_price`؛ پیش‌تر همین باعث
+        می‌شد ماشین‌حساب با «۰» باز شود. حالا وسط بازه خوانده می‌شود و
+        هر سه هدف (TP1..TP3) پر می‌شوند.
         """
         data = dict(signal or {})
-        entry = _first_number(data.get("entry_price"), data.get("entry"))
+        entry = signal_entry(data)
         stop = _first_number(data.get("stop_loss"))
 
         targets = data.get("take_profits") or data.get("take_profit") or []
-        if isinstance(targets, (int, float)):
+        if isinstance(targets, (int, float, str)):
             targets = [targets]
-        target = _first_number(*(list(targets)[:1] or [0]))
+        numbers = [_first_number(value) for value in list(targets)[:3]]
+        numbers = [value for value in numbers if value > 0]
+        while len(numbers) < 3:
+            numbers.append(0.0)
 
         self._updating = True
         try:
             self.entry_input.setValue(entry)
             self.stop_input.setValue(stop)
-            self.target_input.setValue(target)
+            self.target_input.setValue(numbers[0])
+            self.target2_input.setValue(numbers[1])
+            self.target3_input.setValue(numbers[2])
             leverage = data.get("leverage")
             if leverage:
-                self.leverage_input.setValue(max(1, min(MAX_LEVERAGE, int(leverage))))
+                try:
+                    self.leverage_input.setValue(max(1, min(MAX_LEVERAGE, int(float(leverage)))))
+                except (TypeError, ValueError):
+                    pass
         finally:
             self._updating = False
         self.recalculate()
+
+    def targets(self) -> list[float]:
+        """اهداف واردشده (TP1..TP3) — صفرها حذف می‌شوند."""
+        values = (self.target_input.value(), self.target2_input.value(), self.target3_input.value())
+        return [float(value) for value in values if value > 0]
+
+    def trade_values(self) -> dict[str, Any]:
+        """
+        همهٔ اعداد فعلی ماشین‌حساب برای باز کردن معامله (v2.5.0).
+
+        «اقدام به معامله» دقیقاً همین اعداد را به کار می‌برد تا آنچه کاربر
+        دیده و احتمالاً ویرایش کرده، همان معامله‌ای باشد که باز می‌شود.
+        """
+        plan = self._plan
+        return {
+            "capital": float(self.capital_input.value()),
+            "risk_percent": float(self.risk_input.value()),
+            "entry": float(self.entry_input.value()),
+            "stop_loss": float(self.stop_input.value()),
+            "targets": self.targets(),
+            "leverage": int(self.leverage_input.value()),
+            "fee_percent": float(self.fee_input.value()),
+            "quantity": float(plan.quantity) if plan is not None and plan.valid else 0.0,
+        }
 
     def recalculate(self) -> None:
         """محاسبهٔ دوباره و به‌روزرسانی نمایش."""
@@ -360,6 +414,27 @@ def _trim(value: float) -> str:
     return text or "0"
 
 
+def signal_entry(data: dict[str, Any]) -> float:
+    """
+    قیمت ورود یک سیگنال از هر قالبی (v2.5.0).
+
+    ترتیب: `entry_price` → `entry` (عدد یا {min,max}) → وسط `entry_min`/`entry_max`.
+    """
+    direct = _first_number(data.get("entry_price"))
+    if direct > 0:
+        return direct
+    entry = data.get("entry")
+    if isinstance(entry, dict):
+        low, high = _first_number(entry.get("min")), _first_number(entry.get("max"))
+    else:
+        single = _first_number(entry)
+        if single > 0:
+            return single
+        low, high = _first_number(data.get("entry_min")), _first_number(data.get("entry_max"))
+    values = [value for value in (low, high) if value > 0]
+    return sum(values) / len(values) if values else 0.0
+
+
 def _first_number(*values: Any) -> float:
     """نخستین مقدار عددی معتبر میان ورودی‌ها."""
     for value in values:
@@ -372,4 +447,4 @@ def _first_number(*values: Any) -> float:
     return 0.0
 
 
-__all__ = ["PRICE_DECIMALS", "PositionCalculator"]
+__all__ = ["PRICE_DECIMALS", "PositionCalculator", "signal_entry"]

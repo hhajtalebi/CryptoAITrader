@@ -42,6 +42,24 @@ from market.timeframes import (
 logger = get_logger(__name__)
 
 
+#: نام‌های رایج فیلدهای حساب قرارداد (v2.5.0) — ترتیب، اولویت است
+_FUTURES_TOTAL_KEYS = (
+    "total", "equity", "accountEquity", "marginBalance", "totalEquity",
+    "totalMarginBalance", "balanceTotal",
+)
+_FUTURES_WALLET_KEYS = ("walletBalance", "balance", "totalWalletBalance", "cashBalance")
+_FUTURES_AVAILABLE_KEYS = (
+    "available", "availableBalance", "availableMargin", "canUseAmount",
+    "maxWithdrawAmount", "free", "usableAmt", "availBal",
+)
+_FUTURES_FROZEN_KEYS = ("frozen", "frozenMargin", "frozenBalance", "locked", "freezeAmt", "orderMargin")
+_FUTURES_MARGIN_KEYS = ("positionMargin", "usedMargin", "margin", "initialMargin", "posMargin")
+_FUTURES_UNREALIZED_KEYS = (
+    "unrealized", "unrealizedPnl", "unrealisedPnl", "unrealProfit", "unRealizedProfit",
+    "profitUnreal", "floatingPnl", "upl",
+)
+
+
 class LBankProvider(ExchangeProvider):
     """
     ارائه‌دهنده داده بازار صرافی LBank.
@@ -81,6 +99,9 @@ class LBankProvider(ExchangeProvider):
         )
         self._symbol_cache: dict[str, SymbolInfo] = {}
         self._ws_client_counter = 0
+        #: جزئیات آخرین همگام‌سازی موجودی (v2.5.0 — زبانه‌های کیف پول)
+        self.last_spot_details: dict[str, dict[str, float]] = {}
+        self.last_futures_details: dict[str, dict[str, float]] = {}
 
     # ------------------------------------------------------------------
     # چرخه عمر
@@ -326,7 +347,30 @@ class LBankProvider(ExchangeProvider):
         سبک بماند.
         """
         data = await self._client.post_signed(LBankEndpoints.USER_INFO)
+        # v2.5.0: جزئیات آزاد/قفل برای زبانهٔ «اسپات» کیف پول نگه داشته می‌شود
+        self.last_spot_details = self._parse_spot_details(data)
         return self._parse_balances(data)
+
+    @staticmethod
+    def _parse_spot_details(data: Any) -> dict[str, dict[str, float]]:
+        """دارایی → {free, locked, total} از پاسخ user_info.do (v2.5.0)."""
+        rows: Any = []
+        if isinstance(data, list):
+            rows = data
+        elif isinstance(data, dict):
+            rows = data.get("balances") or data.get("data") or data.get("info") or []
+        details: dict[str, dict[str, float]] = {}
+        if not isinstance(rows, list):
+            return details
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            asset = str(row.get("asset") or row.get("coin") or "").upper()
+            free = LBankParser._safe_float(row.get("free", row.get("usableAmt")), 0.0) or 0.0
+            locked = LBankParser._safe_float(row.get("locked", row.get("freezeAmt")), 0.0) or 0.0
+            if asset and free + locked > 0:
+                details[asset] = {"free": free, "locked": locked, "total": free + locked}
+        return details
 
     @staticmethod
     def _parse_balances(data: Any) -> dict[str, float]:
@@ -401,6 +445,7 @@ class LBankProvider(ExchangeProvider):
         )
 
         balances: dict[str, float] = {}
+        details: dict[str, dict[str, float]] = {}
         last_error: Exception | None = None
         answered = False
         for asset in CONTRACT_ASSETS:
@@ -413,30 +458,64 @@ class LBankProvider(ExchangeProvider):
                 last_error = exc
                 continue
             answered = True
-            for name, amount in self._parse_futures_balances(data, asset).items():
-                balances[name] = balances.get(name, 0.0) + float(amount or 0.0)
+            for name, info in self._parse_futures_details(data, asset).items():
+                balances[name] = balances.get(name, 0.0) + float(info.get("total") or 0.0)
+                merged = details.setdefault(name, {})
+                for key, value in info.items():
+                    merged[key] = merged.get(key, 0.0) + float(value or 0.0)
 
         if not answered and last_error is not None:
             raise last_error
+        self.last_futures_details = details
         return balances
 
     @staticmethod
     def _parse_futures_balances(data: Any, default_asset: str = "") -> dict[str, float]:
         """
-        تبدیل پاسخ حساب قرارداد به نگاشت «دارایی → موجودی».
+        تبدیل پاسخ حساب قرارداد به نگاشت «دارایی → موجودی کل».
 
         مثل اسپات، هم فهرست و هم دیکشنری پذیرفته می‌شود چون قالب پاسخ
-        بین نسخه‌ها فرق می‌کند. موجودی کل = آزاد + درگیر در پوزیشن.
+        بین نسخه‌ها فرق می‌کند. جزئیات در `_parse_futures_details` است.
+        """
+        return {
+            asset: float(info.get("total") or 0.0)
+            for asset, info in LBankProvider._parse_futures_details(data, default_asset).items()
+        }
+
+    @staticmethod
+    def _parse_futures_details(
+        data: Any, default_asset: str = ""
+    ) -> dict[str, dict[str, float]]:
+        """
+        دارایی → {total, available, frozen, margin, unrealized} (v2.5.0).
+
+        فیلدهای پاسخ `prv/account` در مستندات رسمی ذکر نشده‌اند، پس
+        نام‌های رایج (LBank، شبه‌Binance و شبه‌Bybit) همه پذیرفته می‌شوند.
+        «موجودی کل» اولویت با equity/marginBalance است (شامل سود شناور)،
+        وگرنه walletBalance/balance، وگرنه آزاد + درگیر.
         """
         rows: Any = data
         if isinstance(data, dict):
-            rows = data.get("data") or data.get("assets") or data.get("list") or []
+            nested = data.get("data") or data.get("assets") or data.get("list")
+            if nested is None and any(
+                key in data for key in _FUTURES_TOTAL_KEYS + _FUTURES_AVAILABLE_KEYS
+            ):
+                nested = data
+            rows = nested or []
         if isinstance(rows, dict):
             rows = [rows]
         if not isinstance(rows, list):
             return {}
 
-        balances: dict[str, float] = {}
+        def pick(row: dict, keys: tuple[str, ...]) -> float:
+            for key in keys:
+                if key in row and row.get(key) not in (None, ""):
+                    value = LBankParser._safe_float(row.get(key), None)
+                    if value is not None:
+                        return float(value)
+            return 0.0
+
+        details: dict[str, dict[str, float]] = {}
         for row in rows:
             if not isinstance(row, dict):
                 continue
@@ -445,23 +524,32 @@ class LBankProvider(ExchangeProvider):
             # انداخته می‌شد و موجودی فیوچرز صفر به نظر می‌رسید.
             asset = str(
                 row.get("asset")
+                or row.get("currency")
                 or row.get("symbol")
                 or row.get("coin")
                 or default_asset
             ).upper()
-            available = LBankParser._safe_float(
-                row.get("available", row.get("availableBalance", row.get("free"))), 0.0
-            ) or 0.0
-            frozen = LBankParser._safe_float(
-                row.get("frozen", row.get("positionMargin", row.get("locked"))), 0.0
-            ) or 0.0
-            total = LBankParser._safe_float(
-                row.get("total", row.get("balance", row.get("marginBalance"))), 0.0
-            ) or 0.0
-            amount = total if total > 0 else available + frozen
-            if asset and amount > 0:
-                balances[asset] = balances.get(asset, 0.0) + amount
-        return balances
+            available = pick(row, _FUTURES_AVAILABLE_KEYS)
+            frozen = pick(row, _FUTURES_FROZEN_KEYS)
+            margin = pick(row, _FUTURES_MARGIN_KEYS)
+            unrealized = pick(row, _FUTURES_UNREALIZED_KEYS)
+            total = pick(row, _FUTURES_TOTAL_KEYS)
+            wallet = pick(row, _FUTURES_WALLET_KEYS)
+            if total <= 0:
+                total = wallet + unrealized if wallet > 0 else available + frozen + margin
+            if not asset or total <= 0 and available <= 0:
+                continue
+            item = details.setdefault(asset, {
+                "total": 0.0, "available": 0.0, "frozen": 0.0,
+                "margin": 0.0, "unrealized": 0.0, "wallet": 0.0,
+            })
+            item["total"] += max(total, available)
+            item["available"] += available
+            item["frozen"] += frozen
+            item["margin"] += margin
+            item["unrealized"] += unrealized
+            item["wallet"] += wallet if wallet > 0 else max(total - unrealized, 0.0)
+        return details
 
     async def test_credentials(self) -> tuple[bool, str]:
         """

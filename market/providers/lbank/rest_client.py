@@ -48,6 +48,12 @@ from market.rate_limiter import AsyncRateLimiter, retry_async
 logger = get_logger(__name__)
 
 
+#: کدهای خطای API قرارداد (مستندات رسمی contract.html) — با کدهای اسپات فرق دارند
+CONTRACT_RATE_LIMIT_ERROR_CODES = frozenset({10012, 183})
+CONTRACT_AUTH_ERROR_CODES = frozenset({10003, 10007, 10008, 10009, 10010, 176, 177})
+CONTRACT_RETRYABLE_ERROR_CODES = frozenset({10004})
+
+
 class LBankRestClient:
     """
     کلاینت سطح پایین ارتباط با REST API صرافی LBank.
@@ -293,7 +299,7 @@ class LBankRestClient:
                 raise TimeoutErrorApp(f"Contract request timed out: {endpoint}") from exc
             except httpx.HTTPError as exc:
                 raise NetworkError(f"Network error while calling {endpoint}") from exc
-            return self._handle_response(response, endpoint)
+            return self._handle_response(response, endpoint, contract=True)
 
         return await retry_async(
             _do_request,
@@ -351,7 +357,9 @@ class LBankRestClient:
             return None
         return value if value > 0 else None
 
-    def _handle_response(self, response: httpx.Response, endpoint: str) -> Any:
+    def _handle_response(
+        self, response: httpx.Response, endpoint: str, *, contract: bool = False
+    ) -> Any:
         """
         بررسی پوشش پاسخ LBank و استخراج بخش data.
 
@@ -388,10 +396,37 @@ class LBankRestClient:
 
         result = payload.get("result")
         is_success = result in (True, "true", "True")
-        error_code = int(payload.get("error_code") or 0)
+        try:
+            error_code = int(payload.get("error_code") or 0)
+        except (TypeError, ValueError):
+            error_code = -1
 
         if is_success and error_code == 0:
             return payload.get("data")
+
+        if contract:
+            # v2.5.0: پاسخ API قراردادها `{"data":…,"error_code":0,"msg":"",
+            # "result":"","success":true}` است — `result` رشتهٔ خالی است و
+            # موفقیت در `success` می‌آید. قبلاً همین پاسخ موفق «LBank error 0»
+            # حساب می‌شد و موجودی فیوچرز همیشه خالی نمایش داده می‌شد.
+            success = payload.get("success")
+            if error_code == 0 and (
+                success in (True, "true", "True") or (success is None and result in ("", None))
+            ):
+                return payload.get("data")
+            if error_code in CONTRACT_RATE_LIMIT_ERROR_CODES:
+                details = {"endpoint": endpoint, "error_code": error_code,
+                           "message": str(payload.get("msg") or "too frequent"),
+                           "retry_after": RATE_LIMIT_RETRY_AFTER}
+                raise RateLimitError("LBank contract rate limit", details=details)
+            if error_code in CONTRACT_AUTH_ERROR_CODES:
+                details = {"endpoint": endpoint, "error_code": error_code,
+                           "message": str(payload.get("msg") or "auth")}
+                raise AuthenticationError("LBank contract authentication failed", details=details)
+            if error_code in CONTRACT_RETRYABLE_ERROR_CODES:
+                details = {"endpoint": endpoint, "error_code": error_code,
+                           "message": str(payload.get("msg") or "timeout")}
+                raise TransientExchangeError("LBank contract transient error", details=details)
 
         message = LBANK_ERROR_MESSAGES.get(error_code, str(payload.get("msg", "Unknown error")))
         details = {"endpoint": endpoint, "error_code": error_code, "message": message}

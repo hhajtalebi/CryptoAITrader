@@ -275,5 +275,38 @@
     "exchange_locked": "پیش از تغییر صرافی، ورود خودکار را متوقف و موقعیت‌های باز را ببندید.",
     "pos_fee": "کارمزد (خروج برآوردی)",
     "entering": "در حال بررسی قیمت تازه و محافظ‌های ورود…"
+  },
+  "history_cols": {
+    "opened": "زمان باز شدن",
+    "symbol": "نماد",
+    "side": "جهت",
+    "status": "وضعیت",
+    "entry": "قیمت ورود",
+    "price": "قیمت فعلی / خروج",
+    "quantity": "حجم باز",
+    "leverage": "اهرم",
+    "margin": "مارجین (USDT)",
+    "sl": "حد ضرر",
+    "targets": "اهداف (TP1 · TP2 · TP3)",
+    "pnl": "سود/زیان خالص (USDT)",
+    "pnl_percent": "بازده روی مارجین",
+    "fee": "کارمزد",
+    "closed": "زمان/علت بسته شدن",
+    "action": "عملیات",
+    "symbol_tip": "برای دیدن جزئیات کامل معامله کلیک کنید",
+    "price_live_tip": "معاملهٔ باز: قیمت زندهٔ قابل‌اجرا (Bid/Ask) با لغزش — هر ثانیه تازه می‌شود"
+  },
+  "staged": {
+    "tp_hit": "TP{target} {symbol} در {price} خورد — یک‌سوم حجم بسته شد",
+    "tp_hit_breakeven": "TP{target} {symbol} در {price} خورد — یک‌سوم بسته شد و حد ضرر به نقطهٔ ورود رفت",
+    "stage": "TP{hit}/{total}",
+    "breakeven": "SL=ورود"
+  },
+  "closed_breakeven": "باقی معامله در نقطهٔ ورود (سربه‌سر) بسته شد",
+  "reasons": {
+    "take_profit": "هدف نهایی",
+    "stop_loss": "حد ضرر",
+    "breakeven": "سربه‌سر",
+    "manual": "دستی"
   }
 }

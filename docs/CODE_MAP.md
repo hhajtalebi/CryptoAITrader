@@ -9744,3 +9744,21 @@ self._scorecard_timer.timeout.connect(self._scorecard_tick)
 - `ui/controllers/main_controller.py`: `_refresh_outcome_view` تنبل (`_outcome_view_stale`، `run_blocking("outcome-view")`)، `_on_outcome_view_shown`، `_terminal_timer_tick`، `_stall_watchdog` در `start()`/`shutdown()`، `_on_history_double_clicked` با نگاشت شناسه، اتصال `copy_notice` → `_toast`.
 - `localization/{en,fa}/signals.json`: گروه `share.*`.
 - آزمون: `tests/test_v242_lightweight_and_copy.py` (۲۵)؛ `tests/conftest.py` استخر را در آزمون‌ها خاموش می‌کند.
+
+## مکمل نسخهٔ 2.5.0
+
+| فایل | نقش | اتصال |
+|---|---|---|
+| `trading/staged_targets.py` | منطق خالص اهداف پلکانی: `clean_targets`, `stage_fractions`, `next_step`, `targets_text` | `trade_monitor.evaluate_staged`، `MainController._on_trade_requested` |
+| `trading/paper_account.py` | موجودی جعلی کاغذی: `PaperAccount`, `build_account`, کلیدهای `paper.*` | `MainController._paper_account/_trading_capital/_portfolio_snapshot` |
+| `trading/trade_monitor.py` | `LivePosition` با `targets/targets_hit/original_quantity/realized_gross`؛ `evaluate_staged` | `MainController._trade_monitor_tick` → `_apply_trade_step` |
+| `app/database/repositories/trade_repository.py` | `partial_close`, `realized_pnl_since`؛ `close_trade` سود جزئی را منظور می‌کند | پایش و کیف پول |
+| `market/providers/lbank/rest_client.py` | `_handle_response(contract=True)` و کدهای خطای قرارداد | `post_contract_signed` |
+| `market/providers/lbank/provider.py` | `_parse_spot_details`, `_parse_futures_details`, `last_spot_details`, `last_futures_details` | `ExchangeAccountService.sync_balances` → `extra_config.wallet_details` |
+| `ui/pages/wallet_page.py` | سه زبانه، `MetricStrip`, `set_spot`, `set_futures`, `set_paper`, سیگنال `paper_sync_requested` | `MainController.refresh_wallet/_fill_wallet_tabs/_fill_paper_panel` |
+| `ui/pages/trades_page.py` | `HISTORY_COLUMNS`, `HISTORY_TEXT_KEYS`, `_history_item`، به‌روزرسانی درجا | `MainController._trade_row/_trade_stage_texts` |
+| `ui/dialogs/signal_detail_dialog.py` | `share_to`, `trade_payload`, `trade_opened`, منوی اشتراک | `trade_requested` → `_on_trade_requested(payload, dialog=d)` |
+| `ui/signal_share.py` | `SHARE_TARGETS`, `share_url`, `share_mode`, `open_url` | مودال جزئیات |
+| `ui/widgets/position_calculator.py` | TP2/TP3، `signal_entry`, `trade_values`, `set_capital_source` | مودال جزئیات |
+| `ui/widgets/chrome.py` | `SearchBox` کشسان (`SEARCH_MIN/MAX_WIDTH`, `SEARCH_HEIGHT`) | `TopBar` |
+

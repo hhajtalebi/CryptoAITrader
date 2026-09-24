@@ -26,6 +26,7 @@ from typing import Any
 from PySide6.QtCore import QDate, Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
+    QHeaderView,
     QCheckBox,
     QComboBox,
     QDateEdit,
@@ -95,6 +96,32 @@ POSITION_COLUMNS = (
     "margin", "notional", "leverage", "tp", "sl", "pnl", "pnl_percent",
     "duration", "data_age", "exit_reason", "status", "action",
 )
+
+#: ستون‌های جدول تاریخچهٔ معاملات — بازسازی v2.5.0.
+#: عنوان‌ها از همین فهرست ساخته می‌شوند (`trades.history_cols.<name>`) تا
+#: عنوان و محتوای ستون هرگز از هم جدا نیفتند؛ پیش‌تر عنوان‌ها فقط هنگام
+#: تغییر زبان نشانده می‌شدند و جدول با سرستون «۱، ۲، ۳…» باز می‌شد.
+HISTORY_COLUMNS = (
+    "opened", "symbol", "side", "status", "entry", "price", "quantity",
+    "leverage", "margin", "sl", "targets", "pnl", "pnl_percent", "fee",
+    "closed", "action",
+)
+
+#: کلید متن هر ستون در ردیف آماده‌شدهٔ کنترلر
+HISTORY_TEXT_KEYS = {
+    "opened": "date_text",
+    "entry": "entry_text",
+    "price": "exit_text",
+    "quantity": "quantity_text",
+    "leverage": "leverage_text",
+    "margin": "margin_text",
+    "sl": "sl_text",
+    "targets": "targets_text",
+    "pnl": "pnl_text",
+    "pnl_percent": "pnl_percent_text",
+    "fee": "fee_text",
+    "closed": "closed_text",
+}
 
 #: کارت‌های اطلاعاتی بالای ترمینال (v2.1 — مرجع UI)
 INFO_CARDS = (
@@ -991,9 +1018,16 @@ class TradesPage(BasePage):
         layout.addWidget(self._build_filters())
         layout.addWidget(self._build_metrics())
 
-        self.table = QTableWidget(0, 15, self)
-        configure_table(self.table, stretch_column=1)
+        self.table = QTableWidget(0, len(HISTORY_COLUMNS), self)
+        configure_table(self.table, stretch_column=HISTORY_COLUMNS.index("closed"))
         harden_table(self.table, min_row_height=30, min_table_height=220)
+        # ستون اهداف هرگز بریده نشود (TP1 · TP2 · TP3 با علامت ✓)
+        for name in ("targets", "symbol", "opened"):
+            self.table.horizontalHeader().setSectionResizeMode(
+                HISTORY_COLUMNS.index(name), QHeaderView.ResizeMode.ResizeToContents
+            )
+        # عنوان‌ها همین حالا نشانده می‌شوند، نه فقط هنگام تغییر زبان
+        self._retranslate_headers()
         self.table.cellDoubleClicked.connect(self._on_row_activated)
         self.table.cellClicked.connect(self._on_history_cell_clicked)
         layout.addWidget(self.table, 1)
@@ -2055,61 +2089,46 @@ class TradesPage(BasePage):
         self._page, self._pages = page, pages
 
         self.table.setSortingEnabled(False)
-        self.table.setRowCount(len(self._rows))
+        # v2.5.0: اگر همان معاملات با همان ترتیب باشند (تیک زندهٔ قیمت)،
+        # فقط متن خانه‌ها عوض می‌شود — دکمه‌ها از نو ساخته نمی‌شوند تا
+        # جدول هر ثانیه چشمک نزند و کلیک روی «بستن» گم نشود.
+        new_ids = [row.get("id") for row in self._rows]
+        in_place = new_ids == getattr(self, "_row_ids", None) and self.table.rowCount() == len(self._rows)
+        self._row_ids = new_ids
+        if not in_place:
+            self.table.setRowCount(len(self._rows))
+        action_column = HISTORY_COLUMNS.index("action")
 
         for index, row in enumerate(self._rows):
-            symbol = QTableWidgetItem(str(row.get("symbol", "")))
-            symbol.setTextAlignment(
-                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
-            )
-
-            side_key = str(row.get("side", "")).lower()
-            side_item = self._cell(self.tr_.tr(f"trades.sides.{side_key}", side_key))
             status_key = str(row.get("status", "")).lower()
-            status_item = self._cell(
-                self.tr_.tr(f"trades.statuses.{status_key}", status_key)
-            )
-
-            pnl_value = row.get("pnl")
-            pnl_item = self._cell(row.get("pnl_text", ""))
-            percent_item = self._cell(row.get("pnl_percent_text", ""))
-
-            if self._theme is not None and isinstance(pnl_value, (int, float)):
-                colors = self._theme.colors
-                tint = QColor(colors.success if pnl_value >= 0 else colors.danger)
-                pnl_item.setForeground(tint)
-                percent_item.setForeground(tint)
-            if self._theme is not None:
-                colors = self._theme.colors
-                side_item.setForeground(
-                    QColor(colors.success if side_key == "long" else colors.danger)
-                )
-
-            cells = [
-                self._cell(row.get("date_text", "")),
-                symbol,
-                side_item,
-                status_item,
-                self._cell(row.get("quantity_text", "")),
-                self._cell(row.get("entry_text", "")),
-                self._cell(row.get("exit_text", "")),
-                self._cell(row.get("leverage_text", "")),
-                pnl_item,
-                percent_item,
-                self._cell(row.get("sl_text", "")),
-                self._cell(row.get("tp_text", "")),
-                self._cell(row.get("margin_text", "")),
-                self._cell(row.get("fee_text", "")),
-                self._cell(""),
-            ]
-            for column, item in enumerate(cells):
+            for column, name in enumerate(HISTORY_COLUMNS):
+                if name == "action":
+                    continue
+                item = self._history_item(name, row)
+                current = self.table.item(index, column)
+                if (
+                    in_place
+                    and current is not None
+                    and current.text() == item.text()
+                    and current.foreground().color() == item.foreground().color()
+                ):
+                    continue
                 self.table.setItem(index, column, item)
+
+            has_button = self.table.cellWidget(index, action_column) is not None
             if status_key == "open":
-                button = make_button(self.tr_.tr("trades.close_trade"))
-                button.clicked.connect(lambda _checked=False, tid=int(row["id"]): self.close_requested.emit(tid))
-                self.table.setCellWidget(index, 14, button)
+                if not (in_place and has_button):
+                    button = make_button(self.tr_.tr("trades.close_trade"))
+                    button.clicked.connect(
+                        lambda _checked=False, tid=int(row["id"]): self.close_requested.emit(tid)
+                    )
+                    self.table.setCellWidget(index, action_column, button)
+                if self.table.item(index, action_column) is None:
+                    self.table.setItem(index, action_column, self._cell(""))
             else:
-                self.table.removeCellWidget(index, 14)
+                if has_button:
+                    self.table.removeCellWidget(index, action_column)
+                self.table.setItem(index, action_column, self._cell(""))
 
         selected_index = next((i for i, row in enumerate(self._rows) if row.get("id") == selected_id), -1)
         if selected_index >= 0:
@@ -2127,6 +2146,41 @@ class TradesPage(BasePage):
             pages=pages,
             text=page_text or self.tr_.tr("trades.page_info", page=page, pages=pages),
         )
+
+    def _history_item(self, name: str, row: dict[str, Any]) -> QTableWidgetItem:
+        """یک خانهٔ جدول تاریخچه با رنگ و چینش مناسب ستون (v2.5.0)."""
+        colors = self._theme.colors if self._theme is not None else None
+        if name == "symbol":
+            item = QTableWidgetItem(str(row.get("symbol", "")))
+            item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            item.setToolTip(self.tr_.tr("trades.history_cols.symbol_tip"))
+            return item
+        if name == "side":
+            side_key = str(row.get("side", "")).lower()
+            item = self._cell(self.tr_.tr(f"trades.sides.{side_key}", side_key))
+            if colors is not None:
+                item.setForeground(QColor(colors.success if side_key == "long" else colors.danger))
+            return item
+        if name == "status":
+            status_key = str(row.get("status", "")).lower()
+            text = self.tr_.tr(f"trades.statuses.{status_key}", status_key)
+            if row.get("stage_text"):
+                text = f"{text} · {row.get('stage_text')}"
+            return self._cell(text)
+        text = str(row.get(HISTORY_TEXT_KEYS.get(name, ""), "") or "—")
+        if name == "targets" and text != "—":
+            # جداسازی چپ‌به‌راست تا «TP1 … ✓» در چیدمان فارسی وارونه نشود
+            text = f"\u2066{text}\u2069"
+        item = self._cell(text)
+        if name in ("pnl", "pnl_percent") and colors is not None:
+            value = row.get("pnl")
+            if isinstance(value, (int, float)):
+                item.setForeground(QColor(colors.success if value >= 0 else colors.danger))
+        if name == "targets" and row.get("targets_tip"):
+            item.setToolTip(str(row.get("targets_tip")))
+        if name == "price" and str(row.get("status", "")).lower() == "open":
+            item.setToolTip(self.tr_.tr("trades.history_cols.price_live_tip"))
+        return item
 
     def set_metrics(self, values: dict[str, str]) -> None:
         """به‌روزرسانی نوار معیارها با متن‌های آمادهٔ نمایش."""
@@ -2269,25 +2323,9 @@ class TradesPage(BasePage):
             combo.blockSignals(False)
 
     def _retranslate_headers(self) -> None:
-        """عنوان ستون‌های جدول تاریخچه."""
+        """عنوان ستون‌های جدول تاریخچه — از `HISTORY_COLUMNS` (v2.5.0)."""
         self.table.setHorizontalHeaderLabels(
-            [
-                self.tr_.tr("trades.date"),
-                self.tr_.tr("trades.symbol"),
-                self.tr_.tr("trades.side"),
-                self.tr_.tr("trades.status"),
-                self.tr_.tr("trades.quantity"),
-                self.tr_.tr("trades.entry"),
-                self.tr_.tr("trades.exit"),
-                self.tr_.tr("trades.leverage"),
-                self.tr_.tr("trades.pnl"),
-                self.tr_.tr("trades.pnl_percent"),
-                self.tr_.tr("trades.auto.pos_sl"),
-                self.tr_.tr("trades.auto.pos_tp"),
-                self.tr_.tr("trades.auto.pos_margin"),
-                self.tr_.tr("trades.fee"),
-                self.tr_.tr("trades.actions"),
-            ]
+            [self.tr_.tr(f"trades.history_cols.{name}") for name in HISTORY_COLUMNS]
         )
 
     def _emit_filters(self) -> None:
@@ -2377,6 +2415,7 @@ __all__ = [
     "AUTO_ENGINE_MODES",
     "AUTO_TIMEFRAMES",
     "DASHBOARD_CELLS",
+    "HISTORY_COLUMNS",
     "INFO_CARDS",
     "OPPORTUNITY_COLUMNS",
     "PAGE_SIZE",

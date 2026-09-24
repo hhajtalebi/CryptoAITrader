@@ -179,6 +179,22 @@
     "primary": "(اصلی {value})",
     "exchange": "صرافی: {value}",
     "time": "زمان: {value}",
-    "disclaimer": "⚠️ توصیهٔ مالی نیست — {app} نسخهٔ {version}"
-  }
+    "disclaimer": "⚠️ توصیهٔ مالی نیست — {app} نسخهٔ {version}",
+    "share": "اشتراک‌گذاری ▾",
+    "share_tip": "ارسال سیگنال به تلگرام، واتساپ، روبیکا، ایتا، بله، X یا ایمیل",
+    "to_telegram": "تلگرام",
+    "to_whatsapp": "واتساپ",
+    "to_x": "X (توییتر)",
+    "to_email": "ایمیل",
+    "to_rubika": "روبیکا (کپی متن + باز کردن وب)",
+    "to_eitaa": "ایتا (کپی متن + باز کردن وب)",
+    "to_bale": "بله (کپی متن + باز کردن وب)",
+    "copied_paste": "متن کپی شد — در گفت‌وگو بچسبانید ✓",
+    "subject": "سیگنال معاملاتی"
+  },
+  "trade_opened_toast": "معاملهٔ {direction} {symbol} در {entry} باز شد — SL {stop} • {targets}",
+  "trade_open_failed": "باز کردن معامله ممکن نشد: قیمت ورود یا حد ضرر معتبر نیست",
+  "trade_refused_stop": "معامله باز نشد: قیمت زنده ({price}) از حد ضرر گذشته است",
+  "trade_refused_target": "معامله باز نشد: قیمت زنده ({price}) از TP1 گذشته و فرصت ورود از دست رفته است",
+  "trade_margin_capped": "حجم به اندازهٔ موجودی آزاد کاغذی محدود شد"
 }

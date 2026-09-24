@@ -275,5 +275,38 @@
     "exchange_locked": "Stop automatic entries and close open positions before switching exchanges.",
     "pos_fee": "Fees (estimated exit)",
     "entering": "Checking a fresh price and entry guards…"
+  },
+  "history_cols": {
+    "opened": "Opened",
+    "symbol": "Symbol",
+    "side": "Side",
+    "status": "Status",
+    "entry": "Entry price",
+    "price": "Current / Exit price",
+    "quantity": "Open qty",
+    "leverage": "Leverage",
+    "margin": "Margin (USDT)",
+    "sl": "Stop-loss",
+    "targets": "Targets (TP1 · TP2 · TP3)",
+    "pnl": "Net P&L (USDT)",
+    "pnl_percent": "Return on margin",
+    "fee": "Fees",
+    "closed": "Closed at / reason",
+    "action": "Actions",
+    "symbol_tip": "Click for full trade details",
+    "price_live_tip": "Open trade: live executable price (Bid/Ask) incl. slippage — refreshed every second"
+  },
+  "staged": {
+    "tp_hit": "TP{target} hit on {symbol} at {price} — one third closed",
+    "tp_hit_breakeven": "TP{target} hit on {symbol} at {price} — one third closed, stop moved to entry",
+    "stage": "TP{hit}/{total}",
+    "breakeven": "SL=entry"
+  },
+  "closed_breakeven": "The rest of the trade closed at entry (break-even)",
+  "reasons": {
+    "take_profit": "Final target",
+    "stop_loss": "Stop-loss",
+    "breakeven": "Break-even",
+    "manual": "Manual"
   }
 }

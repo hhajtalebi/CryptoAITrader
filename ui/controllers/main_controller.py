@@ -110,7 +110,7 @@ from signals.scanner import BACKGROUND_CPU_DUTY  # noqa: E402
 OUTCOME_TICK_MS = 30_000
 # فاصلهٔ پایش معاملات باز. قیمت از کش خوانده می‌شود؛ REST فقط وقتی
 # کش کهنه باشد. دو ثانیه برای بستن سریع اسکالپ کافی است.
-TRADE_MONITOR_TICK_MS = 2_000
+TRADE_MONITOR_TICK_MS = 1_000
 
 #: فاصلهٔ تازه‌سازی داشبورد ترمینال معاملهٔ خودکار (v2.0). خروج
 #: موقعیت‌ها تیک‌محور است؛ این تایمر فقط «نمایش» را تازه می‌کند.
@@ -440,6 +440,8 @@ class MainController(QObject):
         self.markets.alert_requested.connect(self.create_price_alert)
         self.wallet.sync_requested.connect(self.sync_wallet)
         self.wallet.range_changed.connect(lambda _r: self.refresh_wallet())
+        if hasattr(self.wallet, "paper_sync_requested"):
+            self.wallet.paper_sync_requested.connect(self.sync_paper_balance_with_wallet)
 
         # ---- حساب کاربری و حساب‌های صرافی ----
         self.window.login_requested.connect(self.show_auth_dialog)
@@ -2444,7 +2446,7 @@ class MainController(QObject):
         if not records:
             return
 
-        from trading.trade_monitor import evaluate, position_from_record
+        from trading.trade_monitor import evaluate_staged, position_from_record
 
         engine = getattr(self, "_auto_trader_engine", None)
         managed_ids = {t.trade_id for t in engine.open_trades} if engine is not None else set()
@@ -2478,16 +2480,16 @@ class MainController(QObject):
             if not prices:
                 return
             self._live_prices.update({k.upper(): v for k, v in prices.items()})
-            updates, closures = [], []
+            updates, steps = [], []
             for position in positions:
                 if ticks.is_stale(position.symbol):
                     continue
                 quote = ticks.get(position.symbol)
                 price = quote.exit_price(position.side)
                 price *= 1 - config.slippage_percent / 100 if position.is_long else 1 + config.slippage_percent / 100
-                marks, exits = evaluate([position], {position.symbol: price})
+                marks, found = evaluate_staged([position], {position.symbol: price})
                 updates.extend(marks)
-                closures.extend(exits)
+                steps.extend(found)
 
             for item in updates:
                 try:
@@ -2500,22 +2502,19 @@ class MainController(QObject):
                 except Exception:  # noqa: BLE001
                     logger.debug("Live PnL update failed", exc_info=True)
 
-            for trade_id, price, reason in closures:
-                try:
-                    self.app.trade_repository.close_trade(
-                        int(trade_id),
-                        exit_price=float(price),
-                        fee=self._exit_fee(next((r for r in records if r.get("id") == trade_id), None), price=float(price)),
-                        note=reason,
-                    )
-                    self._toast(
-                        self.tr_.tr(f"trades.closed_{reason}"), level="success"
-                    )
-                except Exception:  # noqa: BLE001
-                    logger.warning("Auto-close failed for trade %s", trade_id)
+            for trade_id, price, step in steps:
+                self._apply_trade_step(
+                    int(trade_id),
+                    float(price),
+                    step,
+                    next((r for r in records if r.get("id") == trade_id), None),
+                )
 
-            if updates or closures:
+            if steps:
                 self.refresh_trades()
+                self._refresh_paper_equity_views()
+            elif updates:
+                self._refresh_open_trade_rows()
 
         def finished() -> None:
             self._trade_monitor_busy = False
@@ -2527,6 +2526,56 @@ class MainController(QObject):
             on_error=lambda *_: None,
             on_finished=finished,
         )
+
+    def _apply_trade_step(
+        self, trade_id: int, price: float, step: dict[str, Any], record: dict[str, Any] | None
+    ) -> None:
+        """
+        اجرای یک گام مدیریت معامله (v2.5.0 — اهداف پلکانی).
+
+        • partial → بستن یک‌سوم در TP1/TP2 (و انتقال حد ضرر به ورود پس از TP1)
+        • final   → بستن باقی‌مانده در آخرین هدف
+        • stop    → بستن باقی‌مانده در حد ضرر (یا نقطهٔ سربه‌سر پس از TP1)
+        """
+        action = str(step.get("action") or "")
+        symbol = str((record or {}).get("symbol") or "")
+        try:
+            if action == "partial":
+                quantity = float(step.get("quantity") or 0.0)
+                partial_record = dict(record or {})
+                partial_record["quantity"] = quantity
+                result = self.app.trade_repository.partial_close(
+                    trade_id,
+                    quantity=quantity,
+                    exit_price=price,
+                    fee=self._exit_fee(partial_record, price=price),
+                    target_index=int(step.get("index") or 0),
+                    new_stop_loss=step.get("new_stop"),
+                )
+                if result is not None:
+                    index = int(step.get("index") or 0) + 1
+                    key = "trades.staged.tp_hit_breakeven" if step.get("new_stop") else "trades.staged.tp_hit"
+                    self._toast(
+                        self.tr_.tr(key, target=index, symbol=symbol,
+                                    price=self.tr_.format_number(price, 6)),
+                        level="success",
+                    )
+                return
+            reason = str(step.get("reason") or ("take_profit" if action == "final" else "stop_loss"))
+            if action == "final" and step.get("index") is not None:
+                reason = "take_profit"
+            self.app.trade_repository.close_trade(
+                trade_id,
+                exit_price=price,
+                fee=self._exit_fee(record, price=price),
+                note=reason,
+            )
+            self._toast(
+                self.tr_.tr(f"trades.closed_{reason}"),
+                level="success" if reason in ("take_profit", "breakeven") else "warning",
+            )
+        except Exception:  # noqa: BLE001 - یک معامله نباید پایش بقیه را متوقف کند
+            logger.warning("Trade step %s failed for trade %s", action, trade_id, exc_info=True)
 
     def start_outcome_tracker(self) -> None:
         """
@@ -3017,7 +3066,9 @@ class MainController(QObject):
             payload, self.tr_, self.window, theme=self.themes.tokens
         )
         self._prime_calculator(dialog)
-        dialog.trade_requested.connect(self._on_trade_requested)
+        dialog.trade_requested.connect(
+            lambda payload, d=dialog: self._on_trade_requested(payload, dialog=d)
+        )
         # از همین پنجره هم باید بشود تحلیل هوشمند خواست؛ کاربر خواسته
         # بود بعد از پویش، هر نماد را جداگانه به هوش مصنوعی بسپارد.
         if hasattr(dialog, "ai_analysis_requested"):
@@ -4089,25 +4140,177 @@ class MainController(QObject):
             payload, self.tr_, self.window, theme=self.themes.tokens
         )
         self._prime_calculator(dialog)
-        dialog.trade_requested.connect(self._on_trade_requested)
+        dialog.trade_requested.connect(
+            lambda payload, d=dialog: self._on_trade_requested(payload, dialog=d)
+        )
         dialog.exec()
 
     def _prime_calculator(self, dialog: Any) -> None:
         """
         دادن سرمایه و درصد ریسک واقعی کاربر به ماشین‌حساب پنجرهٔ سیگنال.
 
-        ماشین‌حساب پیش‌فرض ۱۰۰۰ دارد که فقط یک عدد نمونه است؛ با تنظیمات
-        واقعی کاربر، حجم پیشنهادی هم واقعی می‌شود.
+        v2.5.0: سرمایه = موجودی کاغذی (برابر کیف پول واقعی) در حالت
+        کاغذی، یا کل ارزش کیف پول در حالت واقعی؛ فقط اگر هیچ‌کدام نبود،
+        عدد تنظیمات ریسک. منبع عدد زیر ماشین‌حساب نوشته می‌شود.
         """
         setter = getattr(dialog, "set_account_balance", None)
         if not callable(setter):
             return
         try:
-            balance = float(self.app.settings.get("risk.account_balance", 0) or 0)
             risk = float(self.app.settings.get("risk.risk_percent", 0) or 0)
         except (TypeError, ValueError):
-            return
-        setter(balance, risk)
+            risk = 0.0
+        balance, source_text = self._trading_capital()
+        try:
+            setter(balance, risk, source_text)
+        except TypeError:  # پنجره‌های قدیمی‌تر پارامتر سوم ندارند
+            setter(balance, risk)
+
+    # ------------------------------------------------------------------
+    # موجودی کاغذی (v2.5.0)
+    # ------------------------------------------------------------------
+    def _is_paper_mode(self) -> bool:
+        """آیا معامله‌ها کاغذی‌اند؟ (حالت واقعی فقط با تأیید صریح کاربر)"""
+        return str(self.app.settings.get("scalp.mode", "paper") or "paper").strip().lower() != "live"
+
+    def _wallet_total_usdt(self) -> float:
+        """کل ارزش تتری حساب صرافی پیش‌فرض (۰ اگر حسابی نیست)."""
+        try:
+            user_id = self.app.auth.user_id
+            account = (
+                self.app.exchange_accounts.default_account(user_id) if user_id is not None else None
+            )
+        except Exception:  # noqa: BLE001
+            return 0.0
+        if not account:
+            return 0.0
+        try:
+            return float(account.get("total_value_usdt") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _paper_account(self) -> Any:
+        """
+        خلاصهٔ حساب کاغذی: شروع + سود تحقق‌یافته + شناور − مارجین.
+
+        اولین بار که کیف پول واقعی ارزش دارد، عدد شروع برابر آن ثبت
+        می‌شود (خواستهٔ کاربر: موجودی کاغذی = موجودی واقعی). بدون حساب
+        متصل، `risk.account_balance` مبنا است و ذخیره نمی‌شود تا با اتصال
+        حساب، خودکار به کیف پول واقعی برسد.
+        """
+        from trading import paper_account as pa
+
+        settings = self.app.settings
+        try:
+            start = float(settings.get(pa.KEY_START, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            start = 0.0
+        source = str(settings.get(pa.KEY_SOURCE, "") or "")
+        start_at = str(settings.get(pa.KEY_START_AT, "") or "")
+        if start <= 0:
+            wallet = self._wallet_total_usdt()
+            if wallet > 0:
+                start, source, start_at = wallet, pa.SOURCE_WALLET, pa.utc_now_text()
+                settings.set(pa.KEY_START, start, notify=False)
+                settings.set(pa.KEY_SOURCE, source, notify=False)
+                settings.set(pa.KEY_START_AT, start_at, notify=False)
+            else:
+                try:
+                    start = float(settings.get("risk.account_balance", 1000.0) or 1000.0)
+                except (TypeError, ValueError):
+                    start = 1000.0
+                source, start_at = pa.SOURCE_SETTINGS, ""
+        user_id = self.app.auth.user_id
+        repository = self.app.trade_repository
+        try:
+            realized = repository.realized_pnl_since(user_id, pa.parse_start_at(start_at))
+        except Exception:  # noqa: BLE001
+            realized = 0.0
+        try:
+            open_rows = [r for r in repository.open_trades(user_id) if r.get("mode") != "live"]
+        except Exception:  # noqa: BLE001
+            open_rows = []
+        return pa.build_account(
+            start=start, realized=realized, open_trades=open_rows, source=source, start_at=start_at
+        )
+
+    def sync_paper_balance_with_wallet(self) -> bool:
+        """
+        «همگام‌سازی موجودی کاغذی با کیف پول»: شروع = کل ارزش کیف پول واقعی.
+
+        سود/زیان کاغذی قبلی از این لحظه دیگر در موجودی شمرده نمی‌شود
+        (تاریخچه دست‌نخورده می‌ماند).
+        """
+        from trading import paper_account as pa
+
+        wallet = self._wallet_total_usdt()
+        if wallet <= 0:
+            self._toast(self.tr_.tr("wallet.paper.sync_no_wallet"), level="warning")
+            return False
+        settings = self.app.settings
+        settings.set(pa.KEY_START, wallet, notify=False)
+        settings.set(pa.KEY_SOURCE, pa.SOURCE_WALLET, notify=False)
+        settings.set(pa.KEY_START_AT, pa.utc_now_text(), notify=False)
+        self._toast(self.tr_.tr("wallet.paper.synced", amount=self._money(wallet)), level="success")
+        self.refresh_wallet()
+        return True
+
+    def _trading_capital(self) -> tuple[float, str]:
+        """
+        سرمایهٔ مبنای اندازهٔ پوزیشن + متن منبع آن.
+
+        کاغذی → موجودی دفتری حساب کاغذی؛ واقعی → کل ارزش کیف پول.
+        """
+        if self._is_paper_mode():
+            account = self._paper_account()
+            key = "sizing.capital_paper" if account.source == "wallet" else "sizing.capital_paper_settings"
+            return account.balance, self.tr_.tr(key, amount=self._money(account.balance))
+        wallet = self._wallet_total_usdt()
+        if wallet > 0:
+            return wallet, self.tr_.tr("sizing.capital_live", amount=self._money(wallet))
+        try:
+            fallback = float(self.app.settings.get("risk.account_balance", 0) or 0)
+        except (TypeError, ValueError):
+            fallback = 0.0
+        return fallback, ""
+
+    def _refresh_open_trade_rows(self) -> None:
+        """تازه‌سازی سبک جدول معاملات فقط وقتی صفحه دیده می‌شود (هر تیک)."""
+        try:
+            visible = self.window.stack.currentWidget() is self.trades
+        except Exception:  # noqa: BLE001
+            visible = False
+        if visible:
+            self.refresh_trades()
+
+    def _refresh_paper_equity_views(self) -> None:
+        """پس از بستن (جزئی/کامل) معامله، موجودی کاغذی کیف پول تازه شود."""
+        try:
+            if self.window.stack.currentWidget() is self.wallet:
+                self.refresh_wallet()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _live_fill_price(self, symbol: str, side: str) -> float:
+        """
+        قیمت قابل‌اجرای زنده برای ورود (Ask برای خرید، Bid برای فروش).
+
+        فقط تیک تازه پذیرفته می‌شود؛ قیمت کهنه صفر برمی‌گرداند تا ورود با
+        عدد ماشین‌حساب انجام شود نه با قیمتی که دیگر وجود ندارد.
+        """
+        ticks = getattr(self, "_tick_engine", None)
+        if ticks is None or not symbol:
+            return 0.0
+        try:
+            if ticks.is_stale(symbol):
+                return 0.0
+            quote = ticks.get(symbol)
+            entry_price = getattr(quote, "entry_price", None)
+            if callable(entry_price):
+                return float(entry_price(side) or 0.0)
+            return float(getattr(quote, "last", 0.0) or 0.0)
+        except Exception:  # noqa: BLE001
+            return 0.0
 
     def _load_signal_detail(self, record_id: Any) -> dict[str, Any]:
         """خواندن جزئیات کامل یک سیگنال از پایگاه داده."""
@@ -4194,67 +4397,123 @@ class MainController(QObject):
             "review_lesson": review.lesson or "",
         }
 
-    def _on_trade_requested(self, signal: dict[str, Any]) -> None:
+    def _on_trade_requested(self, signal: dict[str, Any], dialog: Any = None) -> None:
         """
-        اقدام روی یک سیگنال.
+        اقدام روی یک سیگنال — نسخهٔ ۲.۵.۰.
 
-        معامله به‌صورت تمرینی ثبت می‌شود؛ سفارش واقعی روی صرافی ارسال
-        نمی‌شود. این موضوع صریحاً به کاربر گفته می‌شود تا تصور نکند پول
-        واقعی جابه‌جا شده است.
+        معامله به‌صورت تمرینی (کاغذی) ثبت می‌شود؛ هیچ سفارش واقعی ارسال
+        نمی‌شود و نگهبان سفارش زنده دور زده نمی‌شود.
+
+        جریان:
+            ۱. اعداد از ماشین‌حساب پنجره (`signal["plan"]`) — همان ورود،
+               حد ضرر، TP1..TP3، اهرم، سرمایه و درصد ریسکی که کاربر دید.
+            ۲. قیمت ورود = قیمت قابل‌اجرای زندهٔ تیک (Ask/Bid) اگر تازه
+               باشد، وگرنه ورود ماشین‌حساب. اگر قیمت زنده از حد ضرر یا
+               TP1 گذشته باشد، معامله باز نمی‌شود.
+            ۳. حجم از ریسک مجاز روی فاصلهٔ واقعی ورود تا حد ضرر؛ مارجین
+               بیش از موجودی آزاد کاغذی مجاز نیست.
+            ۴. ثبت با اهداف پلکانی (⅓ در TP1 + حد ضرر به ورود، ⅓ در TP2،
+               باقی در TP3)، بستن پنجره، رفتن به جدول معاملات باز و اعلان.
         """
+        from signals.paper_trader import PaperTrader
+        from trading.staged_targets import clean_targets, stop_crossed, target_crossed, targets_text
+        from ui.widgets.position_calculator import signal_entry
+
         direction = str(signal.get("direction", "WAIT")).upper()
         if direction not in {"LONG", "SHORT"}:
             self.status(self.tr_.tr("signals.no_action_on_wait"))
             return
+        side = "long" if direction == "LONG" else "short"
+        symbol = str(signal.get("symbol") or "").upper()
+        plan = dict(signal.get("plan") or {})
 
-        trader = self._paper_trader()
-        entry = trader._pick_entry(signal)  # noqa: SLF001 - محاسبه یکسان برای پیش‌نمایش
-        confirm = QMessageBox.question(
-            self.window,
-            self.tr_.tr("signals.paper_trade_title"),
-            self.tr_.tr(
-                "signals.confirm_trade",
-                direction=self.tr_.tr(f"signals.{direction.lower()}", direction),
-                symbol=signal.get("symbol", ""),
-                entry=self.tr_.format_number(entry or 0.0, 4),
-                stop=self.tr_.format_number(signal.get("stop_loss") or 0.0, 4),
-            )
-            + "\n\n"
-            + self.tr_.tr("signals.paper_trade_note"),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if confirm != QMessageBox.StandardButton.Yes:
+        planned_entry = float(plan.get("entry") or 0.0) or signal_entry(signal)
+        stop = float(plan.get("stop_loss") or signal.get("stop_loss") or 0.0)
+        raw_targets = plan.get("targets") or signal.get("take_profits") or signal.get("take_profit") or []
+        fill = self._live_fill_price(symbol, side) or planned_entry
+
+        def refuse(key: str, **values: Any) -> None:
+            text = self.tr_.tr(key, **values)
+            self.status(text)
+            self._toast(text, level="warning")
+
+        if fill <= 0 or stop <= 0:
+            refuse("signals.trade_open_failed")
+            return
+        if stop_crossed(fill, stop, side) or fill == stop:
+            refuse("signals.trade_refused_stop", price=self.tr_.format_number(fill, 6))
+            return
+        targets = clean_targets(raw_targets, entry=fill, side=side)
+        planned_targets = clean_targets(raw_targets, entry=planned_entry, side=side)
+        if planned_targets and target_crossed(fill, planned_targets[0], side):
+            refuse("signals.trade_refused_target", price=self.tr_.format_number(fill, 6))
             return
 
-        risk = self.app.risk_parameters()
-        position = trader.open_from_signal(
-            signal,
-            balance=getattr(risk, "account_balance", 0.0),
-            risk_percent=getattr(risk, "risk_percent", 1.0),
+        capital, _source = self._trading_capital()
+        capital = float(plan.get("capital") or 0.0) or capital
+        risk_percent = float(plan.get("risk_percent") or 0.0) or float(
+            self.app.settings.get("risk.risk_percent", 1) or 1
         )
+        leverage = max(1, int(float(plan.get("leverage") or signal.get("leverage") or 1)))
+
+        # PaperTrader دفتر قدیمی JSON را هم نگه می‌دارد؛ ورود همان قیمت اجرا است
+        trader = self._paper_trader() if hasattr(self, "_paper_trader") else PaperTrader(self.app.settings)
+        order = dict(signal)
+        order.update(entry=fill, entry_min=fill, entry_max=fill, stop_loss=stop,
+                     take_profits=targets, leverage=leverage)
+        order.pop("plan", None)
+        position = trader.open_from_signal(order, balance=capital, risk_percent=risk_percent)
         if position is None:
-            self.status(self.tr_.tr("signals.paper_trade_failed"))
+            refuse("signals.paper_trade_failed")
             return
+
+        quantity = float(position.size or 0.0)
+        # سقف مارجین: در حالت کاغذی بیش از موجودی آزاد نمی‌شود
+        if self._is_paper_mode() and quantity > 0:
+            available = self._paper_account().available
+            margin = quantity * fill / leverage
+            if available > 0 and margin > available:
+                quantity = available * leverage / fill
+                self._toast(self.tr_.tr("signals.trade_margin_capped"), level="info")
 
         # `PaperTrader` معامله را در یک رشتهٔ JSON داخل تنظیمات نگه
-        # می‌دارد، ولی صفحهٔ «معاملات» از `trade_repository` (پایگاه داده)
-        # می‌خواند. تا پیش از این، دکمهٔ معامله فقط در آن حافظهٔ جداگانه
-        # می‌نوشت، پس کاربر هیچ ردی از معامله‌اش در تاریخچه نمی‌دید —
-        # همان گزارشِ «دکمهٔ معامله هیچ چیزی باز نمی‌کند». حالا در هر دو
-        # جا ثبت می‌شود تا تاریخچه واقعاً معامله را نشان دهد.
-        record = dict(signal)
+        # می‌دارد، ولی صفحهٔ «معاملات» از `trade_repository` می‌خواند؛
+        # پس در هر دو جا ثبت می‌شود تا تاریخچه واقعاً معامله را نشان دهد.
+        record = dict(order)
         record["entry_price"] = position.entry
-        self.record_paper_trade(record)
+        record["quantity"] = quantity
+        record["take_profits"] = targets
+        trade = self.record_paper_trade(record)
+        if not trade:
+            return
+
+        # جریان وب‌سوکت نماد تازه را فوراً دنبال کند (پایش بی‌تأخیر)
+        try:
+            self._update_streamed_symbols()
+        except Exception:  # noqa: BLE001
+            logger.debug("Stream update after trade failed", exc_info=True)
+
+        if dialog is not None:
+            closer = getattr(dialog, "trade_opened", None) or getattr(dialog, "accept", None)
+            if callable(closer):
+                closer()
+        self._go_to("nav.trades")
+        try:
+            self.trades.show_open_history()
+        except Exception:  # noqa: BLE001
+            logger.debug("Showing open trades failed", exc_info=True)
+        self.refresh_trades()
 
         message = self.tr_.tr(
-            "signals.paper_trade_opened",
+            "signals.trade_opened_toast",
             direction=self.tr_.tr(f"signals.{position.direction.lower()}", position.direction),
             symbol=position.symbol,
-            entry=self.tr_.format_number(position.entry, 4),
+            entry=self.tr_.format_number(position.entry, 6),
+            stop=self.tr_.format_number(stop, 6),
+            targets=targets_text(targets, lambda v: self.tr_.format_number(v, 6)) or "—",
         )
         self.status(message)
-        QMessageBox.information(self.window, self.tr_.tr("signals.paper_trade_title"), message)
+        self._toast(message, level="success")
 
     def _paper_trader(self) -> Any:
         """ساخت تنبل دفتر معاملهٔ تمرینی."""
@@ -5564,18 +5823,26 @@ class MainController(QObject):
             logger.exception("Loading trades failed")
             self._on_error(self.tr_.tr("common.state.error"), exc)
 
-    def record_paper_trade(self, signal: dict[str, Any]) -> None:
+    def record_paper_trade(self, signal: dict[str, Any]) -> dict[str, Any] | None:
         """
         ثبت یک معاملهٔ کاغذی از روی سیگنال.
 
         کاربر خواسته است فعلاً هیچ سفارش واقعی ارسال نشود؛ مقدار `mode`
         روی «paper» می‌ماند تا وقتی سفارش‌گذاری واقعی فعال شود.
+
+        v2.5.0: اهداف TP1..TP3 در `extra.targets` برای مدیریت پلکانی ثبت
+        می‌شوند و `take_profit` = آخرین هدف است (پیش‌تر `take_profit`
+        از کلیدی خوانده می‌شد که سیگنال‌ها نداشتند و همیشه خالی می‌ماند).
+        حجم اگر از پیش حساب شده باشد (`quantity`) همان به کار می‌رود.
+        بازگشتی: رکورد معامله یا `None`.
         """
+        from trading.staged_targets import clean_targets
+
         try:
             entry = float(signal.get("entry_price") or signal.get("entry_min") or 0.0)
             if entry <= 0:
                 self.status(self.tr_.tr("common.state.no_data"))
-                return
+                return None
             direction = str(signal.get("direction", "")).upper()
             if direction not in ("LONG", "SHORT"):
                 # آرگومان دوم `tr` مقدار پیش‌فرض است نه متغیر؛ نام جهت باید
@@ -5586,32 +5853,52 @@ class MainController(QObject):
                         direction=self.tr_.tr(f"signals.{direction.lower()}", direction),
                     )
                 )
-                return
+                return None
+            side = "long" if direction == "LONG" else "short"
 
-            balance = float(self.app.settings.get("risk.account_balance", 1000) or 1000)
-            risk_percent = float(self.app.settings.get("risk.risk_percent", 1) or 1)
             stop = float(signal.get("stop_loss") or 0.0)
-            distance = abs(entry - stop) or entry * 0.01
-            quantity = (balance * risk_percent / 100.0) / distance
+            quantity = float(signal.get("quantity") or 0.0)
+            if quantity <= 0:
+                balance, _source = self._trading_capital()
+                balance = balance or float(self.app.settings.get("risk.account_balance", 1000) or 1000)
+                risk_percent = float(self.app.settings.get("risk.risk_percent", 1) or 1)
+                distance = abs(entry - stop) or entry * 0.01
+                quantity = (balance * risk_percent / 100.0) / distance
+
+            raw_targets = signal.get("take_profits") or signal.get("take_profit") or []
+            targets = clean_targets(raw_targets, entry=entry, side=side)
+            fee_rate = float(self.app.settings.get("scalp.taker_fee_rate", 0.0006) or 0.0)
+            extra = {
+                "targets": targets,
+                "targets_hit": 0,
+                "original_quantity": quantity,
+                "realized_gross": 0.0,
+                "fee_rate": fee_rate,
+                "source": "signal",
+                "staged": len(targets) > 1,
+            }
 
             trade = self.app.trade_repository.open_trade(
                 symbol=str(signal.get("symbol", "")),
-                side="long" if direction == "LONG" else "short",
+                side=side,
                 quantity=quantity,
                 entry_price=entry,
                 user_id=self.app.auth.user_id,
                 signal_id=signal.get("id"),
                 stop_loss=stop or None,
-                take_profit=float(signal.get("take_profit") or 0.0) or None,
+                take_profit=(targets[-1] if targets else None),
                 leverage=float(signal.get("leverage") or 1.0),
+                fee=quantity * entry * fee_rate,
                 note=str(signal.get("reason", ""))[:200],
+                extra=extra,
             )
             self.status(self.tr_.tr("trades.opened"))
-            self._toast(self.tr_.tr("trades.opened"), level="success")
             self.refresh_trades()
             logger.info("Paper trade recorded from signal: id=%s", trade.get("id"))
+            return trade
         except Exception as exc:  # noqa: BLE001
             self._on_error(self.tr_.tr("common.state.error"), exc)
+            return None
 
     # ------------------------------------------------------------------
     # معاملهٔ خودکار
@@ -6065,6 +6352,7 @@ class MainController(QObject):
             if account is None:
                 return
 
+            self._fill_paper_panel()
             balances = account.get("balances") or {}
             total = float(account.get("total_value_usdt") or 0.0)
             # تفکیک اسپات/فیوچرز که هنگام همگام‌سازی ذخیره شده است
@@ -6076,6 +6364,12 @@ class MainController(QObject):
 
             statistics = self.app.trade_repository.statistics(user_id=user_id)
             available = float(balances.get("USDT", 0.0) or 0.0)
+            # v2.5.0: «آزاد» دقیق = USDT آزاد اسپات + مارجین آزاد فیوچرز
+            wallet_details = dict((account.get("extra_config") or {}).get("wallet_details") or {})
+            spot_usdt = (wallet_details.get("spot") or {}).get("USDT") or {}
+            futures_usdt = (wallet_details.get("futures") or {}).get("USDT") or {}
+            if spot_usdt or futures_usdt:
+                available = float(spot_usdt.get("free") or 0.0) + float(futures_usdt.get("available") or 0.0)
             self.wallet.set_summary(
                 total=self._money(total),
                 available=self._money(available),
@@ -6096,9 +6390,175 @@ class MainController(QObject):
                 if account.get("last_sync_at")
                 else ""
             )
+            details = dict((account.get("extra_config") or {}).get("wallet_details") or {})
+            self._fill_wallet_tabs(by_wallet, details, balances)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Wallet refresh failed")
             self._on_error(self.tr_.tr("common.state.error"), exc)
+
+    def _asset_usdt_price(self, code: str, prices: dict[str, Any] | None = None) -> float:
+        """قیمت تتری دارایی: جدول زنده → قیمت‌های همگام‌سازی → ۰."""
+        code = str(code or "").upper()
+        if code in ("USDT", "USD"):
+            return 1.0
+        live = self._last_price(f"{code}/USDT") or self._asset_prices.get(code, 0.0)
+        if live:
+            return float(live)
+        try:
+            return float((prices or {}).get(code) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _fill_paper_panel(self) -> None:
+        """پنل حساب کاغذی کیف پول (v2.5.0)."""
+        if not hasattr(self.wallet, "set_paper"):
+            return
+        try:
+            account = self._paper_account()
+        except Exception:  # noqa: BLE001
+            logger.debug("Paper account unavailable", exc_info=True)
+            return
+        money = self._money
+        colors = {}
+        tokens = getattr(getattr(self, "themes", None), "tokens", None)
+        palette = getattr(tokens, "colors", None)
+        for key, value in (("realized", account.realized), ("unrealized", account.unrealized)):
+            if palette is not None and value:
+                colors[key] = palette.success if value > 0 else palette.danger
+        if account.source == "wallet":
+            from trading.paper_account import parse_start_at
+
+            moment = parse_start_at(account.start_at)
+            source = self.tr_.tr(
+                "wallet.paper.source_wallet",
+                amount=money(account.start),
+                time=self._localized_datetime(moment) if moment else "—",
+            )
+        else:
+            source = self.tr_.tr("wallet.paper.source_settings", amount=money(account.start))
+        signed = lambda v: ("+" if v > 0 else "") + money(v)  # noqa: E731
+        self.wallet.set_paper(
+            {
+                "balance": money(account.balance),
+                "equity": money(account.equity),
+                "available": money(account.available),
+                "realized": signed(account.realized),
+                "unrealized": signed(account.unrealized),
+                "used_margin": money(account.used_margin),
+                "start": money(account.start),
+            },
+            source_text=source,
+            colors=colors,
+            card_value=money(account.equity),
+            card_caption=self.tr_.tr("wallet.paper.m_available") + ": " + money(account.available),
+        )
+
+    def _fill_wallet_tabs(
+        self, by_wallet: dict[str, Any], details: dict[str, Any], balances: dict[str, Any]
+    ) -> None:
+        """
+        زبانه‌های اسپات و فیوچرز با اعداد دقیق همگام‌سازی (v2.5.0).
+
+        جزئیات آزاد/قفل و مارجین/سود شناور از `wallet_details` می‌آید؛ اگر
+        همگام‌سازی قدیمی‌تر باشد و جزئیات نداشته باشد، کل موجودی نمایش
+        داده می‌شود و خانه‌های نامعلوم «—» می‌مانند (عدد ساختگی نه).
+        """
+        if not hasattr(self.wallet, "set_spot"):
+            return
+        fmt = self.tr_.format_number
+        money = self._money
+        prices = dict(details.get("prices") or {})
+        tokens = getattr(getattr(self, "themes", None), "tokens", None)
+        palette = getattr(tokens, "colors", None)
+
+        # --- اسپات ---
+        spot = dict((by_wallet or {}).get("spot") or {})
+        spot_details = dict(details.get("spot") or {})
+        rows: list[dict[str, Any]] = []
+        spot_total = 0.0
+        locked_value = 0.0
+        for asset, amount in spot.items():
+            code = str(asset).upper()
+            info = spot_details.get(code) or {}
+            total = float(info.get("total") or amount or 0.0)
+            if total <= 0:
+                continue
+            price = self._asset_usdt_price(code, prices)
+            value = total * price if price else 0.0
+            spot_total += value
+            locked = float(info.get("locked") or 0.0)
+            locked_value += locked * price if price else 0.0
+            rows.append({"asset": code, "total": total, "value": value, "price": price,
+                         "free": info.get("free"), "locked": info.get("locked")})
+        rows.sort(key=lambda r: -r["value"])
+        spot_rows = []
+        for r in rows:
+            change = self._change_percent(f"{r['asset']}/USDT") if r["price"] and r["asset"] not in ("USDT", "USD") else None
+            spot_rows.append({
+                "asset": r["asset"],
+                "free_text": fmt(r["free"], 8) if r["free"] is not None else "—",
+                "locked_text": fmt(r["locked"], 8) if r["locked"] is not None else "—",
+                "total_text": fmt(r["total"], 8),
+                "price_text": fmt(r["price"], 6) if r["price"] else "—",
+                "value_text": money(r["value"]) if r["price"] else "—",
+                "share_text": (fmt(r["value"] / spot_total * 100, 1) + "%") if spot_total and r["price"] else "—",
+                "change": change,
+                "change_text": self._change_text(f"{r['asset']}/USDT") if change is not None else "—",
+            })
+        free_usdt = spot_details.get("USDT", {}).get("free") if spot_details.get("USDT") else spot.get("USDT")
+        self.wallet.set_spot(spot_rows, {
+            "value": money(spot_total),
+            "available_usdt": money(float(free_usdt or 0.0)),
+            "locked_value": money(locked_value) if spot_details else "—",
+            "assets": fmt(len(spot_rows), 0),
+        })
+
+        # --- فیوچرز ---
+        futures = dict((by_wallet or {}).get("futures") or {})
+        futures_details = dict(details.get("futures") or {})
+        f_rows = []
+        sums = {"equity": 0.0, "wallet": 0.0, "available": 0.0, "margin": 0.0, "frozen": 0.0, "unrealized": 0.0}
+        for asset in sorted(set(futures) | set(futures_details)):
+            code = str(asset).upper()
+            info = futures_details.get(code) or {}
+            equity = float(info.get("total") or futures.get(asset) or 0.0)
+            if equity <= 0 and not info:
+                continue
+            price = self._asset_usdt_price(code, prices)
+            value = equity * price if price else 0.0
+            row = {"asset": code, "unrealized": float(info.get("unrealized") or 0.0)}
+            for key, source in (("equity", equity), ("wallet", info.get("wallet")),
+                                ("available", info.get("available")), ("margin", info.get("margin")),
+                                ("frozen", info.get("frozen")), ("unrealized", info.get("unrealized"))):
+                if source is None:
+                    row[f"{key}_text"] = "—"
+                    continue
+                number = float(source or 0.0)
+                row[f"{key}_text"] = fmt(number, 8 if code not in ("USDT", "USDC") else 4)
+                if price:
+                    sums[key] += number * price
+            row["value_text"] = money(value) if price else "—"
+            f_rows.append(row)
+        has_details = bool(futures_details)
+        used = sums["margin"] + sums["frozen"]
+        colors = {}
+        if palette is not None and sums["unrealized"]:
+            colors["unrealized"] = palette.success if sums["unrealized"] > 0 else palette.danger
+        dash = "—"
+        summary = {
+            "equity": money(sums["equity"]) if f_rows else money(0.0),
+            "wallet": money(sums["wallet"]) if has_details else dash,
+            "available": money(sums["available"]) if has_details else dash,
+            "used_margin": money(used) if has_details else dash,
+            "unrealized": (("+" if sums["unrealized"] > 0 else "") + money(sums["unrealized"])) if has_details else dash,
+            "margin_ratio": (fmt(used / sums["equity"] * 100, 2) + "%") if has_details and sums["equity"] else dash,
+        }
+        note = ""
+        if not f_rows:
+            note = self.tr_.tr("wallet.futures_tab.empty")
+        elif not has_details:
+            note = self.tr_.tr("wallet.futures_tab.no_details")
+        self.wallet.set_futures(f_rows, summary, note=note, colors=colors)
 
     # ------------------------------------------------------------------
     # نوار بالا
@@ -6224,9 +6684,13 @@ class MainController(QObject):
             estimated_fee += self._exit_fee(item, price=price)
             quantity = float(item.get("quantity") or 0)
             entry = float(item.get("entry_price") or 0)
-            margin = quantity * entry / float(item.get("leverage") or 1)
+            extra_info = item.get("extra") or {}
+            # v2.5.0: پس از بستن جزئی، سود تحقق‌یافته و مارجین اولیه منظور می‌شود
+            base_quantity = max(quantity, float(extra_info.get("original_quantity") or 0.0))
+            realized = float(extra_info.get("realized_gross") or 0.0)
+            margin = base_quantity * entry / float(item.get("leverage") or 1)
             item["last_price"] = price
-            item["pnl"] = (price - entry) * quantity * (1 if side == "long" else -1) - estimated_fee
+            item["pnl"] = (price - entry) * quantity * (1 if side == "long" else -1) + realized - estimated_fee
             item["pnl_percent"] = item["pnl"] / margin * 100 if margin else 0
         row = dict(item)
         row["data_age_text"] = (
@@ -6244,6 +6708,7 @@ class MainController(QObject):
         row["notional_text"] = fmt(entry * quantity, 2)
         row["tp_text"] = fmt(item.get("take_profit") or 0, 6)
         row["sl_text"] = fmt(item.get("stop_loss") or 0, 6)
+        row.update(self._trade_stage_texts(item))
         row["fee_text"] = fmt(estimated_fee, 4)
         row["quantity_text"] = self.tr_.format_number(item.get("quantity") or 0.0, 4)
         row["entry_text"] = self.tr_.format_number(item.get("entry_price") or 0.0, 4)
@@ -6267,6 +6732,49 @@ class MainController(QObject):
         percent = float(item.get("pnl_percent") or 0.0)
         row["pnl_percent_text"] = ("+" if percent >= 0 else "") + self.tr_.format_number(percent, 2) + "%"
         return row
+
+    def _trade_stage_texts(self, item: dict[str, Any]) -> dict[str, str]:
+        """
+        متن‌های ستون «اهداف»، مرحله و «زمان/علت بسته شدن» (v2.5.0).
+
+        اهداف خورده با ✓ علامت می‌خورند؛ معامله‌های قدیمی که فقط یک
+        `take_profit` دارند همان یک هدف را نشان می‌دهند.
+        """
+        extra = item.get("extra") or {}
+        targets = [float(v) for v in (extra.get("targets") or []) if v]
+        if not targets and item.get("take_profit"):
+            targets = [float(item.get("take_profit") or 0.0)]
+        hit = int(extra.get("targets_hit") or 0)
+        status = str(item.get("status") or "")
+        note = str(item.get("note") or "")
+        if status == "closed" and note == "take_profit":
+            hit = len(targets)
+        parts = []
+        for index, value in enumerate(targets, start=1):
+            mark = " ✓" if index <= hit else ""
+            parts.append(f"TP{index} {self.tr_.format_number(value, 6)}{mark}")
+        texts = {"targets_text": " · ".join(parts) if parts else "—"}
+        partials = extra.get("partials") or []
+        if partials:
+            texts["targets_tip"] = "\n".join(
+                f"TP{p.get('target') or '?'}: {self.tr_.format_number(p.get('quantity') or 0, 6)} @ "
+                f"{self.tr_.format_number(p.get('price') or 0, 6)}"
+                for p in partials
+            )
+        if status == "open" and len(targets) > 1:
+            stage = self.tr_.tr("trades.staged.stage", hit=hit, total=len(targets))
+            if hit > 0 and abs(float(item.get("stop_loss") or 0) - float(item.get("entry_price") or 0)) < 1e-12:
+                stage += " · " + self.tr_.tr("trades.staged.breakeven")
+            texts["stage_text"] = stage
+        if status in ("closed", "cancelled"):
+            reason_key = note if note in ("take_profit", "stop_loss", "breakeven", "manual") else ""
+            closed_at = self._localized_datetime(item.get("closed_at")) if item.get("closed_at") else "—"
+            texts["closed_text"] = (
+                f"{closed_at} · {self.tr_.tr(f'trades.reasons.{reason_key}')}" if reason_key else closed_at
+            )
+        else:
+            texts["closed_text"] = "—"
+        return texts
 
     def _digits(self, value: Any) -> str:
         """تبدیل عدد به رشته با ارقام زبان جاری."""
@@ -6608,6 +7116,13 @@ class MainController(QObject):
                 balance = float(account.get("total_value_usdt") or 0.0)
         except Exception:  # noqa: BLE001
             pass
+        if self._is_paper_mode():
+            # v2.5.0: معاملهٔ کاغذی با موجودی جعلی کاغذی (= کیف پول واقعی +
+            # سود/زیان کاغذی) سنجیده می‌شود، نه با موجودی واقعی ثابت.
+            try:
+                balance = self._paper_account().balance
+            except Exception:  # noqa: BLE001
+                logger.debug("Paper account unavailable", exc_info=True)
         stats = getattr(self, "_terminal_stats", {}) or {}
         return {
             "balance": balance,

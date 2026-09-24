@@ -35,6 +35,12 @@ from ui.themes import get_theme
 from ui.widgets.controls import StatusDot, set_role
 
 
+#: ابعاد کادر جست‌وجوی نوار بالا (v2.5.0 — کشسان و گرد)
+SEARCH_MIN_WIDTH = 200
+SEARCH_MAX_WIDTH = 760
+SEARCH_HEIGHT = 38
+
+
 class SearchBox(QLineEdit):
     """
     جستجوی سراسری نوار بالا.
@@ -51,8 +57,12 @@ class SearchBox(QLineEdit):
         super().__init__(parent)
         set_role(self, "search")
         self.setClearButtonEnabled(True)
-        self.setMinimumWidth(240)
-        self.setMaximumWidth(420)
+        # v2.5.0: کادر جست‌وجو کشسان است — همهٔ فضای آزاد نوار بالا را
+        # می‌گیرد (تا سقف معقول) و در پنجرهٔ باریک تا حداقل جمع می‌شود.
+        self.setMinimumWidth(SEARCH_MIN_WIDTH)
+        self.setMaximumWidth(SEARCH_MAX_WIDTH)
+        self.setFixedHeight(SEARCH_HEIGHT)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.returnPressed.connect(self._on_return)
 
         # آیکون ذره‌بین داخل کادر
@@ -351,8 +361,12 @@ class TopBar(QFrame):
             button.setIconSize(icon_size(18))
 
         layout.addLayout(title_box)
+        layout.addSpacing(18)
+        # جست‌وجو فضای آزاد را پر می‌کند؛ کش پیش و پس از آن کادر را در
+        # پنجره‌های خیلی پهن وسط نوار نگه می‌دارد.
         layout.addStretch(1)
-        layout.addWidget(self.search)
+        layout.addWidget(self.search, 6)
+        layout.addStretch(1)
         layout.addWidget(self.refresh_button)
         layout.addWidget(self.theme_button)
         layout.addWidget(self.focus_button)

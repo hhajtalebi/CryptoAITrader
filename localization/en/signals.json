@@ -179,6 +179,22 @@
     "primary": "(primary {value})",
     "exchange": "Exchange: {value}",
     "time": "Time: {value}",
-    "disclaimer": "⚠️ Not financial advice — {app} v{version}"
-  }
+    "disclaimer": "⚠️ Not financial advice — {app} v{version}",
+    "share": "Share ▾",
+    "share_tip": "Send the signal to Telegram, WhatsApp, Rubika, Eitaa, Bale, X or email",
+    "to_telegram": "Telegram",
+    "to_whatsapp": "WhatsApp",
+    "to_x": "X (Twitter)",
+    "to_email": "Email",
+    "to_rubika": "Rubika (copy text + open web)",
+    "to_eitaa": "Eitaa (copy text + open web)",
+    "to_bale": "Bale (copy text + open web)",
+    "copied_paste": "Text copied — paste it in the chat ✓",
+    "subject": "Trading signal"
+  },
+  "trade_opened_toast": "{direction} {symbol} opened at {entry} — SL {stop} • {targets}",
+  "trade_open_failed": "Could not open the trade: entry or stop-loss is invalid",
+  "trade_refused_stop": "Trade not opened: live price ({price}) is already past the stop-loss",
+  "trade_refused_target": "Trade not opened: live price ({price}) is already past TP1 — the entry is gone",
+  "trade_margin_capped": "Size was capped to the available paper balance"
 }

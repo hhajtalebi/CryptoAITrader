@@ -39,6 +39,17 @@ class LivePosition:
     take_profit: float | None = None
     entry_fee: float = 0.0
     fee_rate: float = 0.0
+    #: v2.5.0 — اهداف پلکانی (TP1..TP3) و پیشرفت آن‌ها
+    targets: tuple[float, ...] = ()
+    targets_hit: int = 0
+    original_quantity: float = 0.0
+    #: سود ناخالص تحقق‌یافته از بستن‌های جزئی (کارمزدشان در entry_fee است)
+    realized_gross: float = 0.0
+
+    @property
+    def is_staged(self) -> bool:
+        """آیا این موقعیت اهداف پلکانی دارد؟"""
+        return len(self.targets) > 0
 
     @property
     def is_long(self) -> bool:
@@ -59,8 +70,16 @@ class LivePosition:
         difference = price - self.entry_price
         if not self.is_long:
             difference = -difference
-        pnl = difference * self.quantity - self.entry_fee - self.quantity * price * self.fee_rate
-        notional = self.entry_price * self.quantity
+        pnl = (
+            difference * self.quantity
+            + self.realized_gross
+            - self.entry_fee
+            - self.quantity * price * self.fee_rate
+        )
+        # درصد نسبت به مارجین **اولیه**؛ پس از بستن جزئی، حجم باقی‌مانده
+        # کوچک‌تر است و تقسیم بر آن درصد را غلط بزرگ نشان می‌دهد.
+        base_quantity = max(self.quantity, self.original_quantity or 0.0)
+        notional = self.entry_price * base_quantity
         margin = notional / self.leverage if self.leverage > 0 else notional
         percent = (pnl / margin * 100.0) if margin else 0.0
         return round(pnl, 8), round(percent, 4)
@@ -126,6 +145,21 @@ def position_from_record(record: Any) -> LivePosition | None:
     except (TypeError, ValueError):
         leverage = 1.0
 
+    extra = _get("extra", {}) or {}
+    if not isinstance(extra, dict):
+        extra = {}
+    targets: tuple[float, ...] = ()
+    try:
+        targets = tuple(float(v) for v in (extra.get("targets") or []) if float(v) > 0)
+    except (TypeError, ValueError):
+        targets = ()
+    try:
+        targets_hit = max(0, int(extra.get("targets_hit") or 0))
+        original_quantity = float(extra.get("original_quantity") or quantity)
+        realized_gross = float(extra.get("realized_gross") or 0.0)
+    except (TypeError, ValueError):
+        targets_hit, original_quantity, realized_gross = 0, quantity, 0.0
+
     return LivePosition(
         trade_id=trade_id,
         symbol=str(_get("symbol") or ""),
@@ -136,7 +170,11 @@ def position_from_record(record: Any) -> LivePosition | None:
         stop_loss=_optional("stop_loss"),
         take_profit=_optional("take_profit"),
         entry_fee=float(_get("fee", 0.0) or 0.0),
-        fee_rate=float((_get("extra", {}) or {}).get("fee_rate", 0.0) or 0.0),
+        fee_rate=float(extra.get("fee_rate", 0.0) or 0.0),
+        targets=targets,
+        targets_hit=targets_hit,
+        original_quantity=original_quantity,
+        realized_gross=realized_gross,
     )
 
 
@@ -176,3 +214,48 @@ def evaluate(
             closures.append((position.trade_id, price, reason))
 
     return updates, closures
+
+
+def evaluate_staged(
+    positions: list[LivePosition], prices: dict[str, float]
+) -> tuple[list[dict[str, Any]], list[tuple[int, float, dict[str, Any]]]]:
+    """
+    ارزیابی با مدیریت پلکانی اهداف (v2.5.0).
+
+    بازگشتی: (به‌روزرسانی‌های نمایش، گام‌ها). هر گام `(شناسه، قیمت، اقدام)`
+    است و اقدام همان خروجی `staged_targets.next_step` است. موقعیت بدون
+    اهداف پلکانی با همان قاعدهٔ قدیمی `should_close` ارزیابی می‌شود و
+    گامش `{"action": "final"|"stop", "reason": ...}` است.
+    """
+    from trading.staged_targets import next_step  # noqa: PLC0415
+
+    updates: list[dict[str, Any]] = []
+    steps: list[tuple[int, float, dict[str, Any]]] = []
+    for position in positions:
+        price = float(prices.get(position.symbol, 0.0) or 0.0)
+        if price <= 0:
+            continue
+        pnl, percent = position.unrealised(price)
+        updates.append(
+            {"id": position.trade_id, "symbol": position.symbol, "price": price,
+             "pnl": pnl, "pnl_percent": percent}
+        )
+        if position.is_staged:
+            step = next_step(
+                price=price,
+                side=position.side,
+                stop_loss=position.stop_loss,
+                targets=position.targets,
+                targets_hit=position.targets_hit,
+                original_quantity=position.original_quantity or position.quantity,
+                remaining_quantity=position.quantity,
+                entry=position.entry_price,
+            )
+            if step is not None:
+                steps.append((position.trade_id, price, step))
+            continue
+        close, reason = position.should_close(price)
+        if close:
+            action = "stop" if reason == REASON_STOP_LOSS else "final"
+            steps.append((position.trade_id, price, {"action": action, "reason": reason}))
+    return updates, steps
