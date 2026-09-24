@@ -63,6 +63,8 @@ class ScalpService:
 
     def __init__(self, app: Any) -> None:
         self._app = app
+        from trading.universe import RotatingUniverse
+        self._universe = RotatingUniverse()
 
     # ---- خواندن تنظیم‌ها ---------------------------------------------
 
@@ -75,7 +77,7 @@ class ScalpService:
 
     # ---- پویش --------------------------------------------------------
 
-    async def scan(self, *, use_ai: bool | None = None) -> list[ScalpCandidate]:
+    async def scan(self, *, use_ai: bool | None = None, symbols: list[str] | None = None) -> list[ScalpCandidate]:
         """
         یک دور کامل پویش.
 
@@ -87,9 +89,12 @@ class ScalpService:
         scan_limit = int(self._setting("scalp.scan_limit", 25))
 
         tickers = await self._app.market.get_all_tickers()
-        shortlist = prefilter_symbols(
-            tickers, min_turnover=min_turnover, limit=scan_limit
-        )
+        eligible = prefilter_symbols(tickers, min_turnover=min_turnover, limit=len(tickers))
+        raw = str(self._setting("scalp.selected_symbols", "") or "")
+        favorites = [s.strip().upper() for s in raw.split(",") if s.strip()]
+        chosen = self._universe.select(eligible, limit=scan_limit, selected=symbols,
+                                       favorites=favorites, min_turnover=min_turnover)
+        shortlist = [t for t in eligible if t.symbol in chosen]
         logger.info(
             "Scalp scan: %d tickers -> %d after liquidity filter",
             len(tickers), len(shortlist),
@@ -246,10 +251,29 @@ class ScalpService:
             candidate.volatility_5m,
         )
 
+    def _bool_setting(self, key: str, fallback: bool) -> bool:
+        """False و رشتهٔ «false» نباید در مسیر تنظیمات به True تبدیل شوند."""
+        value = self._setting(key, fallback)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "1", "yes", "on"}:
+                return True
+            if normalized in {"false", "0", "no", "off"}:
+                return False
+            return fallback
+        return fallback if value is None else bool(value)
+
     def build_trader_config(self) -> Any:
-        """ساخت پیکربندی موتور خودکار از روی تنظیم‌های کاربر."""
+        """
+        انتقال کامل تنظیم‌ها به موتور، بدون نوشتن در تنظیم‌های ذخیره‌شده.
+
+        فیلدهای محافظ و حالت موتور نباید فقط در UI خوانده شوند و در
+        AutoTradeConfig روی پیش‌فرض بمانند. صفر کارمزد/لغزش و False معتبرند.
+        سقف‌های سخت همچنان در validated اعمال می‌شوند.
+        """
         from trading.auto_trader import AutoTradeConfig
 
+        fee_rate = self._setting("scalp.taker_fee_rate", 0.0006)
         return AutoTradeConfig(
             margin_per_trade=float(self._setting("scalp.margin_per_trade", 10.0)),
             target_profit=float(self._setting("scalp.target_profit", 2.0)),
@@ -261,5 +285,22 @@ class ScalpService:
             daily_loss_limit=float(self._setting("scalp.daily_loss_limit", 20.0)),
             mode=str(self._setting("scalp.mode", "paper")),
             live_confirmation=str(self._setting("scalp.live_confirmation", "")),
-            fee_rate=float(self._setting("scalp.taker_fee_rate", 0.0006) or 0.0006),
+            fee_rate=float(0.0006 if fee_rate is None else fee_rate),
+            engine_mode=str(self._setting("scalp.engine_mode", "scan")),
+            selected_symbols=str(self._setting("scalp.selected_symbols", "")),
+            scan_interval_seconds=float(self._setting("scalp.scan_interval_seconds", 15.0)),
+            min_liquidity=float(self._setting("scalp.min_liquidity", 2_000_000.0)),
+            max_spread_percent=float(self._setting("scalp.max_spread_percent", 0.25)),
+            stale_after_seconds=float(self._setting("scalp.stale_after_seconds", 10.0)),
+            slippage_percent=float(self._setting("scalp.slippage_percent", 0.02)),
+            break_even_enabled=self._bool_setting("scalp.break_even_enabled", True),
+            break_even_trigger=float(self._setting("scalp.break_even_trigger", 1.0)),
+            trailing_enabled=self._bool_setting("scalp.trailing_enabled", False),
+            trailing_activation=float(self._setting("scalp.trailing_activation", 1.5)),
+            trailing_offset=float(self._setting("scalp.trailing_offset", 0.4)),
+            signal_invalidation=self._bool_setting("scalp.signal_invalidation", True),
+            trend_conflict_policy=str(self._setting("scalp.trend_conflict_policy", "block")),
+            allocation_mode=str(self._setting("scalp.allocation_mode", "fixed")),
+            allocation_percent=float(self._setting("scalp.allocation_percent", 5.0)),
+            max_total_margin_percent=float(self._setting("scalp.max_total_margin_percent", 60.0)),
         ).validated()

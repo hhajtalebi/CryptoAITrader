@@ -2,7 +2,7 @@
   "actions": "Actions",
   "cancel_trade": "Cancel",
   "clear_history": "Clear History",
-  "close_hint": "Select an open trade and press “Close Trade” (or double-click the row).",
+  "close_hint": "Click the symbol or double-click a row for details. Use the Close Trade button to exit.",
   "close_trade": "Close Trade",
   "closed": "Trade closed",
   "closed_manual": "Trade closed manually",
@@ -35,7 +35,7 @@
   "opened": "Paper trade recorded",
   "page_info": "Page {page} of {pages}",
   "paper_notice": "All trades are recorded in paper (simulation) mode; no real orders are sent.",
-  "pnl": "P&L",
+  "pnl": "Net P&L",
   "pnl_percent": "P&L %",
   "quantity": "Quantity",
   "side": "Side",
@@ -68,7 +68,7 @@
     "mode_paper": "Paper (no real money)",
     "mode_live": "Live",
     "started": "Auto-trading started.",
-    "stopped_msg": "Auto-trading stopped.",
+    "stopped_msg": "Automatic entries stopped; protective monitoring of open positions continues.",
     "blocked": "Could not start: {reason}",
     "opened": "Trade opened: {symbol} at {price}",
     "closed": "Trade closed: {symbol} • PnL: ${pnl} ({reason})",
@@ -159,7 +159,7 @@
     "pos_leverage": "Leverage",
     "pos_tp": "TP",
     "pos_sl": "SL",
-    "pos_pnl": "PnL",
+    "pos_pnl": "Estimated net P&L",
     "pos_pnl_percent": "PnL %",
     "pos_duration": "Duration",
     "pos_data_age": "Data Age",
@@ -270,6 +270,10 @@
     "indicator_failed": "Cannot compute {name} with this data (too few candles)",
     "pos_action": "Action",
     "detail_title": "Position Details — {symbol}",
-    "opp_decision_watch": "Watch candidate"
+    "opp_decision_watch": "Watch candidate",
+    "close_failed": "Trade not closed: a fresh price may be unavailable or another exit is in progress.",
+    "exchange_locked": "Stop automatic entries and close open positions before switching exchanges.",
+    "pos_fee": "Fees (estimated exit)",
+    "entering": "Checking a fresh price and entry guards…"
   }
 }

@@ -36,6 +36,10 @@ from market.providers.lbank.constants import (
     LBANK_CONTRACT_URL,
     LBANK_ERROR_MESSAGES,
     LBANK_REST_URL,
+    LBANK_REST_URLS,
+    RATE_LIMIT_ERROR_CODES,
+    RATE_LIMIT_RETRY_AFTER,
+    REGION_BLOCKED_ERROR_CODES,
     RETRYABLE_ERROR_CODES,
 )
 from app.exceptions.errors import TransientExchangeError
@@ -63,6 +67,13 @@ class LBankRestClient:
         rate_limit_per_second: float = 8.0,
     ) -> None:
         self._base_url = base_url.rstrip("/")
+        # دامنه‌های جایگزین فقط وقتی به کار می‌آیند که نشانی پیش‌فرض استفاده شده
+        # باشد؛ نشانی سفارشی کاربر هرگز بی‌اجازه عوض نمی‌شود.
+        if self._base_url == LBANK_REST_URL.rstrip("/"):
+            self._base_urls: tuple[str, ...] = tuple(u.rstrip("/") for u in LBANK_REST_URLS)
+        else:
+            self._base_urls = (self._base_url,)
+        self._base_index = 0
         self._api_key = api_key or ""
         self._api_secret = api_secret or ""
         self._timeout = timeout
@@ -130,8 +141,14 @@ class LBankRestClient:
             assert self._client is not None
             try:
                 response = await self._client.get(endpoint, params=params or {})
+            except httpx.ConnectTimeout as exc:
+                await self._rotate_base_url(exc)
+                raise TimeoutErrorApp(f"Connect timed out: {endpoint}") from exc
             except httpx.TimeoutException as exc:
                 raise TimeoutErrorApp(f"Request timed out: {endpoint}") from exc
+            except httpx.ConnectError as exc:
+                await self._rotate_base_url(exc)
+                raise NetworkError(f"Could not connect while calling {endpoint}") from exc
             except httpx.HTTPError as exc:
                 raise NetworkError(f"Network error while calling {endpoint}") from exc
             return self._handle_response(response, endpoint)
@@ -141,6 +158,36 @@ class LBankRestClient:
             max_attempts=self._max_retries,
             retry_on=(NetworkError, TransientExchangeError),
             operation_name=f"GET {endpoint}",
+            no_retry_on=(RateLimitError,),
+        )
+
+    @property
+    def base_url(self) -> str:
+        """دامنهٔ REST فعلی (برای عیب‌یابی)."""
+        return self._base_url
+
+    async def _rotate_base_url(self, exc: BaseException) -> None:
+        """
+        رفتن به دامنهٔ REST بعدی پس از خطای اتصال (DNS/TCP/TLS).
+
+        اگر یک دامنه در شبکهٔ کاربر فیلتر یا از دسترس خارج باشد، تلاش بعدی
+        با دامنهٔ جایگزین انجام می‌شود. خطای HTTP یا محدودیت نرخ دامنه را
+        عوض نمی‌کند، چون سرور در دسترس بوده است.
+        """
+        if len(self._base_urls) < 2:
+            return
+        previous = self._base_url
+        self._base_index = (self._base_index + 1) % len(self._base_urls)
+        self._base_url = self._base_urls[self._base_index]
+        client, self._client = self._client, None
+        if client is not None and not client.is_closed:
+            try:
+                await client.aclose()
+            except Exception:  # noqa: BLE001
+                pass
+        logger.warning(
+            "LBank REST host %s unreachable (%s); switching to %s",
+            previous, exc.__class__.__name__, self._base_url,
         )
 
     # ------------------------------------------------------------------
@@ -195,6 +242,7 @@ class LBankRestClient:
             _do_request,
             max_attempts=self._max_retries,
             retry_on=(NetworkError,),
+            no_retry_on=(RateLimitError,),
             operation_name=f"POST {endpoint}",
         )
 
@@ -251,6 +299,7 @@ class LBankRestClient:
             _do_request,
             max_attempts=self._max_retries,
             retry_on=(NetworkError,),
+            no_retry_on=(RateLimitError,),
             operation_name=f"POST {endpoint}",
         )
 
@@ -290,6 +339,18 @@ class LBankRestClient:
     # ------------------------------------------------------------------
     # تفسیر پاسخ
     # ------------------------------------------------------------------
+    @staticmethod
+    def _retry_after_seconds(response: httpx.Response) -> float | None:
+        """خواندن سرآیند Retry-After (ثانیه) در صورت وجود."""
+        raw = response.headers.get("Retry-After") if response.headers is not None else None
+        if not raw:
+            return None
+        try:
+            value = float(str(raw).strip())
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
     def _handle_response(self, response: httpx.Response, endpoint: str) -> Any:
         """
         بررسی پوشش پاسخ LBank و استخراج بخش data.
@@ -297,8 +358,14 @@ class LBankRestClient:
         قالب پاسخ:
             {"result": "true"|true, "data": ..., "error_code": 0, "msg": "Success"}
         """
-        if response.status_code == 429:
-            raise RateLimitError("LBank rate limit exceeded", details={"endpoint": endpoint})
+        if response.status_code in (429, 418):
+            # 418 یعنی IP موقتاً مسدود شده؛ هر دو باید مکث سراسری بسازند و
+            # هرگز فوراً تکرار نشوند.
+            details: dict[str, Any] = {"endpoint": endpoint, "status": response.status_code}
+            retry_after = self._retry_after_seconds(response)
+            if retry_after is not None:
+                details["retry_after"] = retry_after
+            raise RateLimitError("LBank rate limit exceeded", details=details)
         if response.status_code >= 500:
             raise ExchangeError(
                 f"LBank server error ({response.status_code})",
@@ -329,6 +396,11 @@ class LBankRestClient:
         message = LBANK_ERROR_MESSAGES.get(error_code, str(payload.get("msg", "Unknown error")))
         details = {"endpoint": endpoint, "error_code": error_code, "message": message}
 
+        if error_code in RATE_LIMIT_ERROR_CODES:
+            details["retry_after"] = RATE_LIMIT_RETRY_AFTER
+            raise RateLimitError(f"LBank rate limit: {message}", details=details)
+        if error_code in REGION_BLOCKED_ERROR_CODES:
+            raise ExchangeError(f"LBank unavailable in this region: {message}", details=details)
         if error_code in AUTH_ERROR_CODES:
             raise AuthenticationError(f"LBank authentication failed: {message}", details=details)
         if error_code in RETRYABLE_ERROR_CODES:

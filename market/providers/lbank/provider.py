@@ -20,7 +20,7 @@ from collections.abc import Callable
 
 from app.core.constants import ConnectionStatus
 from app.core.models import Candle, OrderBook, SymbolInfo, Ticker
-from app.exceptions import ExchangeError, TimeframeError, ValidationError
+from app.exceptions import ExchangeError, RateLimitError, TimeframeError, ValidationError
 from app.logging import get_logger
 from market.providers.base import ExchangeProvider, ProviderCapabilities
 from market.providers.lbank.constants import (
@@ -80,6 +80,7 @@ class LBankProvider(ExchangeProvider):
             max_candles_per_request=LBANK_MAX_KLINE_SIZE,
         )
         self._symbol_cache: dict[str, SymbolInfo] = {}
+        self._ws_client_counter = 0
 
     # ------------------------------------------------------------------
     # چرخه عمر
@@ -111,6 +112,10 @@ class LBankProvider(ExchangeProvider):
         try:
             data = await self._client.get(LBankEndpoints.TIMESTAMP)
             return data is not None
+        except RateLimitError:
+            # محدودیت نرخ یعنی صرافی در دسترس است؛ موتور بازار باید مکث کند،
+            # نه اینکه اتصال را «مرده» اعلام کند.
+            raise
         except Exception as exc:  # noqa: BLE001 - وضعیت اتصال نباید برنامه را متوقف کند
             logger.warning("LBank ping failed: %s", exc.__class__.__name__)
             return False
@@ -485,9 +490,17 @@ class LBankProvider(ExchangeProvider):
         on_status_change: Callable[[ConnectionStatus], None] | None = None,
     ) -> Any | None:
         """ساخت کلاینت وب‌سوکت LBank (درون‌ریزی تنبل)."""
+        from market.providers.lbank.constants import LBANK_WS_URLS
         from market.providers.lbank.websocket_client import LBankWebSocketClient
 
+        # هر کلاینت (مثلاً دو اتصال موازی RedundantStream) از دامنهٔ متفاوتی
+        # شروع می‌کند تا فیلتر/خرابی یک دامنه هر دو را هم‌زمان نخواباند.
+        counter = int(getattr(self, "_ws_client_counter", 0))
+        offset = counter % len(LBANK_WS_URLS)
+        self._ws_client_counter = counter + 1
+        urls = LBANK_WS_URLS[offset:] + LBANK_WS_URLS[:offset]
         return LBankWebSocketClient(
+            urls=urls,
             on_ticker=on_ticker,
             on_candle=on_candle,
             on_status_change=on_status_change,

@@ -37,6 +37,8 @@ class LivePosition:
     leverage: float = 1.0
     stop_loss: float | None = None
     take_profit: float | None = None
+    entry_fee: float = 0.0
+    fee_rate: float = 0.0
 
     @property
     def is_long(self) -> bool:
@@ -57,7 +59,7 @@ class LivePosition:
         difference = price - self.entry_price
         if not self.is_long:
             difference = -difference
-        pnl = difference * self.quantity
+        pnl = difference * self.quantity - self.entry_fee - self.quantity * price * self.fee_rate
         notional = self.entry_price * self.quantity
         margin = notional / self.leverage if self.leverage > 0 else notional
         percent = (pnl / margin * 100.0) if margin else 0.0
@@ -133,6 +135,8 @@ def position_from_record(record: Any) -> LivePosition | None:
         leverage=leverage,
         stop_loss=_optional("stop_loss"),
         take_profit=_optional("take_profit"),
+        entry_fee=float(_get("fee", 0.0) or 0.0),
+        fee_rate=float((_get("extra", {}) or {}).get("fee_rate", 0.0) or 0.0),
     )
 
 

@@ -546,11 +546,11 @@ class PredictiveIntelligenceEngine:
             model_health=health,
             data_quality=quality,
         )
-        self._report_cache[cache_key] = (time.monotonic(), report)
-        # نسخهٔ نماد را تازه نگه داریم تا report(symbol) همیشه جدیدترین باشد
-        latest = self._latest_for_symbol.get(symbol)
-        if latest is None or time.monotonic() - cached[0] >= 0 or True:
-            self._latest_for_symbol[symbol] = (time.monotonic(), report)
+        # گزارش تازه برای هر دو نما یک زمان دارد. کلید تایم‌فریم تازه
+        # ممکن است cache قبلی نداشته باشد؛ برای ثبت نتیجه نباید آن را خواند.
+        cache_entry = (time.monotonic(), report)
+        self._report_cache[cache_key] = cache_entry
+        self._latest_for_symbol[symbol] = cache_entry
         return report
 
     # ------------------------------------------------------------------

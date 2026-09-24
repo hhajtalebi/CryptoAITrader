@@ -73,6 +73,7 @@ async def retry_async(
     max_delay: float = 8.0,
     retry_on: tuple[type[Exception], ...] = (NetworkError,),
     operation_name: str = "operation",
+    no_retry_on: tuple[type[Exception], ...] = (),
 ) -> T:
     """
     اجرای یک عملیات ناهمگام با تلاش مجدد و تأخیر نمایی همراه با نویز.
@@ -89,6 +90,10 @@ async def retry_async(
         try:
             return await operation()
         except retry_on as exc:
+            if no_retry_on and isinstance(exc, no_retry_on):
+                # مثلاً محدودیت نرخ: تکرار فوری فقط مسدودی را طولانی‌تر می‌کند؛
+                # تصمیم مکث با لایهٔ بالاتر (cooldown موتور بازار) است.
+                raise
             last_error = exc
             if attempt >= max_attempts:
                 break

@@ -991,10 +991,11 @@ class TradesPage(BasePage):
         layout.addWidget(self._build_filters())
         layout.addWidget(self._build_metrics())
 
-        self.table = QTableWidget(0, 10, self)
+        self.table = QTableWidget(0, 15, self)
         configure_table(self.table, stretch_column=1)
         harden_table(self.table, min_row_height=30, min_table_height=220)
         self.table.cellDoubleClicked.connect(self._on_row_activated)
+        self.table.cellClicked.connect(self._on_history_cell_clicked)
         layout.addWidget(self.table, 1)
 
         actions_row = QHBoxLayout()
@@ -1801,6 +1802,9 @@ class TradesPage(BasePage):
         self.auto_ws_label.setText(
             "WS: " + self.tr_.tr("common.online" if connected else "common.offline")
         )
+        connections = status.get("connections") or {}
+        if connections.get("connections"):
+            self.auto_ws_label.setText(self.auto_ws_label.text() + f" ({connections.get('connected', 0)}/{connections['connections']})")
         set_role(self.auto_ws_label, "chip_up" if connected else "chip_warn")
 
         latency = status.get("avg_total_latency_ms")
@@ -1940,13 +1944,8 @@ class TradesPage(BasePage):
         dialog.exec()
 
     def _on_position_activated(self, row: int, _column: int) -> None:
-        """دوبار کلیک روی موقعیت باز آن را می‌بندد."""
-        data = self._position_row_from_table(row)
-        if data:
-            try:
-                self.close_position_requested.emit(int(data["id"]))
-            except (KeyError, TypeError, ValueError):
-                self.close_position_blocked.emit()
+        """دوبار کلیک جزئیات را نشان می‌دهد؛ خروج فقط با دکمهٔ صریح."""
+        self._on_position_cell_clicked(row, 0)
 
     def _set_columns(self, table: QTableWidget, columns: tuple[str, ...], prefix: str) -> None:
         """عنوان‌دهی ستون‌های یک جدول از کلیدهای ترجمه."""
@@ -2050,6 +2049,8 @@ class TradesPage(BasePage):
         (`*_text`) تا این صفحه درگیر قالب‌بندی عدد و تاریخ نشود؛ آن کار
         وظیفهٔ کنترلر است که به تنظیمات محلی دسترسی دارد.
         """
+        selected = self.trade_row(self.table.currentRow())
+        selected_id = selected.get("id") if selected else None
         self._rows = list(rows or [])
         self._page, self._pages = page, pages
 
@@ -2095,10 +2096,27 @@ class TradesPage(BasePage):
                 self._cell(row.get("leverage_text", "")),
                 pnl_item,
                 percent_item,
+                self._cell(row.get("sl_text", "")),
+                self._cell(row.get("tp_text", "")),
+                self._cell(row.get("margin_text", "")),
+                self._cell(row.get("fee_text", "")),
+                self._cell(""),
             ]
             for column, item in enumerate(cells):
                 self.table.setItem(index, column, item)
+            if status_key == "open":
+                button = make_button(self.tr_.tr("trades.close_trade"))
+                button.clicked.connect(lambda _checked=False, tid=int(row["id"]): self.close_requested.emit(tid))
+                self.table.setCellWidget(index, 14, button)
+            else:
+                self.table.removeCellWidget(index, 14)
 
+        selected_index = next((i for i, row in enumerate(self._rows) if row.get("id") == selected_id), -1)
+        if selected_index >= 0:
+            self.table.selectRow(selected_index)
+        else:
+            self.table.setCurrentCell(-1, -1)
+            self.table.clearSelection()
         has_rows = bool(self._rows)
         self.table.setVisible(has_rows)
         self.empty_state.setVisible(not has_rows)
@@ -2264,6 +2282,11 @@ class TradesPage(BasePage):
                 self.tr_.tr("trades.leverage"),
                 self.tr_.tr("trades.pnl"),
                 self.tr_.tr("trades.pnl_percent"),
+                self.tr_.tr("trades.auto.pos_sl"),
+                self.tr_.tr("trades.auto.pos_tp"),
+                self.tr_.tr("trades.auto.pos_margin"),
+                self.tr_.tr("trades.fee"),
+                self.tr_.tr("trades.actions"),
             ]
         )
 
@@ -2299,11 +2322,32 @@ class TradesPage(BasePage):
             return
         self.close_requested.emit(int(data.get("id", 0)))
 
+    def show_open_history(self) -> None:
+        """پس از ورود موفق، تاریخچهٔ باز بدون فیلتر پنهان‌کننده نمایش داده شود."""
+        self._page = 1
+        for combo, data in ((self.symbol_combo, "all"), (self.side_combo, "all"), (self.status_combo, "open")):
+            combo.blockSignals(True)
+            combo.setCurrentIndex(max(0, combo.findData(data)))
+            combo.blockSignals(False)
+        for widget, date in ((self.from_date, QDate.currentDate().addDays(-30)), (self.to_date, QDate.currentDate())):
+            widget.blockSignals(True)
+            widget.setDate(date)
+            widget.blockSignals(False)
+        self.tabs.setCurrentIndex(1)
+
+    def _on_history_cell_clicked(self, row: int, column: int) -> None:
+        if column == 1:
+            self._on_row_activated(row, column)
+
     def _on_row_activated(self, row: int, _column: int) -> None:
-        """دوبار کلیک روی معاملهٔ باز آن را می‌بندد."""
+        """کلیک نماد/دوبار کلیک ردیف، مودال جزئیات؛ نه خروج ناخواسته."""
         data = self.trade_row(row)
-        if data and str(data.get("status")) == "open":
-            self.close_requested.emit(int(data.get("id", 0)))
+        if not data:
+            return
+        from ui.dialogs.trading_dialogs import PositionDetailDialog
+        dialog = PositionDetailDialog(self.tr_, dict(data), self)
+        dialog.close_trade_requested.connect(self.close_requested.emit)
+        dialog.exec()
 
     @staticmethod
     def _cell(text: str) -> QTableWidgetItem:

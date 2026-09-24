@@ -2,9 +2,43 @@
 
 **Professional desktop app for crypto market analysis and futures signal generation**
 
-Version 2.2.0 · Windows 10/11 · Python 3.11+ (tested up to 3.13) · Persian & English
+Version 2.3.2 · Windows 10/11 · Python 3.11+ (tested up to 3.13) · Persian & English
 
 [راهنمای فارسی](README.md)
+
+> **Current delivery 2.3.2:** LBank connectivity — WebSocket now uses the official
+> `wss://api.lbank.info/ws/V2/` with fallback domains, client pings and proxy fallback;
+> LBank error 10004 ("request too frequent") is treated as a rate limit with a short
+> cooldown instead of an authentication failure. [Release report](docs/RELEASE_2.3.2_FA.md).
+>
+> **Previous delivery 2.3.1:** fixes "online for a few seconds, then disconnected"
+> (excess REST polling triggered exchange rate limits), honours 429/418 with a global
+> cooldown, treats fresh REST *or* WebSocket data as online, and adds a professional
+> dashboard command center. [Release report](docs/RELEASE_2.3.1_FA.md).
+>
+> **Previous delivery 2.3.0:** independent exit monitoring, serialized entries and
+> single-flight exits, net fee accounting, two same-provider streams with fresh REST
+> fallback, rotating liquid-market/favorite scans, and opportunity entry → open history
+> with details and explicit close actions. **758 passed / 4 skipped** in the selected
+> subset; native Qt/Windows behavior remains unverified. Profit, zero losses and uptime
+> are not guaranteed. [Release report](docs/RELEASE_2.3.0_FA.md). Source only; no commit/push.
+
+> **Previous delivery 2.2.2:** fixes prediction cache updates, complete trading
+> settings propagation and backup sensitivity metadata (encrypted keys retained).
+> Adds a separate local download portal. **708 passed / 3 skipped** in the core
+> subset; full desktop/Windows testing remains unverified. See
+> [release notes and download server instructions](docs/RELEASE_2.2.2_FA.md).
+> The 2.2.1 note below is historical. No commit or push has been made.
+
+> **2.2.1 review/documentation delivery (2026-09-23):** no application logic changes.
+> See the [project memory](docs/PROJECT_MEMORY_FA.md), [complete static code index](docs/CODE_MAP.md)
+> and [validation/open findings](docs/REVIEW_VALIDATION_FA.md) (Persian).
+> Some historical descriptions below are stale: there are 5 registered strategies and 14
+> timeframe codes; certain AI paths change decisions/levels; data defaults to the application
+> directory, and encrypted secrets can be present in the database and its backups.
+> This review ran 674 passing tests and 2 skips in a non-UI subset, not the historical full-suite
+> result. Full collection was blocked by missing Qt system libraries. This is a source delivery,
+> not a newly built executable. Commit/push require the owner's explicit permission.
 
 ---
 
@@ -151,10 +185,10 @@ The AI **cannot invent data**. It reaches real market data only through defined 
 
 ## API key security
 
-- Keys are stored in the **Windows Credential Manager** via `keyring`.
-- If no OS keyring is available, they go into an **encrypted file** outside the database.
-- Keys are **never** written to SQLite, source code, or log files — a dedicated filter masks anything key-shaped before it reaches a log.
-- Backups **never contain secrets** (there is an automated test for this).
+- SecretStore supports OS keyring, encrypted-file and encrypted-database backends. With the default `security.store_secrets_in_db=True`, Application selects the **encrypted database backend**.
+- Raw keys must not be written to source or logs. Logging/error filters redact sensitive values; encrypted ciphertext in SQLite is not the same as storing plaintext keys.
+- File/database key derivation is not equivalent to OS-backed DPAPI protection; improving it remains an open security-review item.
+- Database backups **can contain encrypted secrets**. Version 2.2.2 marks these snapshots as sensitive in the manifest without deleting keys. OS keyring data and `.secret_store.bin` are not included. Keep all personal backups private.
 
 ---
 

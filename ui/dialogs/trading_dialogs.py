@@ -240,6 +240,7 @@ class PositionDetailDialog(QDialog):
         ("data_age_text", "pos_data_age"),
         ("exit_reason_text", "pos_exit_reason"),
         ("status_text", "pos_status"),
+        ("fee_text", "pos_fee"),
     ]
 
     def __init__(
@@ -271,7 +272,7 @@ class PositionDetailDialog(QDialog):
         head.addWidget(side)
         head.addStretch(1)
         pnl = QLabel(str(row.get("pnl_text", "—")), self)
-        set_role(pnl, "chip_up" if is_long else "chip_down")
+        set_role(pnl, "chip_up" if float(row.get("pnl") or 0) >= 0 else "chip_down")
         head.addWidget(pnl)
         layout.addLayout(head)
 
@@ -304,7 +305,7 @@ class PositionDetailDialog(QDialog):
         cancel = QPushButton(translator.tr("common.close"), self)
         cancel.clicked.connect(self.reject)
         actions.addWidget(cancel)
-        if self._trade_id is not None:
+        if self._trade_id is not None and row.get("status", "open") == "open":
             close_btn = make_button(
                 translator.tr("trades.auto.close_selected"), primary=True
             )
