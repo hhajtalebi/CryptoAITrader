@@ -25,6 +25,7 @@ from app.exceptions import (
     AuthenticationError,
     ExchangeError,
     NetworkError,
+    RateLimitError,
     TimeoutErrorApp,
 )
 from app.logging import get_logger
@@ -187,6 +188,16 @@ class ToobitRestClient:
         Toobit خطاها را هم با کد HTTP و هم با `code`/`msg` در بدنه اعلام
         می‌کند؛ هر دو بررسی می‌شوند.
         """
+        if response.status_code in (418, 429):
+            # 429 = درخواست زیاد، 418 = مسدودی موقت IP. تکرار فوری مسدودی را
+            # طولانی‌تر می‌کند؛ موتور بازار با این اطلاعات مکث سراسری می‌گذارد.
+            raise RateLimitError(
+                f"Toobit rate limit on {endpoint}",
+                details={
+                    "status": response.status_code,
+                    "retry_after": _retry_after_seconds(response),
+                },
+            )
         if response.status_code == 401 or response.status_code == 403:
             raise AuthenticationError(
                 f"Toobit rejected the credentials for {endpoint}",
@@ -222,6 +233,14 @@ class ToobitRestClient:
                 details={"status": response.status_code},
             )
         return payload
+
+
+def _retry_after_seconds(response: httpx.Response) -> float:
+    """خواندن Retry-After (ثانیه)؛ نبود یا نامعتبر بودن آن یعنی صفر."""
+    try:
+        return max(0.0, float(response.headers.get("Retry-After", 0) or 0))
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _safe_int(value: Any) -> int:

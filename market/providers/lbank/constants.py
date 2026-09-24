@@ -16,6 +16,23 @@ LBANK_REST_URL: Final[str] = "https://api.lbkex.com"
 # نشانی WebSocket نسخه ۲
 LBANK_WS_URL: Final[str] = "wss://www.lbkex.net/ws/V2/"
 
+# نسخهٔ ۲.۳.۲: مستندات فعلی LBank (www.lbank.com/docs) نشانی رسمی را
+# api.lbank.info اعلام می‌کند و www.lbkex.net نشانی قدیمی است. اگر یک دامنه در
+# شبکهٔ کاربر مسدود/فیلتر باشد یا دست‌دادن را رد کند، کلاینت به ترتیب سراغ
+# بعدی می‌رود؛ دامنهٔ موفق تا قطع بعدی حفظ می‌شود.
+LBANK_WS_URLS: Final[tuple[str, ...]] = (
+    "wss://api.lbank.info/ws/V2/",
+    LBANK_WS_URL,
+    "wss://api.lbkex.com/ws/V2/",
+)
+
+# دامنه‌های جایگزین REST؛ فقط هنگام خطای «اتصال» (DNS/TCP/TLS) عوض می‌شوند.
+LBANK_REST_URLS: Final[tuple[str, ...]] = (
+    LBANK_REST_URL,
+    "https://api.lbank.info",
+    "https://www.lbkex.net",
+)
+
 # سقف تعداد کندل در هر درخواست (آزمایش شد: ۲۰۰۰ مجاز، ۳۰۰۰ خطای پارامتر)
 LBANK_MAX_KLINE_SIZE: Final[int] = 2000
 
@@ -101,26 +118,40 @@ LBANK_AGGREGATED_TIMEFRAMES: Final[dict[str, str]] = {
     "12h": "4h",
 }
 
+# کدهای خطای LBank مطابق جدول رسمی (www.lbank.com/docs → Error code).
+# تا نسخهٔ ۲.۳.۱ این جدول جابه‌جا بود: 10004 («درخواست بیش از حد») به‌اشتباه
+# «امضای نامعتبر» و خطای احراز هویت شمرده می‌شد، پس محدودیت نرخ LBank به‌جای
+# مکث، اتصال REST را «مرده» اعلام می‌کرد.
+RATE_LIMIT_ERROR_CODES: Final[set[int]] = {10004}
+# ثانیهٔ مکث پیش‌فرض پس از 10004 (صرافی Retry-After نمی‌فرستد).
+RATE_LIMIT_RETRY_AFTER: Final[float] = 10.0
 # کدهای خطای LBank که تکرار درخواست برایشان منطقی است.
-RETRYABLE_ERROR_CODES: Final[set[int]] = {10000, 10001, 10002}
+RETRYABLE_ERROR_CODES: Final[set[int]] = {10000, 10017, 10116}
+AUTH_ERROR_CODES: Final[set[int]] = {10005, 10006, 10007, 10022, 10201, 10202, 10203}
+# محدودیت منطقه‌ای؛ تکرار بی‌فایده است و پیام روشن لازم دارد.
+REGION_BLOCKED_ERROR_CODES: Final[set[int]] = {10205}
 
-# کدهای خطای مربوط به احراز هویت (تکرار بی‌فایده است).
-AUTH_ERROR_CODES: Final[set[int]] = {10004, 10005, 10006, 10007}
-
-# توضیح کدهای خطای پرکاربرد، برای پیام‌های قابل‌فهم‌تر در لاگ.
 LBANK_ERROR_MESSAGES: Final[dict[int, str]] = {
     10000: "Internal error",
-    10001: "Parameter error",
-    10002: "Authentication failed",
-    10003: "Illegal parameter",
-    10004: "Invalid signature",
-    10005: "Invalid api_key",
-    10006: "Request expired",
-    10007: "IP not allowed",
-    10008: "Trading pair not supported",
-    10009: "Missing price or amount",
-    10010: "Price or amount must be greater than zero",
-    10013: "Amount below minimum",
+    10001: "Parameter can not be null",
+    10002: "Validation failed",
+    10003: "Invalid parameter",
+    10004: "Request too frequent",
+    10005: "Secret key does not exist",
+    10006: "User does not exist",
+    10007: "Invalid signature",
+    10008: "Currency pair not supported",
+    10009: "Limit orders need price and quantity",
+    10010: "Price or quantity must be greater than the minimum",
+    10013: "Order quantity below minimum",
     10014: "Insufficient balance",
     10016: "Insufficient balance",
+    10017: "Server exception",
+    10022: "API key permission denied, invalid IP or permissions",
+    10116: "Upgrading, please try again later",
+    10201: "api_key and sign can not be null",
+    10202: "timestamp, signature_method and echostr can not be null",
+    10203: "Wrong signature method",
+    10205: "LBank is not available in your country/region",
+    10600: "Request timeout; check the difference between local and server time",
 }

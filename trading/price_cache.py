@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import time
+import math
 from collections import deque
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -81,6 +82,7 @@ class TickQuote:
     received_ts_ms: float = 0.0
     processed_ts_ms: float = 0.0
     #: عمق بهترین سطح دفتر سفارش (حجم) — صفر یعنی نامعلوم
+    book_ts_ms: float = 0.0
     bid_depth: float = 0.0
     ask_depth: float = 0.0
     tick_direction: int = 0
@@ -134,7 +136,13 @@ class TickQuote:
         """سن داده از آخرین تیک — برای نمایش و دروازهٔ کهنگی."""
         if self.processed_ts_ms <= 0:
             return float("inf")
-        return max(0.0, _now_ms() - self.processed_ts_ms)
+        stamp = min(self.processed_ts_ms, self.received_ts_ms or self.processed_ts_ms,
+                    self.exchange_ts_ms or self.processed_ts_ms)
+        return max(0.0, _now_ms() - stamp)
+
+    @property
+    def book_fresh(self) -> bool:
+        return _now_ms() - (self.book_ts_ms or self.processed_ts_ms) <= 10_000
 
     def exit_price(self, side: str) -> float:
         """
@@ -142,9 +150,9 @@ class TickQuote:
 
         بدون دفتر سفارش، Last برمی‌گردد — صادقانه‌ترین جایگزین موجود.
         """
-        if side == "long" and self.bid > 0:
+        if side == "long" and self.bid > 0 and self.book_fresh:
             return self.bid
-        if side == "short" and self.ask > 0:
+        if side == "short" and self.ask > 0 and self.book_fresh:
             return self.ask
         return self.last
 
@@ -155,9 +163,9 @@ class TickQuote:
         ورود همیشه از سمت گران‌ترِ اسپرد است؛ نادیده‌گرفتن این یعنی
         سود کاغذی که در واقعیت وجود ندارد.
         """
-        if side == "long" and self.ask > 0:
+        if side == "long" and self.ask > 0 and self.book_fresh:
             return self.ask
-        if side == "short" and self.bid > 0:
+        if side == "short" and self.bid > 0 and self.book_fresh:
             return self.bid
         return self.last
 
@@ -230,7 +238,7 @@ class TickEngine:
         """
         price = float(price or 0.0)
         symbol = str(symbol or "").strip().upper()
-        if price <= 0 or not symbol:
+        if not math.isfinite(price) or price <= 0 or not symbol:
             return None
 
         received = received_at_ms if received_at_ms is not None else _now_ms()
@@ -238,6 +246,15 @@ class TickEngine:
         exchange_ms = _parse_exchange_ms(exchange_ts)
 
         previous = self._quotes.get(symbol)
+        if exchange_ms is not None and exchange_ms > processed + 5000:
+            return None
+        if previous is not None and exchange_ms and previous.exchange_ts_ms and exchange_ms < previous.exchange_ts_ms:
+            return None
+        # Ticker frames don't contain a book; retain only a still-fresh real book.
+        book_stamp = processed if bid > 0 and ask > 0 else 0.0
+        if not bid and not ask and previous is not None and previous.book_fresh:
+            bid, ask = previous.bid, previous.ask
+            book_stamp = previous.book_ts_ms or previous.processed_ts_ms
         unchanged = (
             previous is not None
             and abs(previous.last - price) < 1e-12
@@ -248,6 +265,7 @@ class TickEngine:
         quote = TickQuote(
             symbol=symbol,
             last=price,
+            book_ts_ms=book_stamp,
             bid=float(bid or 0.0),
             ask=float(ask or 0.0),
             source=str(source or "rest"),
@@ -295,14 +313,18 @@ class TickEngine:
         ask = float(getattr(book, "best_ask", 0.0) or 0.0)
         bids = list(getattr(book, "bids", []) or [])
         asks = list(getattr(book, "asks", []) or [])
-        bid_depth = float(getattr(bids[0], "amount", 0.0) or 0.0) if bids else 0.0
-        ask_depth = float(getattr(asks[0], "amount", 0.0) or 0.0) if asks else 0.0
+        bid_depth = float(getattr(bids[0], "quantity", 0.0) or 0.0) if bids else 0.0
+        ask_depth = float(getattr(asks[0], "quantity", 0.0) or 0.0) if asks else 0.0
 
         quote = self._quotes.get(symbol)
         if quote is None:
             # دفتر بدون تیک قبلی: قیمت میانی را به‌عنوان Last ثبت نکن —
             # عدد جعلی نیست. فقط ذخیرهٔ لایه‌ای بی‌معناست؛ رد می‌شود.
             return None
+        stamp = _parse_exchange_ms(getattr(book, "timestamp", None)) or _now_ms()
+        if bid <= 0 or ask < bid or not all(math.isfinite(v) for v in (bid, ask)) or _now_ms() - stamp > 10_000:
+            return quote
+        quote.book_ts_ms = stamp
         quote.bid = bid
         quote.ask = ask
         quote.bid_depth = bid_depth
@@ -313,6 +335,15 @@ class TickEngine:
     # ------------------------------------------------------------------
     # خواندن
     # ------------------------------------------------------------------
+    def clear(self) -> None:
+        """Drop exchange-specific data on a provider switch; keep registered listeners."""
+        self._quotes.clear()
+        self._history.clear()
+        self._latency_samples.clear()
+        self._last_tick_at_ms = 0.0
+        self._tick_count = 0
+        self._ws_tick_count = 0
+
     def get(self, symbol: str) -> TickQuote | None:
         """آخرین تیک نماد."""
         return self._quotes.get(str(symbol or "").strip().upper())
@@ -342,7 +373,10 @@ class TickEngine:
         if quote is None:
             return True
         # سن داده نسبت به مهر پردازش همان تیک سنجیده می‌شود
-        return quote.age_ms > self.stale_after_ms
+        stamp = min(quote.processed_ts_ms, quote.received_ts_ms or quote.processed_ts_ms,
+                    quote.exchange_ts_ms or quote.processed_ts_ms)
+        age = (now_ms if now_ms is not None else _now_ms()) - stamp
+        return age > self.stale_after_ms
 
     def stale_symbols(self, symbols: list[str]) -> list[str]:
         """نمادهای کهنه از میان فهرست داده‌شده."""

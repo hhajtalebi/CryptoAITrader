@@ -113,6 +113,26 @@ class PaperTradeRepository(BaseRepository[PaperTradeRecord]):
             )
             return _to_dict(record)
 
+    def daily_realised_pnl(self, user_id: int | None = None) -> float:
+        """UTC-day net realised P&L; survives engine/application restarts."""
+        start = _utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        with self._db.session_scope() as session:
+            stmt = select(func.coalesce(func.sum(PaperTradeRecord.pnl), 0.0)).where(
+                PaperTradeRecord.status == "closed", PaperTradeRecord.closed_at >= start
+            )
+            if user_id is not None:
+                stmt = stmt.where(PaperTradeRecord.user_id == int(user_id))
+            return float(session.scalar(stmt) or 0.0)
+
+    def update_protection(self, trade_id: int, *, stop_loss: float) -> bool:
+        """حفظ حد ضرر مؤثر برای تاریخچه و پایش پس از راه‌اندازی دوباره."""
+        with self._db.session_scope() as session:
+            record = session.get(PaperTradeRecord, int(trade_id))
+            if record is None or record.status != "open":
+                return False
+            record.stop_loss = float(stop_loss)
+            return True
+
     def update_live_pnl(
         self, trade_id: int, *, price: float, pnl: float, pnl_percent: float
     ) -> bool:
@@ -144,8 +164,8 @@ class PaperTradeRepository(BaseRepository[PaperTradeRecord]):
         بستن معامله و محاسبهٔ سود/زیان.
 
         محاسبه جهت‌آگاه است: در موقعیت فروش، افت قیمت سود محسوب می‌شود.
-        اهرم در سود درصدی ضرب می‌گردد چون همان چیزی است که کاربر در حساب
-        فیوچرز می‌بیند.
+        درصد از سود خالص تقسیم بر مارجین ورود به‌دست می‌آید؛ کارمزد
+        هم در عدد دلاری و هم در درصد منظور می‌شود.
         """
         with self._db.session_scope() as session:
             record = session.get(PaperTradeRecord, int(trade_id))
@@ -161,11 +181,8 @@ class PaperTradeRepository(BaseRepository[PaperTradeRecord]):
             record.exit_price = price
             record.fee = total_fee
             record.pnl = gross - total_fee
-            record.pnl_percent = (
-                ((price - entry) / entry * 100.0 * direction * float(record.leverage or 1.0))
-                if entry
-                else 0.0
-            )
+            margin = entry * float(record.quantity or 0.0) / float(record.leverage or 1.0)
+            record.pnl_percent = record.pnl / margin * 100.0 if margin > 0 else 0.0
             record.status = "closed"
             record.closed_at = _utcnow()
             if note:

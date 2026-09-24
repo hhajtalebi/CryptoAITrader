@@ -32,6 +32,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -310,6 +311,12 @@ class ManagedTrade:
         """سود یا زیان فعلی به دلار."""
         return (price - self.entry_price) * self.direction_sign * self.quantity
 
+    def net_unrealised(self, price: float) -> float:
+        """برآورد خالص پس از کارمزد ورود و خروج در قیمت فعلی."""
+        rate = float(self.extra.get("fee_rate", 0.0) or 0.0)
+        entry_fee = float(self.extra.get("entry_fee", self.quantity * self.entry_price * rate))
+        return self.unrealised(price) - entry_fee - self.quantity * price * rate
+
     def used_margin(self) -> float:
         """مارجین اشغال‌شده — مارجین واقعی یا برآیندِ config پایه."""
         if self.margin > 0:
@@ -332,7 +339,7 @@ class ManagedTrade:
         else:
             self.extreme_price = min(self.extreme_price, price)
 
-        profit = (price - self.entry_price) * self.direction_sign * self.quantity
+        profit = self.net_unrealised(price)
 
         # --- سر‌به‌سر: بعد از پوشش هزینه‌ها حد ضرر به ورود می‌رود ---
         if (
@@ -341,8 +348,10 @@ class ManagedTrade:
             and profit >= config.break_even_trigger
         ):
             fees = float(self.extra.get("round_trip_fee", 0.0) or 0.0)
-            cover = fees / self.quantity if self.quantity > 0 else 0.0
-            self.effective_stop = self.entry_price + self.direction_sign * cover
+            rate = float(self.extra.get("fee_rate", 0.0) or 0.0)
+            cover = fees / (self.quantity * (1 - self.direction_sign * rate)) if self.quantity > 0 else 0.0
+            stop = self.entry_price + self.direction_sign * cover
+            self.effective_stop = max(self.effective_stop, stop) if self.is_long else min(self.effective_stop, stop)
             self.break_even_armed = True
             events.append("break_even_armed")
 
@@ -432,9 +441,14 @@ class AutoTrader:
         self._invalidation_source = invalidation_source
 
         self._open: dict[int, ManagedTrade] = {}
+        self._entry_lock = asyncio.Lock()
+        self._closing: set[int] = set()
+        self._scan_task: asyncio.Task | None = None
+        self._last_rejections: dict[str, str] = {}
         self._running = False
         self._task: asyncio.Task[None] | None = None
         self._realised_today = 0.0
+        self._pnl_date = datetime.now(UTC).date()
         self._listeners: list[Callable[[str, dict[str, Any]], None]] = []
         self._halted_reason = ""
         self._tick_engine: Any | None = None
@@ -454,6 +468,10 @@ class AutoTrader:
         ذخیرهٔ عددهای تازه تا ری‌استارت موتور بی‌اثر می‌ماند.
         """
         self.config = config.validated()
+        if self._tick_engine is not None:
+            # سن مجاز داده در cache متصل هم نگهداری می‌شود؛ ذخیرهٔ تنظیم
+            # نباید فقط config را عوض کند و محافظ STALE روی عدد قدیمی بماند.
+            self._tick_engine.stale_after_ms = self.config.stale_after_seconds * 1000.0
 
     def attach_tick_engine(self, tick_engine: Any) -> None:
         """
@@ -463,6 +481,7 @@ class AutoTrader:
         می‌سنجد؛ هیچ تایمری در میان نیست.
         """
         self._tick_engine = tick_engine
+        tick_engine.stale_after_ms = self.config.stale_after_seconds * 1000.0
         tick_engine.add_listener(self._on_tick)
 
     # ---- وضعیت ------------------------------------------------------
@@ -547,13 +566,15 @@ class AutoTrader:
         """
         try:
             symbol = str(getattr(quote, "symbol", "") or "")
+            if self._is_stale(symbol):
+                return
             managed_trades = [t for t in self._open.values() if t.symbol == symbol]
             for managed in managed_trades:
                 price = self._exit_price_for(managed, quote)
                 if price > 0:
                     managed.mark(price, self.config)
 
-            if not managed_trades or not self._running:
+            if not managed_trades:
                 return
             if symbol in self._tick_check_pending:
                 return  # بررسی همین نماد در صف است؛ تکرار نکن
@@ -566,11 +587,17 @@ class AutoTrader:
 
     def _schedule_tick_check(self, symbol: str) -> None:
         """اجرای بررسی فوری نماد بیرون از مسیر شنونده."""
-        self._tick_check_pending.discard(symbol)
+        async def check():
+            try:
+                await self.check_symbol(symbol)
+            except Exception:
+                logger.exception("Tick exit check failed for %s", symbol)
+            finally:
+                self._tick_check_pending.discard(symbol)
         try:
-            asyncio.ensure_future(self.check_symbol(symbol))
-        except RuntimeError:  # حلقه بسته شده — موتور هم خاموش است
-            pass
+            asyncio.create_task(check())
+        except RuntimeError:
+            self._tick_check_pending.discard(symbol)
 
     def _exit_price_for(self, managed: ManagedTrade, quote: Any) -> float:
         """قیمت خروج واقعی از تیک (Bid/Ask) با لغزش علیه ما."""
@@ -620,7 +647,7 @@ class AutoTrader:
                 "data_age_ms": getattr(quote, "age_ms", None),
             }
         else:
-            entry = float(await self._price_source(symbol) or 0.0)
+            entry = float(await asyncio.wait_for(self._price_source(symbol), timeout=5.0) or 0.0)
         if entry <= 0:
             return 0.0, info
         slip = self.config.slippage_percent / 100.0
@@ -632,12 +659,17 @@ class AutoTrader:
         """قیمت خروج واقعی — Bid برای LONG و Ask برای SHORT + لغزش."""
         if self._tick_engine is not None:
             quote = self._tick_engine.get(managed.symbol)
-            if quote is not None:
+            if quote is not None and not self._is_stale(managed.symbol):
                 price = self._exit_price_for(managed, quote)
                 if price > 0:
                     managed.last_tick_ms = time.time() * 1000.0
                     return price
-        price = float(await self._price_source(managed.symbol) or 0.0)
+        price = float(await asyncio.wait_for(self._price_source(managed.symbol), timeout=5.0) or 0.0)
+        if self._tick_engine is not None:
+            if self._is_stale(managed.symbol):
+                return 0.0
+            quote = self._tick_engine.get(managed.symbol)
+            return self._exit_price_for(managed, quote)
         if price <= 0:
             return 0.0
         slip = self.config.slippage_percent / 100.0
@@ -653,7 +685,15 @@ class AutoTrader:
 
         این آخرین خط دفاع در برابر یک روز بد است.
         """
-        if self._realised_today <= -abs(self.config.daily_loss_limit):
+        today = datetime.now(UTC).date()
+        if today != self._pnl_date:
+            self._pnl_date = today
+            self._realised_today = 0.0
+        total = self._realised_today
+        persisted = getattr(self._repo, "daily_realised_pnl", None)
+        if callable(persisted):
+            total = float(persisted(self._user_id))
+        if total <= -abs(self.config.daily_loss_limit):
             self._halted_reason = (
                 f"سقف زیان روزانه ({self.config.daily_loss_limit} دلار) رد شد"
             )
@@ -667,7 +707,7 @@ class AutoTrader:
         try:
             return bool(self._tick_engine.is_stale(symbol))
         except Exception:  # noqa: BLE001
-            return False
+            return True
 
     def _notify_stale_if_new(self, symbol: str) -> None:
         """اعلام STALE فقط یک‌بار در هر بازهٔ کوتاه — نه هر دور پویش."""
@@ -689,7 +729,7 @@ class AutoTrader:
         کم و تضاد روند هرکدام جدا گزارش می‌شوند تا UI بتواند دلیلِ
         «چرا معامله باز نشد» را صادقانه نشان دهد.
         """
-        symbol = str(getattr(candidate, "symbol", "") or "")
+        symbol = str(getattr(candidate, "symbol", "") or "").strip().upper()
         config = self.config
 
         if self._is_stale(symbol):
@@ -741,6 +781,8 @@ class AutoTrader:
                 "برای معاملهٔ واقعی باید عبارت تأیید را دقیقاً وارد کنید: "
                 f"«{LIVE_CONFIRMATION_PHRASE}»"
             )
+        if not self._check_daily_limit():
+            return False, self._halted_reason
         if config.max_loss <= 0:
             return False, "حد ضرر باید بزرگ‌تر از صفر باشد"
         if config.target_profit <= 0:
@@ -790,7 +832,30 @@ class AutoTrader:
             margin = config.margin_per_trade
         return max(0.0, min(margin, available, cap))
 
+    def rejection_reason(self, symbol: str) -> str:
+        return self._last_rejections.get(symbol.upper(), "rejected_by_guards")
+
     async def open_trade(self, candidate: Any) -> ManagedTrade | None:
+        """ظرفیت و ورود تکراری زیر قفل مشترک دستی/خودکار دوباره بررسی می‌شوند."""
+        # Slow quote I/O must not hold the portfolio lock and delay a fresh manual entry.
+        symbol = str(getattr(candidate, "symbol", "") or "").strip().upper()
+        if symbol and self._tick_engine is not None and self._is_stale(symbol):
+            reason = ""
+            try:
+                await asyncio.wait_for(self._price_source(symbol), timeout=5.0)
+                if self._is_stale(symbol):
+                    reason = "stale_data"
+            except Exception:
+                reason = "price_unavailable"
+            if reason:
+                self._last_rejections[symbol] = reason
+                self._emit("rejected", {"symbol": symbol, "reason": reason})
+                self._record_opportunity(candidate, decision="skip", reason=reason)
+                return None
+        async with self._entry_lock:
+            return await self._open_trade_locked(candidate)
+
+    async def _open_trade_locked(self, candidate: Any) -> ManagedTrade | None:
         """
         باز کردن یک معامله بر پایهٔ نامزد.
 
@@ -798,19 +863,35 @@ class AutoTrader:
         واقعی نمی‌رود. نامزد رد‌شده هرگز بی‌صدا دور ریخته نمی‌شود —
         رویداد `rejected` با دلیل صریح منتشر می‌شود.
         """
-        symbol = str(getattr(candidate, "symbol", "") or "")
+        symbol = str(getattr(candidate, "symbol", "") or "").strip().upper()
         direction = str(getattr(candidate, "direction", "LONG")).upper()
         side = "long" if direction == "LONG" else "short"
         confidence = float(getattr(candidate, "score", 0.0) or 0.0)
 
         def reject(reason: str) -> None:
+            self._last_rejections[symbol.upper()] = reason
             self._emit("rejected", {"symbol": symbol, "reason": reason})
             self._record_opportunity(candidate, decision="skip", reason=reason)
 
-        if len(self._open) >= self.config.max_concurrent:
+        if not symbol or direction not in {"LONG", "SHORT"} or not math.isfinite(confidence):
+            reject("invalid_candidate")
+            return None
+        observed_at = float(getattr(candidate, "observed_at", 0) or 0)
+        if observed_at and time.time() - observed_at > max(60, 2 * self.config.scan_interval_seconds):
+            reject("stale_candidate")
+            return None
+        if any(t.symbol.upper() == symbol.upper() for t in self._open.values()):
+            reject("symbol_already_open")
+            return None
+        lookup = getattr(self._repo, "open_trades", None)
+        if callable(lookup) and any(str(r.get("symbol", "")).upper() == symbol.upper() for r in lookup(self._user_id)):
+            reject("symbol_already_open")
+            return None
+        if len(self._open) >= self.config.max_concurrent or int(self.portfolio().get("open_count", 0)) >= self.config.max_concurrent:
             reject("max_concurrent_reached")
             return None
         if not self._check_daily_limit():
+            reject("daily_loss_limit")
             return None
 
         allowed = self._allowed_symbols()
@@ -824,16 +905,19 @@ class AutoTrader:
             return None
 
         margin = self._resolve_margin(candidate, confidence)
-        if margin < 1.0:
+        if not math.isfinite(margin) or margin < 1.0:
             reject("no_available_margin")
             return None
 
         entry, execution = await self._price_for_entry(symbol, side)
-        if entry <= 0:
+        if not math.isfinite(entry) or entry <= 0:
             reject("no_price")
             return None
 
         config = self.config
+        if not math.isfinite(config.fee_rate) or not 0 <= config.fee_rate < 1:
+            reject("invalid_fee_rate")
+            return None
         # نامزد AI می‌تواند اهرم و سطوح خودش را بیاورد (TP/SL از چندک‌ها)
         leverage = float(getattr(candidate, "leverage", 0.0) or 0.0) or config.leverage
         leverage = max(1.0, min(leverage, HARD_MAX_LEVERAGE))
@@ -849,17 +933,44 @@ class AutoTrader:
             config.max_loss,
             config.fee_rate,
         )
+        if plan.round_trip_fee >= config.max_loss:
+            reject("fees_exceed_loss_budget")
+            return None
         quantity = plan.notional / entry
         sign = 1.0 if side == "long" else -1.0
         if candidate_tp > 0:
             target = candidate_tp
         else:
-            target = entry + sign * (plan.gross_target / quantity)
+            target = (entry * sign + (config.target_profit + plan.entry_fee) / quantity) / (sign - config.fee_rate)
         if candidate_sl > 0:
             stop = candidate_sl
         else:
-            stop = entry - sign * (plan.stop_distance / quantity)
+            stop = (entry * sign + (plan.entry_fee - config.max_loss) / quantity) / (sign - config.fee_rate)
 
+        net_reward = (target - entry) * sign * quantity - plan.entry_fee - quantity * target * config.fee_rate
+        net_risk = -(stop - entry) * sign * quantity + plan.entry_fee + quantity * stop * config.fee_rate
+        if not all(math.isfinite(v) and v > 0 for v in (target, stop, quantity)) or (target - entry) * sign <= 0 or (entry - stop) * sign <= 0:
+            reject("invalid_risk_levels")
+            return None
+        if net_risk > config.max_loss + 1e-8:
+            reject("risk_exceeds_loss_budget")
+            return None
+        if net_reward <= 0 or net_reward + 1e-8 < net_risk * min(1.0, config.target_profit / config.max_loss):
+            reject("poor_net_reward_risk")
+            return None
+        portfolio = self.portfolio()
+        balance = float(portfolio.get("balance", 0) or 0)
+        used = float(portfolio.get("used_margin", 0) or 0)
+        if balance > 0 and (used + margin > balance * config.max_total_margin_percent / 100 or margin > balance - used):
+            reject("no_available_margin")
+            return None
+        # Revalidate freshness/spread after awaited I/O.
+        ok, reason = self._check_entry_guards(candidate, side)
+        if not ok:
+            reject(reason)
+            return None
+        if config.mode == "live" and not config.is_live:
+            raise LiveTradingNotEnabledError("تأیید معامله واقعی کامل نیست")
         if config.is_live:
             if self._gateway is None:
                 raise LiveTradingNotEnabledError("درگاه سفارش واقعی تنظیم نشده است")
@@ -886,6 +997,7 @@ class AutoTrader:
                 "target_profit": config.target_profit,
                 "max_loss": config.max_loss,
                 "round_trip_fee": plan.round_trip_fee,
+                "entry_fee": plan.entry_fee,
                 "gross_target": plan.gross_target,
                 "fee_rate": config.fee_rate,
                 "engine_mode": config.engine_mode,
@@ -906,10 +1018,14 @@ class AutoTrader:
             opened_at=datetime.now(UTC),
             mode="live" if config.is_live else "paper",
             margin=margin,
+            extra={"round_trip_fee": plan.round_trip_fee, "entry_fee": plan.entry_fee,
+                   "fee_rate": config.fee_rate},
             entry_bid=float(execution.get("bid", 0.0) or 0.0),
             entry_ask=float(execution.get("ask", 0.0) or 0.0),
         )
         self._open[managed.trade_id] = managed
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(self._loop())
         logger.info(
             "Auto-trade opened %s %s @ %.6f target=%.6f stop=%.6f margin=%.2f lev=%g",
             side, symbol, entry, target, stop, margin, leverage,
@@ -919,12 +1035,24 @@ class AutoTrader:
         return managed
 
     async def close_trade(self, managed: ManagedTrade, reason: str) -> dict[str, Any] | None:
+        """فقط یک خروج در جریان برای هر موقعیت؛ تیک/دکمه/تایمر هم‌زمان مجاز نیست."""
+        if managed.trade_id not in self._open or managed.trade_id in self._closing:
+            return None
+        self._closing.add(managed.trade_id)
+        try:
+            return await self._close_trade_once(managed, reason)
+        finally:
+            self._closing.discard(managed.trade_id)
+
+    async def _close_trade_once(self, managed: ManagedTrade, reason: str) -> dict[str, Any] | None:
         """بستن یک معامله و ثبت نتیجه."""
         price = await self._price_for_exit(managed)
         if price <= 0:
             return None
 
-        if managed.mode == "live" and self._gateway is not None:
+        if managed.mode == "live":
+            if self._gateway is None:
+                raise LiveTradingNotEnabledError("درگاه سفارش واقعی تنظیم نشده است")
             await self._gateway.close_position(
                 symbol=managed.symbol, side=managed.side, quantity=managed.quantity
             )
@@ -932,8 +1060,8 @@ class AutoTrader:
         from trading.micro_plan import exit_fee_from_notional
 
         exit_fee = exit_fee_from_notional(
-            managed.quantity * managed.entry_price,
-            self.config.fee_rate,
+            managed.quantity * price,
+            float(managed.extra.get("fee_rate", self.config.fee_rate)),
         )
         record = self._repo.close_trade(
             managed.trade_id,
@@ -959,18 +1087,29 @@ class AutoTrader:
     async def check_open_trades(self) -> None:
         """پایش fallback همهٔ معامله‌های باز — وقتی تیک نمی‌آید."""
         now = datetime.now(UTC)
-        for managed in list(self._open.values()):
+        async def check(managed):
             try:
-                price = await self._price_source(managed.symbol)
+                price = await self._price_for_exit(managed)
             except Exception:  # noqa: BLE001
                 logger.exception("Price check failed for %s", managed.symbol)
-                continue
+                return
             if price <= 0:
-                continue
+                return
             managed.mark(price, self.config)
             reason = managed.should_close(price, now, self.config.max_hold_seconds)
             if reason:
                 await self.close_trade(managed, reason)
+                return
+            update = getattr(self._repo, "update_live_pnl", None)
+            if callable(update):
+                net = managed.net_unrealised(price)
+                update(managed.trade_id, price=price, pnl=net,
+                       pnl_percent=net / managed.margin * 100 if managed.margin else 0)
+            protection = getattr(self._repo, "update_protection", None)
+            if callable(protection):
+                protection(managed.trade_id, stop_loss=managed.effective_stop)
+
+        await asyncio.gather(*(check(t) for t in list(self._open.values())))
 
     async def check_signal_invalidation(self) -> None:
         """
@@ -1015,7 +1154,7 @@ class AutoTrader:
         نامزدِ رد‌شده نگه داشته می‌شود تا کاربر بتواند از جدول، ورود
         دستی بخواهد؛ همهٔ دروازه‌ها دوباره سنجیده می‌شوند.
         """
-        symbol = str(getattr(candidate, "symbol", "") or "")
+        symbol = str(getattr(candidate, "symbol", "") or "").strip().upper()
         if not symbol:
             return
         ladder = getattr(candidate, "trend_ladder", None)
@@ -1135,6 +1274,14 @@ class AutoTrader:
                 continue
             await self.open_trade(candidate)
 
+    async def _run_scan(self) -> None:
+        try:
+            await self._scan_for_entries()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Candidate scan failed")
+
     async def _loop(self) -> None:
         """
         حلقهٔ پس‌زمینه — فقط پویش و fallback.
@@ -1143,20 +1290,22 @@ class AutoTrader:
         انجام می‌شود. این حلقه حداکثر هر `poll_seconds` بیدار می‌شود
         و ورودها هر `scan_interval_seconds` بررسی می‌شوند.
         """
-        while self._running:
+        while self._running or self._open:
             try:
                 await self.check_open_trades()
                 await self.check_signal_invalidation()
 
                 now = time.monotonic()
                 if (
-                    self._candidate_source is not None
+                    self._running
+                    and (self._scan_task is None or self._scan_task.done())
+                    and self._candidate_source is not None
                     and len(self._open) < self.config.max_concurrent
                     and self._check_daily_limit()
                     and now - self._last_scan_monotonic >= self.config.scan_interval_seconds
                 ):
                     self._last_scan_monotonic = now
-                    await self._scan_for_entries()
+                    self._scan_task = asyncio.create_task(self._run_scan())
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001
@@ -1174,7 +1323,8 @@ class AutoTrader:
         self._running = True
         self._halted_reason = ""
         self._last_scan_monotonic = 0.0
-        self._task = asyncio.create_task(self._loop())
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(self._loop())
         logger.info(
             "Auto-trader started (mode=%s engine=%s)",
             "live" if self.config.is_live else "paper",
@@ -1191,12 +1341,16 @@ class AutoTrader:
         بازار می‌تواند زیان را قفل کند. کاربر خودش تصمیم می‌گیرد.
         """
         self._running = False
-        if self._task is not None:
-            self._task.cancel()
-            try:
-                await self._task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
+        current = asyncio.current_task()
+        if self._scan_task is not None and self._scan_task is not current:
+            if not self._scan_task.done():
+                self._scan_task.cancel()
+                await asyncio.gather(self._scan_task, return_exceptions=True)
+            self._scan_task = None
+        # Stopping automatic entries must not abandon protective exits.
+        # Do not cancel a parent monitor from its own per-position child task.
+        # With no positions the loop exits at its next wake-up.
+        if self._task is not None and self._task.done():
             self._task = None
         logger.info("Auto-trader stopped (%d open trades left)", len(self._open))
         self._emit("stopped", {"open": len(self._open)})

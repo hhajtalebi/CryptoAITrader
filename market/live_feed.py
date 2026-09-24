@@ -30,7 +30,19 @@ from market.engine import MarketDataEngine
 logger = get_logger(__name__)
 
 #: فاصله زمانی نظرسنجی REST برای کل بازار (ثانیه)
-DEFAULT_POLL_INTERVAL = 2.0
+DEFAULT_POLL_INTERVAL = 3.0
+
+#: حداکثر عمر فهرست کامل تیکرها که از کش مشترک پذیرفته می‌شود (ثانیه).
+#: فهرست همهٔ نمادها سنگین‌ترین endpoint عمومی صرافی است؛ نسخهٔ 2.3.0 آن
+#: را هر ۲ ثانیه بدون کش می‌خواند و کش بقیهٔ صفحه‌ها را هم بی‌اثر می‌کرد —
+#: ترافیک چند برابر، محدودیت نرخ صرافی و «چند ثانیه آنلاین، بعد قطع».
+SNAPSHOT_MAX_AGE = 5.0
+
+#: داده‌ای که از این قدیمی‌تر باشد «تازه» حساب نمی‌شود (ثانیه).
+FRESHNESS_WINDOW = 20.0
+
+#: سقف مکث پس از شکست‌های پیاپی — بازگشت پس از قطعی نباید دقیقه‌ها طول بکشد.
+MAX_POLL_BACKOFF = 30.0
 
 #: بیشینه نمادهایی که هم‌زمان روی WebSocket مشترک می‌شوند
 MAX_STREAMED_SYMBOLS = 80
@@ -54,6 +66,9 @@ class PriceUpdate:
     tick_direction: int = 0  # +1 بالا، -1 پایین، 0 بدون تغییر
     updated_at: datetime = field(default_factory=now_utc)
     source: str = "rest"
+    exchange_ts: int = 0
+    #: قیمت یا تغییر ۲۴ساعته نسبت به قبل عوض شده (برای بازترسیم جدول‌ها)
+    changed: bool = True
 
     @property
     def is_up(self) -> bool:
@@ -90,7 +105,10 @@ class LivePriceFeed:
         self._streamed: list[str] = []
         self._running = False
         self._last_poll_ok: datetime | None = None
+        self._last_stream_ok: datetime | None = None
+        self._last_batch: object | None = None
         self._consecutive_failures = 0
+        self._last_error = ""
 
     # ------------------------------------------------------------------
     # چرخه عمر
@@ -142,10 +160,20 @@ class LivePriceFeed:
         این معیارِ «آنلاین بودن» است که به کاربر نشان داده می‌شود: مهم این
         نیست که سوکتی باز باشد، مهم این است که قیمت‌ها واقعاً به‌روز شوند.
         """
-        if self._last_poll_ok is None:
-            return False
-        age = (now_utc() - self._last_poll_ok).total_seconds()
-        return age < self._poll_interval * 4
+        window = max(FRESHNESS_WINDOW, self._poll_interval * 4)
+        now = now_utc()
+        for stamp in (self._last_poll_ok, self._last_stream_ok):
+            if stamp is not None and (now - stamp).total_seconds() < window:
+                return True
+        return False
+
+    @property
+    def data_age_seconds(self) -> float | None:
+        """سن تازه‌ترین دادهٔ رسیده از REST یا WebSocket."""
+        stamps = [s for s in (self._last_poll_ok, self._last_stream_ok) if s is not None]
+        if not stamps:
+            return None
+        return max(0.0, (now_utc() - max(stamps)).total_seconds())
 
     # ------------------------------------------------------------------
     # اشتراک‌ها
@@ -217,8 +245,8 @@ class LivePriceFeed:
         """
         ثبت یک تیکر در انبار و محاسبه جهت تیک.
 
-        اگر قیمت تغییر نکرده باشد `None` برمی‌گردد تا رابط کاربری بیهوده
-        بازترسیم نشود.
+        تیک واقعیِ بدون تغییر قیمت نیز زمان دریافت تازه دارد؛ حذف آن
+        نباید قیمت معتبر را در کش اجرا کهنه نشان دهد.
         """
         previous = self._prices.get(ticker.symbol)
         price = float(ticker.last_price or 0.0)
@@ -226,13 +254,16 @@ class LivePriceFeed:
             return None
 
         direction = 0
+        changed = True
         if previous is not None:
             if price > previous.price:
                 direction = 1
             elif price < previous.price:
                 direction = -1
-            elif abs((ticker.change_percent or 0.0) - previous.change_percent) < 1e-9:
-                return None  # هیچ چیز عوض نشده
+            else:
+                # تیک واقعی بدون تغییر هم نشانهٔ تازگی است، ولی نیازی به
+                # بازترسیم جدول ندارد.
+                changed = abs((ticker.change_percent or 0.0) - previous.change_percent) >= 1e-9
 
         update = PriceUpdate(
             symbol=ticker.symbol,
@@ -243,6 +274,8 @@ class LivePriceFeed:
             volume_24h=float(ticker.volume_24h or 0.0),
             tick_direction=direction,
             source=source,
+            exchange_ts=ticker.timestamp,
+            changed=changed,
         )
         self._prices[ticker.symbol] = update
         return update
@@ -251,6 +284,7 @@ class LivePriceFeed:
         """دریافت تیک زنده از WebSocket."""
         update = self._store(ticker, source="websocket")
         if update is not None:
+            self._last_stream_ok = update.updated_at
             self._notify({update.symbol: update})
 
     async def _poll_loop(self) -> None:
@@ -262,19 +296,36 @@ class LivePriceFeed:
         """
         while self._running:
             try:
-                tickers = await self._market.get_all_tickers()
+                tickers = await self._market.get_all_tickers(max_age_seconds=SNAPSHOT_MAX_AGE)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - قطعی شبکه عادی است
                 self._consecutive_failures += 1
+                self._last_error = type(exc).__name__
                 logger.debug("Price poll failed (%d in a row): %s", self._consecutive_failures, exc)
-                # عقب‌نشینی تدریجی تا در قطعی طولانی، صرافی را بمباران نکنیم
-                backoff = min(self._poll_interval * (2 ** min(self._consecutive_failures, 4)), 60.0)
+                # عقب‌نشینی تدریجی تا در قطعی طولانی، صرافی را بمباران نکنیم؛
+                # اگر صرافی زمان مکث را گفته، دقیقاً همان رعایت می‌شود.
+                backoff = min(self._poll_interval * (2 ** min(self._consecutive_failures, 4)), MAX_POLL_BACKOFF)
+                details = getattr(exc, "details", None) or {}
+                try:
+                    hinted = float(details.get("retry_after") or 0) if isinstance(details, dict) else 0.0
+                except (TypeError, ValueError):
+                    hinted = 0.0
+                if hinted > 0:
+                    backoff = max(1.0, min(hinted, 300.0))
                 await asyncio.sleep(backoff)
                 continue
 
             self._consecutive_failures = 0
-            self._last_poll_ok = now_utc()
+            self._last_error = ""
+            if tickers is self._last_batch:
+                # همان فهرستِ کش‌شدهٔ قبلی؛ دوباره ثبت نمی‌شود تا سنِ داده
+                # جوان‌تر از واقعیت نشان داده نشود.
+                await asyncio.sleep(self._poll_interval)
+                continue
+            self._last_batch = tickers
+            fetched = getattr(self._market, "all_tickers_fetched_at", None)
+            self._last_poll_ok = fetched if isinstance(fetched, datetime) else now_utc()
             changed: dict[str, PriceUpdate] = {}
             for ticker in tickers:
                 # تیک WebSocket تازه‌تر از نظرسنجی است؛ رویش را ننویس
@@ -285,6 +336,7 @@ class LivePriceFeed:
                         continue
                 update = self._store(ticker, source="rest")
                 if update is not None:
+                    update.updated_at = self._last_poll_ok
                     changed[update.symbol] = update
 
             self._notify(changed)
@@ -303,5 +355,8 @@ class LivePriceFeed:
             "websocket": websocket is ConnectionStatus.CONNECTED,
             "websocket_status": websocket.value,
             "last_update": self._last_poll_ok,
+            "last_stream": self._last_stream_ok,
+            "data_age": self.data_age_seconds,
             "failures": self._consecutive_failures,
+            "last_error": self._last_error,
         }
