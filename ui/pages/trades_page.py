@@ -49,7 +49,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from trading.auto_trader import HARD_MAX_LEVERAGE
+from trading.auto_trader import HARD_MAX_CONCURRENT, HARD_MAX_LEVERAGE
 
 from localization import Translator
 from ui.charts import PriceChart
@@ -80,6 +80,7 @@ AUTO_ENGINE_MODES = (
     ("selected", "trades.auto.mode_selected"),
     ("scan", "trades.auto.mode_scan"),
     ("ai", "trades.auto.mode_ai"),
+    ("ultra", "trades.auto.mode_ultra"),
 )
 
 #: ستون‌های جدول فرصت‌ها — ترمینال حرفه‌ای (v2.1)
@@ -405,6 +406,10 @@ class TradesPage(BasePage):
         self.auto_automatic_button = make_button(self.tr_.tr("trades.auto.automatic"))
         self.auto_automatic_button.clicked.connect(self._emit_automatic_profile)
         top.addWidget(self.auto_automatic_button)
+        self.auto_ultra_button = make_button("⚡ " + self.tr_.tr("trades.auto.ultra_preset"))
+        self.auto_ultra_button.setToolTip(self.tr_.tr("trades.auto.ultra_preset_hint"))
+        self.auto_ultra_button.clicked.connect(self._emit_ultra_profile)
+        top.addWidget(self.auto_ultra_button)
         layout.addLayout(top)
 
         # --- نوار حالت‌ها (خواستهٔ §۳) ---
@@ -489,7 +494,7 @@ class TradesPage(BasePage):
 
         self.auto_liquidity_input = _spin(0.0, 100_000_000.0, 100_000.0, 0)
         self.auto_spread_input = _spin(0.0, 5.0, 0.01)
-        self.auto_scan_interval_input = _spin(3.0, 3600.0, 1.0)
+        self.auto_scan_interval_input = _spin(1.0, 3600.0, 1.0)
         self.auto_stale_input = _spin(1.0, 300.0, 1.0)
         self.auto_slippage_input = _spin(0.0, 1.0, 0.01)
         self.auto_trailing_check = QCheckBox()
@@ -1119,8 +1124,15 @@ class TradesPage(BasePage):
         self.auto_confirm_input.setPlaceholderText(self.tr_.tr("trades.auto.confirm_placeholder"))
 
         self.auto_concurrent_input = QSpinBox()
-        self.auto_concurrent_input.setRange(1, 10)
+        self.auto_concurrent_input.setRange(1, int(HARD_MAX_CONCURRENT))
         self.auto_concurrent_input.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        # نسخهٔ ۲.۵.۴: بیشترین زمان باز ماندن هر معامله (ثانیه)
+        self.auto_hold_input = QSpinBox()
+        self.auto_hold_input.setRange(10, 86_400)
+        self.auto_hold_input.setSingleStep(10)
+        self.auto_hold_input.setSuffix(" s")
+        self.auto_hold_input.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self.auto_confidence_input = QSpinBox()
         self.auto_confidence_input.setRange(50, 99)
@@ -1137,6 +1149,7 @@ class TradesPage(BasePage):
             ("trades.auto.max_loss", self.auto_loss_input),
             ("trades.auto.leverage", self.auto_leverage_input),
             ("trades.auto.concurrent", self.auto_concurrent_input),
+            ("trades.auto.max_hold", self.auto_hold_input),
             ("trades.auto.min_confidence", self.auto_confidence_input),
             ("trades.auto.source", self.auto_source_combo),
             ("trades.auto.poll", self.auto_poll_input),
@@ -1173,6 +1186,7 @@ class TradesPage(BasePage):
         self.auto_loss_input.setValue(float(values.get("scalp.max_loss", 3.0)))
         self.auto_leverage_input.setValue(int(values.get("scalp.leverage", 10)))
         self.auto_concurrent_input.setValue(int(values.get("scalp.max_concurrent", 3)))
+        self.auto_hold_input.setValue(int(float(values.get("scalp.max_hold_seconds", 900) or 900)))
         self.auto_confidence_input.setValue(int(values.get("scalp.min_confidence", 75)))
         index = self.auto_source_combo.findData(
             str(values.get("scalp.candidate_source", "confidence"))
@@ -1239,6 +1253,7 @@ class TradesPage(BasePage):
             "scalp.max_loss": self.auto_loss_input.value(),
             "scalp.leverage": self.auto_leverage_input.value(),
             "scalp.max_concurrent": self.auto_concurrent_input.value(),
+            "scalp.max_hold_seconds": self.auto_hold_input.value(),
             "scalp.min_confidence": self.auto_confidence_input.value(),
             "scalp.candidate_source": self.auto_source_combo.currentData(),
             "scalp.poll_seconds": self.auto_poll_input.value(),
@@ -1284,6 +1299,50 @@ class TradesPage(BasePage):
         payload["scalp.max_hold_seconds"] = 90
         payload["scalp.taker_fee_rate"] = 0.0006
         payload["scalp.settings_mode"] = "automatic"
+        self.auto_settings_changed.emit(payload)
+
+    #: پیش‌تنظیم اسکالپ فوق‌سریع (همه در تنظیم دستی قابل تغییرند)
+    ULTRA_PRESET = {
+        "scalp.engine_mode": "ultra",
+        "scalp.margin_per_trade": 10.0,
+        "scalp.leverage": 50,
+        "scalp.target_profit": 2.0,
+        "scalp.max_loss": 2.0,
+        "scalp.max_concurrent": 100,
+        "scalp.max_hold_seconds": 180,
+        "scalp.poll_seconds": 0.5,
+        "scalp.scan_interval_seconds": 1.0,
+        "scalp.max_total_margin_percent": 100.0,
+        "scalp.allocation_mode": "fixed",
+        "scalp.taker_fee_rate": 0.0006,
+    }
+
+    def _emit_ultra_profile(self) -> None:
+        """
+        اسکالپ فوق‌سریع: ۱۰ دلار × اهرم ۵۰، بستن در سود خالص ۲ دلار، تا ۱۰۰ هم‌زمان.
+
+        مثل «خودکار»، حالت سفارش (کاغذی/واقعی) و عبارت تأیید دست نمی‌خورند.
+        """
+        preset = dict(self.ULTRA_PRESET)
+        self.auto_margin_input.setValue(preset["scalp.margin_per_trade"])
+        self.auto_leverage_input.setValue(int(preset["scalp.leverage"]))
+        self.auto_target_input.setValue(preset["scalp.target_profit"])
+        self.auto_loss_input.setValue(preset["scalp.max_loss"])
+        self.auto_concurrent_input.setValue(int(preset["scalp.max_concurrent"]))
+        self.auto_hold_input.setValue(int(preset["scalp.max_hold_seconds"]))
+        self.auto_poll_input.setValue(preset["scalp.poll_seconds"])
+        self.auto_scan_interval_input.setValue(preset["scalp.scan_interval_seconds"])
+        self.auto_max_margin_input.setValue(preset["scalp.max_total_margin_percent"])
+        index = self.auto_engine_mode_combo.findData("ultra")
+        if index >= 0:
+            self.auto_engine_mode_combo.blockSignals(True)
+            self.auto_engine_mode_combo.setCurrentIndex(index)
+            self.auto_engine_mode_combo.blockSignals(False)
+        payload = self.collect_auto_settings()
+        payload.update(preset)
+        payload.pop("scalp.mode", None)
+        payload.pop("scalp.live_confirmation", None)
+        payload["scalp.settings_mode"] = "ultra"
         self.auto_settings_changed.emit(payload)
 
     def _on_auto_toggle(self) -> None:

@@ -127,9 +127,29 @@ def run_gui() -> int:
     # خاموشی تمیز: بستن اتصال‌های شبکه پیش از پایان برنامه
     qt_app.aboutToQuit.connect(controller.shutdown)
 
+    # نسخهٔ ۲.۵.۴: ضربان نشست. اگر نشست قبلی ناگهان بسته شده باشد، کاربر
+    # می‌بیند کی و بعد از چند ساعت؛ علت در data/logs/app.log و crash.log است.
+    from PySide6.QtCore import QTimer
+
+    from app.diagnostics import SessionMonitor, install_qt_message_handler
+
+    install_qt_message_handler()
+    monitor = SessionMonitor(application.paths.logs_dir)
+    monitor.set_extra_provider(controller.health_counters)
+    previous = monitor.start()
+    heartbeat = QTimer(qt_app)
+    heartbeat.setInterval(60_000)
+    heartbeat.timeout.connect(lambda: controller.log_health(monitor.heartbeat()))
+    heartbeat.start()
+    qt_app.aboutToQuit.connect(monitor.mark_clean_exit)
+
     window.show()
     controller.start()
-    return qt_app.exec()
+    if previous is not None:
+        QTimer.singleShot(4_000, lambda: controller.report_unclean_exit(previous))
+    exit_code = qt_app.exec()
+    logger.info("Application exited with code %s", exit_code)
+    return exit_code
 
 
 def main() -> int:
@@ -140,7 +160,22 @@ def main() -> int:
     parser.add_argument("--log-level", default="INFO", help="Logging level")
     args = parser.parse_args()
 
-    configure_logging(level=args.log_level)
+    # نسخهٔ ۲.۵.۴: exe بدون کنسول stdout/stderr ندارد و برنامه هیچ فایل لاگی
+    # نمی‌نوشت؛ هر خطای کشنده بی‌رد می‌ماند. حالا همیشه data/logs/app.log.
+    from app.core.paths import app_paths
+    from app.diagnostics import install_crash_handlers, protect_std_streams
+
+    has_console = sys.stdout is not None
+    protect_std_streams()
+    configure_logging(
+        level=args.log_level,
+        log_file=app_paths.logs_dir / "app.log",
+        console=has_console,
+        max_bytes=5 * 1024 * 1024,
+    )
+    crash_log = install_crash_handlers(app_paths.logs_dir)
+    logger.info("%s v%s starting (log: %s, crash log: %s)", APP_NAME, APP_VERSION,
+                app_paths.logs_dir / "app.log", crash_log)
 
     if args.check:
         return asyncio.run(run_check())

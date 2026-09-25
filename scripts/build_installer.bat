@@ -1,4 +1,4 @@
-﻿@echo off
+@echo off
 chcp 65001 >nul 2>&1
 REM ======================================================================
 REM   ربات ساخت فایل نصبی ویندوز - Crypto AI Trader
@@ -9,7 +9,9 @@ REM   پیش نیازها:
 REM     * Python 3.11+  (هنگام نصب "Add Python to PATH" را بزنید)
 REM     * Inno Setup 6  (https://jrsoftware.org/isdl.php)
 REM
-REM   رد کردن آزمون ها:  scripts\build_installer.bat --skip-tests
+REM   آزمون هاي كامل پيش فرض اجرا نمي شوند (فقط بررسي سلامت بدون پنجره).
+REM   اجراي آزمون هاي كامل (بي پنجره):  scripts\build_installer.bat --with-tests
+REM   نكته: اين فايل عمدا بدون BOM ذخيره شده؛ BOM باعث مي شد @echo off اجرا نشود.
 REM ======================================================================
 setlocal EnableDelayedExpansion
 cd /d "%~dp0.."

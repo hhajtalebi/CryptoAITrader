@@ -1,4 +1,4 @@
-﻿@echo off
+@echo off
 chcp 65001 >nul 2>&1
 REM ======================================================================
 REM   ربات ساخت APK - Crypto AI Trader Mobile
@@ -12,6 +12,9 @@ REM     مدير اجرا كنيد:   wsl --install -d Ubuntu
 REM
 REM   اولين ساخت 40 تا 90 دقيقه طول مي كشد (دانلود NDK و SDK).
 REM   ساخت هاي بعدي چند دقيقه اند.
+REM
+REM   نسخه 2.5.3: ساخت روي فايل سيستم لينوكس (~/cryptoaitrader-apk)،
+REM   خروجي زنده و گزارش كامل در build_logs. اين فايل عمدا بدون BOM است.
 REM ======================================================================
 setlocal EnableDelayedExpansion
 cd /d "%~dp0.."
@@ -23,7 +26,11 @@ echo ======================================================================
 echo.
 
 set "PY_CMD="
-py -3 --version >nul 2>&1 && set "PY_CMD=py -3"
+REM  نسخه 2.5.3: پايتون محيط مجازي پروژه (numpy/pandas/pytest دارد) مقدم است.
+if exist ".venv\Scripts\python.exe" set "PY_CMD=.venv\Scripts\python.exe"
+if not defined PY_CMD (
+    py -3 --version >nul 2>&1 && set "PY_CMD=py -3"
+)
 if not defined PY_CMD (
     python --version >nul 2>&1 && set "PY_CMD=python"
 )
@@ -46,8 +53,9 @@ if errorlevel 1 (
     echo   بعد از آن، يك بار داخل WSL اين ها را نصب كنيد:
     echo.
     echo       sudo apt update
-    echo       sudo apt install -y python3-pip openjdk-17-jdk zip unzip autoconf libtool pkg-config zlib1g-dev libncurses-dev cmake libffi-dev libssl-dev git
-    echo       pip3 install --user buildozer cython
+    echo       sudo apt install -y python3-pip python3-venv openjdk-17-jdk zip unzip autoconf libtool pkg-config zlib1g-dev libncurses-dev cmake libffi-dev libssl-dev git build-essential lld
+    echo.
+    echo   buildozer را خود ربات داخل WSL نصب مي كند.
     echo.
     goto :fail
 )

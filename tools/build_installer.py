@@ -7,7 +7,11 @@
 چه می‌کند؟
     ۱. نسخه را از `app/core/constants.py` می‌خواند (یک منبع حقیقت).
     ۲. وابستگی‌ها را نصب می‌کند.
-    ۳. آزمون‌ها را اجرا می‌کند — با شکست آزمون، ساخت متوقف می‌شود.
+    ۳. بررسی سلامت کد بدون باز کردن هیچ پنجره (کامپایل همهٔ ماژول‌ها و
+       بارگذاری برنامه با Qt بی‌صفحه). آزمون‌های کامل فقط با
+       `--with-tests` و همیشه بی‌پنجره اجرا می‌شوند (نسخهٔ ۲.۵.۳: قبلاً
+       همهٔ آزمون‌ها روی دسکتاپ واقعی اجرا می‌شد و صدها پنجره باز می‌کرد؛
+       هر آزمون وابسته به محیط، ساخت را پیش از PyInstaller می‌کشت).
     ۴. با PyInstaller فایل اجرایی می‌سازد.
     ۵. با Inno Setup فایل نصبی می‌سازد.
     ۶. یک فایل `latest.json` کنار خروجی می‌گذارد تا ربات به‌روزرسانی
@@ -30,12 +34,22 @@ import json
 import os
 import re
 import shutil
-import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import IO
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from tools.build_common import headless_env, open_log, run_streaming, summarize  # noqa: E402
+
+#: بارگذاری برنامه بدون پنجره — خطای import/وابستگی را پیش از PyInstaller می‌گیرد.
+SMOKE_CODE = (
+    "import main, app.application, ui.controllers.main_controller, "
+    "signals.compute_pool; print('smoke ok')"
+)
 
 #: جاهایی که Inno Setup معمولاً نصب می‌شود.
 ISCC_CANDIDATES = (
@@ -162,24 +176,32 @@ def write_manifest(destination: Path, version: str, installer: Path | None) -> P
     return destination
 
 
-def _run(command: list[str], step: BuildStep, cwd: Path) -> bool:
-    """اجرای یک فرمان و ثبت نتیجه در گام."""
-    try:
-        completed = subprocess.run(  # noqa: S603
-            command, cwd=str(cwd), capture_output=True, text=True, timeout=3600
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        step.detail = f"{exc.__class__.__name__}: {exc}"
-        return False
-    step.ok = completed.returncode == 0
+_LOG: IO[str] | None = None
+
+
+def _run(
+    command: list[str], step: BuildStep, cwd: Path, *, env: dict[str, str] | None = None
+) -> bool:
+    """اجرای یک فرمان با خروجی زنده و ثبت نتیجه در گام."""
+    print(f"\n>>> {step.name}", flush=True)
+    code, tail = run_streaming(command, cwd=cwd, env=env, log=_LOG, timeout=3600)
+    step.ok = code == 0
     if not step.ok:
-        tail = (completed.stderr or completed.stdout or "").strip().splitlines()
-        step.detail = " | ".join(tail[-4:])[:400]
+        step.detail = summarize(tail) or f"exit code {code}"
     return step.ok
 
 
-def build(*, skip_tests: bool = False, root: Path | None = None) -> BuildReport:
-    """اجرای کامل زنجیرهٔ ساخت."""
+def build(
+    *, skip_tests: bool = True, root: Path | None = None, run_tests: bool | None = None
+) -> BuildReport:
+    """
+    اجرای کامل زنجیرهٔ ساخت.
+
+    پیش‌فرض: بدون آزمون‌های کامل (`run_tests=True` یا `skip_tests=False`
+    برای اجرای آن‌ها، همیشه بی‌پنجره).
+    """
+    if run_tests is None:
+        run_tests = not skip_tests
     base = root or PROJECT_ROOT
     report = BuildReport(version=read_version(base))
     python = sys.executable
@@ -192,12 +214,24 @@ def build(*, skip_tests: bool = False, root: Path | None = None) -> BuildReport:
     if not deps.ok:
         return report
 
-    tests = BuildStep("اجرای آزمون‌ها")
-    if skip_tests:
+    smoke = BuildStep("بررسی سلامت کد (بدون پنجره)")
+    smoke.ok = _run(
+        [python, "-m", "compileall", "-q", "-x", r"(\.venv|build|dist|mobile|\.cache)", "."],
+        smoke, base,
+    ) and _run([python, "-c", SMOKE_CODE], smoke, base, env=headless_env())
+    report.steps.append(smoke)
+    if not smoke.ok:
+        return report
+
+    tests = BuildStep("اجرای آزمون‌ها (بی‌پنجره)")
+    if not run_tests:
         tests.skipped = True
-        tests.detail = "با درخواست کاربر رد شد"
+        tests.detail = "پیش‌فرض رد می‌شود؛ برای اجرا: --with-tests"
     else:
-        tests.ok = _run([python, "-m", "pytest", "tests", "-q"], tests, base)
+        tests.ok = _run(
+            [python, "-m", "pytest", "tests", "-q", "-p", "no:cacheprovider"],
+            tests, base, env=headless_env(),
+        )
     report.steps.append(tests)
     if not (tests.ok or tests.skipped):
         return report
@@ -226,6 +260,10 @@ def build(*, skip_tests: bool = False, root: Path | None = None) -> BuildReport:
 
     exe = base / "dist" / "CryptoAITrader" / "CryptoAITrader.exe"
     report.exe_path = exe if exe.exists() else None
+    if report.exe_path is None and sys.platform == "win32":
+        package.ok = False
+        package.detail = f"PyInstaller تمام شد ولی فایل اجرایی ساخته نشد: {exe}"
+        return report
 
     installer_step = BuildStep("ساخت فایل نصبی با Inno Setup")
     iscc = find_iscc()
@@ -276,12 +314,22 @@ def build(*, skip_tests: bool = False, root: Path | None = None) -> BuildReport:
 
 def main() -> int:
     """پوستهٔ خط فرمان."""
-    skip = os.environ.get("SKIP_TESTS") == "1" or "--skip-tests" in sys.argv
+    global _LOG
+    # `--skip-tests` (قدیمی) همچنان پذیرفته می‌شود؛ حالا پیش‌فرض همین است.
+    run_tests = os.environ.get("RUN_TESTS") == "1" or "--with-tests" in sys.argv
+    if os.environ.get("SKIP_TESTS") == "1" or "--skip-tests" in sys.argv:
+        run_tests = False
     print("=" * 66)
     print("ربات ساخت فایل نصبی — Crypto AI Trader")
     print("=" * 66)
 
-    report = build(skip_tests=skip)
+    log_path, _LOG = open_log("installer")
+    print(f"گزارش کامل ساخت: {log_path}", flush=True)
+    try:
+        report = build(run_tests=run_tests)
+    finally:
+        _LOG.close()
+        _LOG = None
     print(f"\nنسخه: {report.version}\n")
     for step in report.steps:
         mark = "رد شد" if step.skipped else ("موفق" if step.ok else "شکست")
@@ -294,6 +342,8 @@ def main() -> int:
         print(f"فایل اجرایی : {report.exe_path}")
     if report.installer_path:
         print(f"فایل نصبی   : {report.installer_path}")
+    if not report.succeeded:
+        print(f"گزارش کامل  : {log_path}  (در صورت نیاز همین فایل را بفرستید)")
     print("=" * 66)
     return 0 if report.succeeded else 1
 

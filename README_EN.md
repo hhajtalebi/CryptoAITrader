@@ -2,11 +2,22 @@
 
 **Professional desktop app for crypto market analysis and futures signal generation**
 
-Version 2.5.2 · Windows 10/11 · Python 3.11+ (tested up to 3.13) · Persian & English
+Version 2.5.4 · Windows 10/11 · Python 3.11+ (tested up to 3.13) · Persian & English
 
 [راهنمای فارسی](README.md)
 
-> **Current delivery 2.5.2:** LBank futures HTTP 403 (Cloudflare firewall) — browser-like headers, the exact
+> **Current delivery 2.5.4:** the app no longer closes by itself after hours (background task handles leaked
+> and the trade monitor wrote to the database hundreds of times a second); logs, crash traces and a session
+> heartbeat now go to `data\logs\`. Auto trading really opens trades and shows why candidates were rejected.
+> New **⚡ Ultra scalp** (paper, live prices): whole-market momentum scan every second, close at your net profit
+> after fees, up to 200 concurrent trades. [Release report](docs/RELEASE_2.5.4_FA.md).
+>
+> **Previous delivery 2.5.3:** build robots fixed — the Windows installer build no longer opens app windows
+> (full tests are opt-in with `--with-tests` and run headless) and streams its output to `build_logs\`; the APK
+> build checks the WSL toolchain, installs buildozer into a venv, builds on the Linux filesystem and ships the
+> missing icon/presplash/font assets. [Release report](docs/RELEASE_2.5.3_FA.md).
+>
+> **Previous delivery 2.5.2:** LBank futures HTTP 403 (Cloudflare firewall) — browser-like headers, the exact
 > Cloudflare block code and reason in the wallet report, no retries of rejected requests, and a fix hint.
 > [Release report](docs/RELEASE_2.5.2_FA.md).
 >

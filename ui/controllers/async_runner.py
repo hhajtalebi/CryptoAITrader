@@ -15,7 +15,10 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import threading
+import time
+from collections import deque
 from collections.abc import Callable, Coroutine
 from typing import Any
 
@@ -25,6 +28,36 @@ from app.exceptions import AppError
 from app.logging import get_logger
 
 logger = get_logger(__name__)
+
+#: دستهٔ کار تمام‌شده پس از این مدت (ثانیه) نابود می‌شود. فاصله لازم است:
+#: سیگنال `finished` از نخ پس‌زمینه emit می‌شود و نابودکردن شیء هم‌زمان با
+#: emit در نخ دیگر رفتار تعریف‌نشده (فروپاشی) دارد.
+FINISHED_HANDLE_GRACE_SECONDS = 2.0
+
+
+def _destroy_handle(handle: QObject) -> None:
+    """نابودی هم‌گام شیء C++ دسته در نخ رابط (بدون صف DeferredDelete)."""
+    try:
+        import shiboken6
+
+        if shiboken6.isValid(handle):
+            shiboken6.delete(handle)
+    except Exception:  # noqa: BLE001 - نابودی نباید خودش مشکل بسازد
+        logger.debug("Task handle could not be destroyed", exc_info=True)
+
+
+def _log_loop_exception(loop: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
+    """
+    خطاهای بی‌صاحب حلقه (وظیفهٔ رهاشده، callback خراب) فقط ثبت می‌شوند.
+
+    پیش‌فرض asyncio آن‌ها را روی stderr می‌نوشت که در exe ویندوز وجود ندارد؛
+    یعنی هیچ ردی از علت مشکل نمی‌ماند.
+    """
+    exception = context.get("exception")
+    message = context.get("message", "")
+    if isinstance(exception, (asyncio.CancelledError, KeyboardInterrupt)):
+        return
+    logger.error("Unhandled asyncio error: %s", message, exc_info=exception)
 
 
 class TaskHandle(QObject):
@@ -79,6 +112,10 @@ class AsyncRunner(QObject):
         #: کار در حال اجرا به ازای هر کلید، برای جلوگیری از انباشت
         self._active: dict[str, tuple[TaskHandle, Any, Any]] = {}
         self._lock = threading.Lock()
+        #: شمار کل کارهای فرستاده‌شده (برای گزارش سلامت)
+        self.submitted_total = 0
+        #: دسته‌های تمام‌شده در انتظار نابودی: (زمان پایان، دسته)
+        self._graveyard: deque[tuple[float, TaskHandle]] = deque()
 
     # ------------------------------------------------------------------
     # چرخه عمر
@@ -97,6 +134,7 @@ class AsyncRunner(QObject):
         """بدنه نخ پس‌زمینه."""
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        loop.set_exception_handler(_log_loop_exception)
         self._loop = loop
         self._ready.set()
         try:
@@ -124,6 +162,9 @@ class AsyncRunner(QObject):
         self._thread = None
         self._loop = None
         self._ready.clear()
+        # نخ پس‌زمینه تمام شده، پس هیچ emit هم‌زمانی نیست؛ دسته‌های تمام‌شده
+        # همین حالا نابود می‌شوند تا چرخهٔ ارجاعی runner را زنده نگه ندارد.
+        self.purge_finished(force=True)
         logger.debug("Async runner stopped")
 
     @property
@@ -170,6 +211,20 @@ class AsyncRunner(QObject):
                         except (RuntimeError, AttributeError):
                             logger.debug("Superseded coroutine already closed")
 
+        if self._loop is None:
+            # کار هرگز زمان‌بندی نمی‌شود: دستهٔ بی‌والد (مالکیت پایتون) و بدون
+            # deleteLater. اگر فرزند runner بود و runner پیش از پردازش
+            # DeferredDelete جمع‌آوری می‌شد، حذف دوباره به فروپاشی می‌انجامید.
+            coroutine.close()
+            orphan = TaskHandle(name)
+            if on_error is not None:
+                orphan.failed.connect(on_error)
+            if on_finished is not None:
+                orphan.finished.connect(on_finished)
+            orphan.failed.emit("Background runner is not running", RuntimeError("runner stopped"))
+            orphan.finished.emit()
+            return orphan
+
         handle = TaskHandle(name, parent=self)
         if on_success is not None:
             handle.succeeded.connect(on_success)
@@ -177,15 +232,15 @@ class AsyncRunner(QObject):
             handle.failed.connect(on_error)
         if on_finished is not None:
             handle.finished.connect(on_finished)
-        handle.finished.connect(lambda: self._handles.discard(handle))
-        handle.finished.connect(lambda: self._release(name, handle))
+        # نسخهٔ ۲.۵.۴: دستهٔ هر کار فرزند Qt همین runner است و قبلاً هرگز
+        # پاک نمی‌شد. با چند کار در ثانیه (قیمت، پایش معامله، پویش)، پس از
+        # چند ساعت ده‌ها هزار QObject با اتصال‌هایشان انباشته می‌شد و حافظه
+        # و کندی رشد می‌کرد تا برنامه بسته شود. حالا دستهٔ تمام‌شده پس از
+        # مهلتی کوتاه در نخ رابط نابود می‌شود.
+        handle.finished.connect(functools.partial(self._on_handle_finished, name, handle))
         self._handles.add(handle)
-
-        if self._loop is None:
-            coroutine.close()
-            handle.failed.emit("Background runner is not running", RuntimeError("runner stopped"))
-            handle.finished.emit()
-            return handle
+        self.purge_finished()
+        self.submitted_total += 1
 
         future = asyncio.run_coroutine_threadsafe(self._wrap(handle, coroutine), self._loop)
         if coalesce:
@@ -220,6 +275,31 @@ class AsyncRunner(QObject):
             if callable(close):
                 close()
         return True
+
+    def _on_handle_finished(self, name: str, handle: TaskHandle) -> None:
+        """پایان کار (در نخ رابط): آزادکردن کلید و سپردن دسته به صف نابودی."""
+        self._handles.discard(handle)
+        self._release(name, handle)
+        self._graveyard.append((time.monotonic(), handle))
+        self.purge_finished()
+
+    def purge_finished(self, *, force: bool = False) -> int:
+        """نابودی دسته‌های تمام‌شده‌ای که مهلتشان گذشته (یا همه با force)."""
+        now = time.monotonic()
+        removed = 0
+        while self._graveyard and (force or now - self._graveyard[0][0] >= FINISHED_HANDLE_GRACE_SECONDS):
+            _finished_at, handle = self._graveyard.popleft()
+            _destroy_handle(handle)
+            removed += 1
+        return removed
+
+    def live_handles(self) -> int:
+        """شمار دسته‌های کارهای در حال اجرا — باید کوچک بماند."""
+        return len(self._handles)
+
+    def pending_release(self) -> int:
+        """شمار دسته‌های تمام‌شده‌ای که هنوز نابود نشده‌اند (حداکثر چند ثانیه)."""
+        return len(self._graveyard)
 
     def active_keys(self) -> list[str]:
         """کلید کارهای در حال اجرا (برای آزمون و عیب‌یابی)."""

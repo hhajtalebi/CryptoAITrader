@@ -274,7 +274,30 @@
     "close_failed": "معامله بسته نشد: ممکن است قیمت تازه در دسترس نباشد یا خروج دیگری در جریان باشد.",
     "exchange_locked": "پیش از تغییر صرافی، ورود خودکار را متوقف و موقعیت‌های باز را ببندید.",
     "pos_fee": "کارمزد (خروج برآوردی)",
-    "entering": "در حال بررسی قیمت تازه و محافظ‌های ورود…"
+    "entering": "در حال بررسی قیمت تازه و محافظ‌های ورود…",
+    "mode_ultra": "⚡ اسکالپ فوق‌سریع",
+    "ultra_preset": "اسکالپ فوق‌سریع",
+    "ultra_preset_hint": "۱۰ دلار × اهرم ۵۰، بستن در سود خالص ۲ دلار (پس از کارمزد ورود و خروج)، حد ضرر ۲ دلار، تا ۱۰۰ معاملهٔ هم‌زمان، پویش هر ثانیه. همه در «تنظیم دستی» قابل تغییرند. حالت کاغذی/واقعی تغییر نمی‌کند.",
+    "max_hold": "بیشترین زمان باز ماندن",
+    "scan_summary": "آخرین پویش: {candidates} نامزد، {opened} باز شد؛ رد: {reasons}",
+    "reject": {
+      "stale_data": "دادهٔ کهنه",
+      "price_unavailable": "قیمت نیامد",
+      "wide_spread": "اسپرد زیاد",
+      "low_liquidity": "نقدینگی کم",
+      "trend_conflict": "تضاد روند",
+      "no_available_margin": "مارجین آزاد نیست",
+      "max_concurrent_reached": "ظرفیت پر",
+      "daily_loss_limit": "سقف زیان روزانه",
+      "fees_exceed_loss_budget": "کارمزد بیش از حد ضرر",
+      "risk_exceeds_loss_budget": "ریسک بیش از حد ضرر",
+      "poor_net_reward_risk": "سود خالص ناچیز",
+      "invalid_risk_levels": "سطح نامعتبر",
+      "symbol_already_open": "نماد باز است",
+      "stale_candidate": "نامزد کهنه",
+      "symbol_not_selected": "نماد انتخاب نشده",
+      "no_price": "بدون قیمت"
+    }
   },
   "history_cols": {
     "opened": "زمان باز شدن",

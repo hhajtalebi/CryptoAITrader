@@ -348,6 +348,10 @@ class TickEngine:
         """آخرین تیک نماد."""
         return self._quotes.get(str(symbol or "").strip().upper())
 
+    def symbols(self) -> list[str]:
+        """همهٔ نمادهایی که تیکی از آن‌ها رسیده است."""
+        return list(self._quotes)
+
     def price(self, symbol: str) -> float:
         """آخرین قیمت؛ صفر یعنی داده‌ای نیست."""
         quote = self.get(symbol)

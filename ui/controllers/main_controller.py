@@ -5995,6 +5995,20 @@ class MainController(QObject):
 
         confidence_source = ConfidenceCandidateSource(self.app)
 
+        # نسخهٔ ۲.۵.۴: اسکالپ فوق‌سریع — بدون درخواست اضافه، از کش تیک.
+        from trading.ultra_scalp import UltraScalpSource
+
+        async def ultra_tickers() -> list:
+            market = bound_market
+            return await market.get_all_tickers(max_age_seconds=10) if market is not None else []
+
+        ultra_source = UltraScalpSource(
+            lambda: getattr(self, "_tick_engine", None),
+            tickers_source=ultra_tickers,
+            settings=lambda key, default: self.app.settings.get(key, default),
+        )
+        self._ultra_source = ultra_source
+
         async def candidate_source() -> list:
             """
             نامزدهای معامله بر پایهٔ حالت موتور (خواستهٔ §۳).
@@ -6014,6 +6028,14 @@ class MainController(QObject):
 
             if engine_mode == "ai":
                 return await self._ai_candidate_scan()
+            if engine_mode == "ultra":
+                trader = getattr(self, "_auto_trader_engine", None)
+                held = {t.symbol for t in trader.open_trades} if trader is not None else set()
+                capacity = (trader.config.max_concurrent - len(held)) if trader is not None else 50
+                return await ultra_source.scan(
+                    symbols=self._auto_selected_symbols(), exclude=held,
+                    limit=max(5, capacity * 2),
+                )
 
             selected = self._auto_selected_symbols()
             if source_mode == "confidence":
@@ -6076,6 +6098,7 @@ class MainController(QObject):
             "scalp.max_loss",
             "scalp.leverage",
             "scalp.max_concurrent",
+            "scalp.max_hold_seconds",
             "scalp.min_confidence",
             "scalp.candidate_source",
             "scalp.mode",
@@ -6109,42 +6132,83 @@ class MainController(QObject):
         """
         self.auto_trade_event.emit(str(event), dict(payload or {}))
 
+    #: کمترین فاصلهٔ دو اعلان شناور معاملهٔ خودکار (ثانیه)؛ بقیه در نوار وضعیت
+    AUTO_TOAST_MIN_INTERVAL = 2.5
+    #: ادغام تازه‌سازی جدول/پنل پس از رویدادهای پیاپی (میلی‌ثانیه)
+    AUTO_REFRESH_COALESCE_MS = 400
+
     def _handle_auto_trade_event(self, event: str, payload: dict) -> None:
-        """نمایش رویداد معاملهٔ خودکار روی صفحه (نخ رابط کاربری)."""
+        """
+        نمایش رویداد معاملهٔ خودکار روی صفحه (نخ رابط کاربری).
+
+        نسخهٔ ۲.۵.۴: با اسکالپ فوق‌سریع صدها رویداد در دقیقه می‌رسد. قبلاً هر
+        رویداد (حتی «رد نامزد») جدول معاملات را از پایگاه داده دوباره می‌ساخت
+        و برای هر باز/بسته شدن یک اعلان شناور می‌آمد. حالا: رد/کهنگی هیچ
+        تازه‌سازی‌ای ندارند، تازه‌سازی‌ها در یک نوبت ۴۰۰ms ادغام می‌شوند و
+        اعلان‌ها حداکثر هر ۲٫۵ ثانیه یکی است (بقیه خلاصه در نوار وضعیت).
+        """
         # موتور، معامله را زیر کلید `trade` و نتیجهٔ ذخیره‌شده را زیر
         # `record` می‌فرستد؛ خواندن مستقیم `symbol` از payload همیشه
         # «؟» می‌داد.
+        if event in {"rejected", "stale", "tick"}:
+            return
         trade = payload.get("trade")
         record = payload.get("record") or {}
         symbol = getattr(trade, "symbol", "") or record.get("symbol", "?")
 
+        message = ""
+        level = "info"
         if event == "opened":
             price = getattr(trade, "entry_price", None) or record.get("entry_price", "?")
-            self._toast(
-                self.tr_.tr(
-                    "trades.auto.opened",
-                    symbol=symbol,
-                    price=f"{float(price):,.6g}" if isinstance(price, (int, float)) else price,
-                ),
-                level="info",
+            message = self.tr_.tr(
+                "trades.auto.opened",
+                symbol=symbol,
+                price=f"{float(price):,.6g}" if isinstance(price, (int, float)) else price,
             )
         elif event == "closed":
             pnl = float(record.get("pnl", 0) or 0)
-            self._toast(
-                self.tr_.tr(
-                    "trades.auto.closed",
-                    symbol=symbol,
-                    pnl=f"{pnl:+.2f}",
-                    reason=str(payload.get("reason", "")),
-                ),
-                level="success" if pnl >= 0 else "warning",
+            message = self.tr_.tr(
+                "trades.auto.closed",
+                symbol=symbol,
+                pnl=f"{pnl:+.2f}",
+                reason=str(payload.get("reason", "")),
             )
+            level = "success" if pnl >= 0 else "warning"
         elif event == "halted":
-            self._toast(
-                self.tr_.tr("trades.auto.blocked", reason=payload.get("reason", "")),
-                level="warning",
-            )
+            message = self.tr_.tr("trades.auto.blocked", reason=payload.get("reason", ""))
+            level = "warning"
+        if message:
+            self._auto_event_toast(message, level=level, force=event in {"halted", "started", "stopped"})
         if event in {"opened", "closed"}:
+            self._auto_streams_dirty = True
+        self._schedule_auto_refresh()
+
+    def _auto_event_toast(self, message: str, *, level: str, force: bool = False) -> None:
+        """اعلان شناور با سقف نرخ؛ پیام‌های اضافه فقط در نوار وضعیت."""
+        now = time.monotonic()
+        last = getattr(self, "_auto_last_toast", 0.0)
+        if force or now - last >= self.AUTO_TOAST_MIN_INTERVAL:
+            self._auto_last_toast = now
+            skipped = getattr(self, "_auto_toasts_skipped", 0)
+            self._auto_toasts_skipped = 0
+            if skipped:
+                message = f"{message}  (+{skipped})"
+            self._toast(message, level=level)
+        else:
+            self._auto_toasts_skipped = getattr(self, "_auto_toasts_skipped", 0) + 1
+            self.status(message)
+
+    def _schedule_auto_refresh(self) -> None:
+        """یک تازه‌سازی ادغام‌شده برای همهٔ رویدادهای ۴۰۰ms اخیر."""
+        if getattr(self, "_auto_refresh_pending", False):
+            return
+        self._auto_refresh_pending = True
+        QTimer.singleShot(self.AUTO_REFRESH_COALESCE_MS, self._flush_auto_refresh)
+
+    def _flush_auto_refresh(self) -> None:
+        self._auto_refresh_pending = False
+        if getattr(self, "_auto_streams_dirty", False):
+            self._auto_streams_dirty = False
             self._update_streamed_symbols()
         self.refresh_trades()
         self._refresh_auto_trade_panel()
@@ -6197,9 +6261,38 @@ class MainController(QObject):
             )
             detail = f"{len(engine.open_trades)} / {engine.config.max_concurrent}"
             detail = self.tr_.tr("trades.auto.running") + f" • {detail}"
+            scan_text = self._auto_scan_summary(engine)
+            if scan_text:
+                detail += f" • {scan_text}"
         if not detail:
             detail = self._auto_economics_text()
         self.trades.set_auto_state(running, detail)
+
+    #: توضیح فارسی/انگلیسی دلیل‌های رد رایج (کلید ترجمه)
+    AUTO_REJECTION_KEYS = (
+        "stale_data", "price_unavailable", "wide_spread", "low_liquidity", "trend_conflict",
+        "no_available_margin", "max_concurrent_reached", "daily_loss_limit",
+        "fees_exceed_loss_budget", "risk_exceeds_loss_budget", "poor_net_reward_risk",
+        "invalid_risk_levels", "symbol_already_open", "stale_candidate", "symbol_not_selected",
+        "no_price",
+    )
+
+    def _auto_scan_summary(self, engine: Any) -> str:
+        """«آخرین پویش: N نامزد، M باز شد؛ رد: دلیل×k» — تا کاربر علت را ببیند."""
+        stats = engine.scan_stats() if hasattr(engine, "scan_stats") else {}
+        if not stats:
+            return ""
+        parts = []
+        for reason, count in list(stats.get("rejections") or [])[:2]:
+            key = f"trades.auto.reject.{reason}"
+            label = self.tr_.tr(key) if reason in self.AUTO_REJECTION_KEYS and self.tr_.has(key) else reason
+            parts.append(f"{label}×{count}")
+        return self.tr_.tr(
+            "trades.auto.scan_summary",
+            candidates=int(stats.get("candidates", 0) or 0),
+            opened=int(stats.get("opened", 0) or 0),
+            reasons="، ".join(parts) if parts else "—",
+        )
 
     def toggle_auto_trading(self, start: bool) -> None:
         """روشن یا خاموش کردن معاملهٔ خودکار به درخواست کاربر."""
@@ -7368,7 +7461,7 @@ class MainController(QObject):
     def change_auto_engine_mode(self, mode: str) -> None:
         """تغییر حالت موتور (Selected/Scan/AI) از صفحهٔ معاملات."""
         value = str(mode or "scan").strip().lower()
-        if value not in ("selected", "scan", "ai"):
+        if value not in ("selected", "scan", "ai", "ultra"):
             return
         try:
             self.app.settings.set("scalp.engine_mode", value)
@@ -8154,6 +8247,14 @@ class MainController(QObject):
 
             # آمار سنگین (SQLite) هر ۵ تیک؛ بقیهٔ مقادیر هر تیک
             self._terminal_stats_tick += 1
+            if engine is not None and engine.is_running and self._terminal_stats_tick % 3 == 0:
+                # «آخرین پویش: … رد: …» حتی وقتی هیچ معامله‌ای باز نمی‌شود (۲.۵.۴)
+                running_text = (
+                    self.tr_.tr("trades.auto.running")
+                    + f" • {len(engine.open_trades)} / {engine.config.max_concurrent}"
+                )
+                scan_text = self._auto_scan_summary(engine)
+                page.set_auto_state(True, running_text + (f" • {scan_text}" if scan_text else ""))
             if self._terminal_stats_tick % 5 == 0:
                 try:
                     statistics = self.app.trade_repository.statistics(
@@ -8695,6 +8796,59 @@ class MainController(QObject):
         if isinstance(value, date):
             return datetime.combine(value, time.max if end_of_day else time.min)
         return None
+
+    # ------------------------------------------------------------------
+    # سلامت نشست (نسخهٔ ۲.۵.۴)
+    # ------------------------------------------------------------------
+    HEALTH_LOG_EVERY = 10  # ضربان‌ها؛ هر ضربان یک دقیقه
+
+    def health_counters(self) -> dict[str, Any]:
+        """عددهایی که رشد بی‌پایانشان نشانهٔ نشت است — در session.json و لاگ."""
+        runner = getattr(self, "runner", None)
+        engine = getattr(self, "_auto_trader_engine", None)
+        ticks = getattr(self, "_tick_engine", None)
+        counters: dict[str, Any] = {}
+        try:
+            if runner is not None:
+                counters["runner_handles"] = runner.live_handles()
+                counters["runner_children"] = len(runner.children())
+                counters["runner_submitted"] = int(getattr(runner, "submitted_total", 0))
+            if engine is not None:
+                counters["auto_open"] = len(engine.open_trades)
+                counters["auto_running"] = bool(engine.is_running)
+            if ticks is not None:
+                counters["tick_symbols"] = int(ticks.stats().get("symbols", 0))
+            counters["pending_updates"] = len(getattr(self, "_pending_updates", {}) or {})
+        except Exception:  # noqa: BLE001 - گزارش سلامت نباید چیزی را بشکند
+            counters["error"] = "health counters failed"
+        return counters
+
+    def log_health(self, snapshot: dict[str, Any]) -> None:
+        """ثبت ضربان در لاگ هر ده دقیقه (و فوراً اگر حافظه بالا رفت)."""
+        self._health_beats = getattr(self, "_health_beats", 0) + 1
+        memory = float(snapshot.get("memory_mb", 0.0) or 0.0)
+        if self._health_beats % self.HEALTH_LOG_EVERY == 1 or memory > 1500:
+            logger.info(
+                "Health: uptime=%.2fh memory=%.0fMB peak=%.0fMB threads=%s %s",
+                float(snapshot.get("uptime_hours", 0.0) or 0.0), memory,
+                float(snapshot.get("peak_memory_mb", 0.0) or 0.0),
+                snapshot.get("threads"), snapshot.get("extra"),
+            )
+
+    def report_unclean_exit(self, previous: Any) -> None:
+        """به کاربر بگو نشست قبلی ناگهان بسته شد و لاگش کجاست."""
+        try:
+            logs = str(self.app.paths.logs_dir)
+        except Exception:  # noqa: BLE001
+            logs = "data/logs"
+        message = self.tr_.tr(
+            "common.unclean_exit",
+            hours=f"{float(getattr(previous, 'uptime_hours', 0.0) or 0.0):.1f}",
+            memory=f"{float(getattr(previous, 'memory_mb', 0.0) or 0.0):.0f}",
+            path=logs,
+        )
+        self.status(message)
+        self._toast(message, level="warning")
 
     def _toast(self, message: str, *, level: str = "info") -> None:
         """نمایش اعلان شناور روی پنجرهٔ اصلی."""

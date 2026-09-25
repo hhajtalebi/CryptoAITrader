@@ -1,11 +1,54 @@
-## وضعیت جاری ۲.۵.۲ — فیوچرز LBank: HTTP 403 از Cloudflare
+## وضعیت جاری ۲.۵.۴ — بسته‌شدن خودکار EXE، معاملهٔ خودکاری که باز نمی‌شد، اسکالپ فوق‌سریع
+
+گزارش کاربر: (۱) EXE پس از چند دقیقه/ساعت خودش بسته می‌شود؛ (۲) معاملهٔ خودکار هیچ معامله‌ای باز نمی‌کند؛
+(۳) «اسکالپ فوق‌سریع» با اهرم بالا، بستن در سود خالص کاربر (مثلاً ۲–۳ دلار پس از کارمزد) و ~۱۰۰ معاملهٔ هم‌زمان
+با ۱۰۰۰ دلار. پاسخ‌های کاربر: فعلاً کاغذی با قیمت زنده؛ سقف هم‌زمانی تا ۲۰۰ قابل تنظیم.
+- بسته‌شدن: هر `TaskHandle` فرزند Qt ‏`AsyncRunner` بود و هرگز پاک نمی‌شد (چند کار در ثانیه ← ده‌ها هزار QObject).
+  حالا `_on_handle_finished` ← صف `_graveyard` ← `purge_finished` (نابودی هم‌گام با `shiboken6.delete` پس از
+  `FINISHED_HANDLE_GRACE_SECONDS=2`؛ `stop()` همه را پس از join نابود می‌کند). `deleteLater` مستقیم آزمون‌ها را
+  با segfault می‌کشت (GC چرخه‌ای runner/نابودی هم‌زمان با emit) — تکرار نشود. کار زمان‌بندی‌نشده (runner متوقف)
+  دستهٔ بی‌والد می‌گیرد. `app/diagnostics.py`: `data/logs/app.log` (چرخشی ۵MB)، `crash.log` (faulthandler +
+  excepthook نخ‌ها)، `session.json` (`SessionMonitor`: ضربان ۶۰ث، `clean`؛ نشست ناتمام قبلی ← اعلان
+  `common.unclean_exit`)، پیام‌های Qt در لاگ، `MainController.health_counters/log_health`. نوشتن DB پایش معامله
+  محدود شد (`PERSIST_INTERVAL_SECONDS=2`، تغییر حد ضرر فوری). رویدادهای موتور: اعلان‌ها محدود (۲٫۵ث) و تازه‌سازی
+  جدول‌ها یکجا (۴۰۰ms: `_schedule_auto_refresh`/`_flush_auto_refresh`).
+- باز نشدن: حد ضرر دورِ سیگنال در اهرم بالا همیشه `risk_exceeds_loss_budget` می‌داد. حالا `_open_trade_locked` هدف
+  و حد ضرر را به بودجهٔ دلاری کاربر محدود می‌کند (`stop_source`/`target_source` در extra رکورد). `scan_stats()`
+  (نامزد/بازشده/دلیل‌های رد) در پنل با `trades.auto.scan_summary` و `trades.auto.reject.*` هر ۳ ثانیه دیده می‌شود.
+- فوق‌سریع: `trading/ultra_scalp.py` (`momentum`، `UltraScalpSource` از کش تیک کل بازار + فیلتر نقدینگی)، حالت موتور
+  `ultra` (`ULTRA_MIN_SCAN_INTERVAL=1`، `ULTRA_MIN_HOLD_SECONDS=10`، بدون ابطال سیگنال)، `HARD_MAX_CONCURRENT=200`،
+  دکمهٔ «⚡ اسکالپ فوق‌سریع» (`TradesPage.ULTRA_PRESET`: ۱۰$×۵۰، هدف ۲$، ضرر ۲$، ۱۰۰ هم‌زمان، ۱۸۰ث، پویش ۱ث)، فیلد
+  «بیشترین زمان باز ماندن»، تنظیم‌های `scalp.ultra_*`. کش روزانهٔ سود/زیان ۱ث و یک عکس پرتفوی برای هر ورود.
+  حالت سفارش (کاغذی/واقعی) با پیش‌تنظیم عوض نمی‌شود؛ درگاه واقعی همچنان کاغذی است. سوکت حداکثر ۸۰ نماد
+  (`MAX_STREAMED_SYMBOLS`)، بقیه با REST هر ۳ ثانیه.
+آزمون: `tests/test_v254_ultra_and_stability.py`؛ کل مجموعه 2564 پاس + 2 skip. شبیه‌سازی ۳۰۰ نماد: ۱۰۰ معامله در
+کمتر از ۸ ثانیه، بستن در سود خالص ≈ ۲ دلار (دادهٔ مصنوعی؛ نشانهٔ سودآوری نیست). گزارش: `docs/RELEASE_2.5.4_FA.md`.
+**commit نشده** (آخرین commit: `511d2b5` = 2.5.1+2.5.2؛ 2.5.3 هم commit نشده است).
+
+## وضعیت قبلی ۲.۵.۳ — ربات‌های ساخت فایل نصبی ویندوز و APK
+
+گزارش کاربر: ساخت ویندوز «پنجره‌های زیادی از بخش‌های مختلف نرم‌افزار باز می‌کند و فایل نصبی نمی‌سازد»؛ APK با
+«APK ساخته نشد» (RESULT=1) تمام می‌شود. علت ویندوز: `tools/build_installer.py` کل آزمون‌ها را روی دسکتاپ واقعی
+(بدون offscreen) اجرا می‌کرد و هر شکست PyInstaller را متوقف می‌کرد؛ BOM در ابتدای bat جلوی `@echo off` را می‌گرفت؛
+`.iss` بدون BOM بود. رفع: `tools/build_common.py` (`run_streaming` خروجی زنده + `build_logs/*.log`، `headless_env`)،
+گام «بررسی سلامت کد» (compileall + import بی‌پنجرهٔ `SMOKE_CODE`)، آزمون کامل فقط با `--with-tests`/`RUN_TESTS=1`
+(بی‌پنجره)، `upx=False`، `tests/conftest.py` پیش‌فرض offscreen، `scripts/build_windows.bat` ← `build_installer.bat`.
+علت APK: `mobile/assets/` (آیکون/پیش‌نمایش/قلم) نبود، پذیرش مجوز SDK، `python-bidi` بدون پین (Rust)، آزمون ریاضی
+با پایتون بدون numpy/pandas، ساخت روی `/mnt/c`، `pip --user` مسدود در اوبونتو ۲۴. رفع: `mobile/assets/*`،
+`android.accept_sdk_license = True`، `python-bidi==0.4.2`، `warn_on_root = 0`، `check_toolchain`/`probe_script`
+(buildozer در `~/.cai-buildozer`، فرمان apt دقیق)، `build_script` (کپی به `~/cryptoaitrader-apk`، ساخت روی
+فایل‌سیستم لینوکس، برگرداندن APK به `mobile/bin`)، ردکردن آزمون ریاضی در نبود بسته‌ها. موبایل 1.9.13.
+آزمون: `tests/test_v253_build_tools.py`. ساخت واقعی ویندوز/APK در sandbox ممکن نیست. گزارش: `docs/RELEASE_2.5.3_FA.md`.
+**commit نشده** (آخرین commit: `511d2b5` = 2.5.1+2.5.2).
+
+## وضعیت قبلی ۲.۵.۲ — فیوچرز LBank: HTTP 403 از Cloudflare
 
 گزارش کاربر پس از 2.5.1: اسپات ✓ (۳ دارایی)، فیوچرز ✗ `NetworkError: HTTP 403 … /cfd/openApi/v1/prv/account`.
 `lbkperp.lbank.com` پشت Cloudflare است (`api.lbkex.com` نه). رفع: `BROWSER_HEADERS` در `_contract_client`،
 `LBankRestClient._classify_forbidden` + `_cloudflare_code`/`CLOUDFLARE_REASONS` ← `AccessBlockedError`
 (`app/exceptions/errors.py`, زیرکلاس `NetworkError`) در `no_retry_on`، شکستن حلقهٔ دارایی‌های فیوچرز پس از
 مسدودی، `wallet.hint.blocked/blocked_region` در `_wallet_error_hint`. کد Cloudflare واقعی کاربر هنوز نامعلوم؛
-گزارش بعدی کیف پول آن را نشان می‌دهد. گزارش: `docs/RELEASE_2.5.2_FA.md`. **commit نشده** (آخرین commit: `982cce2`).
+گزارش بعدی کیف پول آن را نشان می‌دهد. گزارش: `docs/RELEASE_2.5.2_FA.md`. commit شد در `511d2b5`.
 
 ## وضعیت قبلی ۲.۵.۱ — نمایش دارایی کیف پول، واچ‌لیست، ترتیب و قیمت بازارها
 

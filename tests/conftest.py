@@ -7,8 +7,15 @@
 
 from __future__ import annotations
 
+import os as _os_qt
 import random
 from pathlib import Path
+
+# نسخهٔ ۲.۵.۳: آزمون‌ها همیشه بی‌پنجره اجرا شوند (پیش از هر import از Qt).
+# بدون این، اجرای آزمون‌ها روی ویندوز — از جمله داخل ربات ساخت — صدها
+# پنجرهٔ واقعی از بخش‌های مختلف برنامه باز می‌کرد. با QT_QPA_PLATFORM
+# صریح (مثلاً windows) می‌توان عمداً پنجره‌ها را دید.
+_os_qt.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 

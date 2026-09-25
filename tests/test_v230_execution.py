@@ -87,7 +87,6 @@ async def test_costs_larger_than_loss_budget_reject_instead_of_tiny_stop():
 
 @pytest.mark.parametrize("values,reason", [
     ({"take_profit": 99}, "invalid_risk_levels"),
-    ({"stop_loss": 90}, "risk_exceeds_loss_budget"),
     ({"take_profit": 100.01}, "poor_net_reward_risk"),
     ({"direction": "WAIT"}, "invalid_candidate"),
     ({"observed_at": time.time()-1000}, "stale_candidate"),
@@ -96,6 +95,17 @@ async def test_bad_candidate_has_explicit_reason(values, reason):
     trader = make()
     assert await trader.open_trade(candidate(**values)) is None
     assert trader.rejection_reason("BTC/USDT") == reason
+
+
+async def test_far_signal_stop_is_clamped_to_loss_budget_instead_of_rejected():
+    """۲.۵.۴: حد ضرر دورِ سیگنال در اهرم بالا دیگر هر ورودی را رد نمی‌کرد."""
+    trader = make()
+    trade = await trader.open_trade(candidate(stop_loss=90))
+    assert trade is not None
+    assert trade.stop_price > 90  # به بودجهٔ ضرر نزدیک شد
+    move = abs(trade.entry_price - trade.stop_price) * trade.quantity
+    exit_fee = trade.stop_price * trade.quantity * trader.config.fee_rate
+    assert move + float(trade.extra["entry_fee"]) + exit_fee == pytest.approx(trader.config.max_loss, rel=0.02)
 
 
 async def test_manual_and_scanner_cannot_duplicate_symbol_after_await():

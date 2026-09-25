@@ -9785,3 +9785,35 @@ self._scorecard_timer.timeout.connect(self._scorecard_tick)
 | `market/providers/lbank/rest_client.py` | `BROWSER_HEADERS`، `CLOUDFLARE_REASONS`، `_cloudflare_code`، `_classify_forbidden` (401/403) | `_handle_response`، `_contract_client` |
 | `market/providers/lbank/provider.py` | `fetch_futures_balance` پس از `AccessBlockedError` می‌شکند | `ExchangeAccountService.sync_balances` |
 | `ui/controllers/main_controller.py` | `_wallet_error_hint` ← `wallet.hint.blocked` / `blocked_region` | پنل گزارش کیف پول |
+
+## مکمل نسخهٔ 2.5.3
+
+- `tools/build_common.py` (جدید): `LOG_DIR`، `open_log(name)`، `headless_env()`، `run_streaming(cmd, *, cwd, env, log,
+  timeout, tail_lines, echo)` → `(code, tail)` (127 = فرمان نیست، 124 = مهلت)، `summarize(lines)`.
+- `tools/build_installer.py`: `SMOKE_CODE`؛ `build(*, skip_tests=True, root=None, run_tests=None)`؛ گام‌ها: وابستگی‌ها ←
+  بررسی سلامت (compileall + import بی‌پنجره) ← آزمون‌ها (پیش‌فرض رد؛ `--with-tests`/`RUN_TESTS=1`) ← PyInstaller ←
+  Inno Setup ← latest.json. گزارش در `build_logs/installer-*.log`.
+- `tools/build_apk.py`: `shell_command`، `probe_script`، `apt_command`، `check_toolchain`، `build_script(mode, clean=)`،
+  ثابت‌های `WSL_BUILD_DIR`/`BUILDOZER_VENV`/`BUILDOZER_PACKAGES`/`REQUIRED_TOOLS`/`APT_BASE`؛ گزارش `build_logs/apk-*.log`.
+- `mobile/assets/`: `icon.png` (512²)، `presplash.png` (1080×1920)، `Vazirmatn-Regular.ttf`.
+- آزمون: `tests/test_v253_build_tools.py`.
+
+## مکمل نسخهٔ 2.5.4
+
+- `app/diagnostics.py` (جدید): `protect_std_streams`، `memory_mb` (psapi/`/proc`)، `install_crash_handlers(logs_dir)`
+  ← `crash.log`، `install_qt_message_handler`، `flush_logs`، `PreviousSession`، `SessionMonitor(logs_dir)`
+  (`start()` ← نشست ناتمام قبلی، `heartbeat()`، `mark_clean_exit()`، `set_extra_provider`). اتصال: `main.py` (`main`، `run_gui`).
+- `ui/controllers/async_runner.py`: `FINISHED_HANDLE_GRACE_SECONDS`، `_destroy_handle`، `_on_handle_finished`،
+  `purge_finished(force=)`، `live_handles()`، `pending_release()`، `submitted_total`، `_log_loop_exception`.
+- `trading/ultra_scalp.py` (جدید): `UltraCandidate`، `momentum(points, now_ms=, window_ms=)`، `UltraScalpSource(tick_engine_source,
+  tickers_source=, settings=, clock_ms=)`، `.scan(symbols=, limit=, exclude=)`، `last_stats`. اتصال: `MainController._auto_trader`
+  (حالت `ultra`).
+- `trading/auto_trader.py`: `HARD_MAX_CONCURRENT=200`، `ENGINE_MODES` + `ultra`، `ULTRA_MIN_SCAN_INTERVAL`، `ULTRA_MIN_HOLD_SECONDS`،
+  `PERSIST_INTERVAL_SECONDS`، `scan_stats()`، `_count_rejection`، `last_scan`، هدف/ضرر محدود به بودجه در `_open_trade_locked`،
+  `_resolve_margin(..., portfolio=)`، کش ۱ثانیه‌ای `_check_daily_limit`.
+- `trading/price_cache.py`: `TickEngine.symbols()`.
+- `ui/pages/trades_page.py`: `ULTRA_PRESET`، `_emit_ultra_profile`، `auto_ultra_button`، `auto_hold_input`، حالت `ultra`.
+- `ui/controllers/main_controller.py`: `health_counters`، `log_health`، `report_unclean_exit`، `_auto_event_toast`،
+  `_schedule_auto_refresh`/`_flush_auto_refresh`، `AUTO_REJECTION_KEYS`، `_auto_scan_summary`، `_ultra_source`.
+- آزمون: `tests/test_v254_ultra_and_stability.py`.
+

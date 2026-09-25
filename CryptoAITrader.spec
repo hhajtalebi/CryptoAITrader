@@ -114,7 +114,9 @@ exe = EXE(  # noqa: F821
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    # نسخهٔ ۲.۵.۳: UPX (اگر روی سیستم باشد) DLLهای Qt را خراب می‌کند و
+    # برنامهٔ ساخته‌شده بالا نمی‌آید؛ فشرده‌سازی خاموش است.
+    upx=False,
     console=False,  # برنامه گرافیکی است؛ پنجره کنسول نباید باز شود
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -129,7 +131,7 @@ coll = COLLECT(  # noqa: F821
     a.binaries,
     a.datas,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     name="CryptoAITrader",
 )

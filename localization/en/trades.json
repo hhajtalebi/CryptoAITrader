@@ -274,7 +274,30 @@
     "close_failed": "Trade not closed: a fresh price may be unavailable or another exit is in progress.",
     "exchange_locked": "Stop automatic entries and close open positions before switching exchanges.",
     "pos_fee": "Fees (estimated exit)",
-    "entering": "Checking a fresh price and entry guards…"
+    "entering": "Checking a fresh price and entry guards…",
+    "mode_ultra": "⚡ Ultra scalp",
+    "ultra_preset": "Ultra scalp",
+    "ultra_preset_hint": "$10 × 50x leverage, close at +$2 net (after entry and exit fees), $2 stop, up to 100 concurrent trades, scan every second. Everything is editable under manual settings. Paper/live mode is not changed.",
+    "max_hold": "Max hold time",
+    "scan_summary": "Last scan: {candidates} candidates, {opened} opened; rejected: {reasons}",
+    "reject": {
+      "stale_data": "stale data",
+      "price_unavailable": "no price",
+      "wide_spread": "wide spread",
+      "low_liquidity": "low liquidity",
+      "trend_conflict": "trend conflict",
+      "no_available_margin": "no free margin",
+      "max_concurrent_reached": "capacity full",
+      "daily_loss_limit": "daily loss limit",
+      "fees_exceed_loss_budget": "fees exceed stop",
+      "risk_exceeds_loss_budget": "risk exceeds stop",
+      "poor_net_reward_risk": "net reward too small",
+      "invalid_risk_levels": "invalid levels",
+      "symbol_already_open": "already open",
+      "stale_candidate": "stale candidate",
+      "symbol_not_selected": "not selected",
+      "no_price": "no price"
+    }
   },
   "history_cols": {
     "opened": "Opened",

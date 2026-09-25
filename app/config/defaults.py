@@ -137,8 +137,12 @@ class SettingKey(str, Enum):
     #: چند نماد برتر در هر دور پویش بررسی شود
     AUTOTRADE_SCAN_SYMBOLS = "scalp.scan_symbols"
     # --- v2.0: حالت‌ها و محافظ‌های رویدادمحور ---
-    #: حالت موتور: selected | scan | ai (خواستهٔ §۳)
+    #: حالت موتور: selected | scan | ai | ultra (۲.۵.۴: اسکالپ فوق‌سریع)
     AUTOTRADE_ENGINE_MODE = "scalp.engine_mode"
+    #: اسکالپ فوق‌سریع — پنجرهٔ تکانه (ثانیه)، کمترین حرکت (درصد) و یکنواختی (۰..۱)
+    ULTRA_WINDOW_SECONDS = "scalp.ultra_window_seconds"
+    ULTRA_MIN_MOVE_PERCENT = "scalp.ultra_min_move_percent"
+    ULTRA_MIN_CONSISTENCY = "scalp.ultra_min_consistency"
     #: نمادهای حالت Selected — جداشده با ویرگول
     AUTOTRADE_SELECTED_SYMBOLS = "scalp.selected_symbols"
     #: فاصلهٔ پویش ورود (ثانیه) — جدا از پایش خروج تیک‌محور
@@ -396,6 +400,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     SettingKey.AUTOTRADE_SCAN_SYMBOLS.value: 40,
     # --- v2.0: حالت‌ها و محافظ‌های رویدادمحور ---
     SettingKey.AUTOTRADE_ENGINE_MODE.value: "scan",
+    SettingKey.ULTRA_WINDOW_SECONDS.value: 30.0,
+    SettingKey.ULTRA_MIN_MOVE_PERCENT.value: 0.04,
+    SettingKey.ULTRA_MIN_CONSISTENCY.value: 0.35,
     SettingKey.AUTOTRADE_SELECTED_SYMBOLS.value: "BTC/USDT,ETH/USDT",
     SettingKey.AUTOTRADE_SCAN_INTERVAL.value: 15.0,
     SettingKey.AUTOTRADE_MIN_LIQUIDITY.value: 2_000_000.0,

@@ -20,7 +20,9 @@ version.filename = %(source.dir)s/version.py
 #  `app/indicators_lite.py` با پایتون خالص نوشته شده و هم‌ارزی عددی‌اش
 #  با نسخهٔ دسکتاپ آزمون دارد. تلاش برای ساخت pandas روی اندروید،
 #  شناخته‌شده‌ترین راه شکست خوردن این نوع پروژه است.
-requirements = python3,kivy==2.3.0,openssl,certifi,arabic_reshaper,python-bidi
+# نسخهٔ ۲.۵.۳: python-bidi ≥ 0.5 با Rust ساخته می‌شود و python-for-android
+# نمی‌تواند کامپایلش کند؛ 0.4.2 پایتون خالص است (همان API: bidi.algorithm).
+requirements = python3,kivy==2.3.0,openssl,certifi,arabic_reshaper,python-bidi==0.4.2
 
 orientation = portrait
 fullscreen = 0
@@ -34,6 +36,9 @@ android.api = 34
 android.minapi = 24
 android.ndk = 25b
 android.archs = arm64-v8a,armeabi-v7a
+# نسخهٔ ۲.۵.۳: بدون این، buildozer برای پذیرش مجوز SDK منتظر ورودی می‌ماند و
+# در ربات ساخت (بدون ورودی) گیر می‌کند یا شکست می‌خورد.
+android.accept_sdk_license = True
 
 #  اجازهٔ ترافیک HTTPS؛ پاک‌متن لازم نیست.
 android.allow_backup = True
@@ -43,4 +48,5 @@ icon.filename = %(source.dir)s/assets/icon.png
 
 [buildozer]
 log_level = 2
-warn_on_root = 1
+# ربات ساخت ورودی ندارد؛ پرسش «با root ادامه می‌دهید؟» ساخت را می‌کشت.
+warn_on_root = 0
