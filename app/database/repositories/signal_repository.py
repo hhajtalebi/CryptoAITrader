@@ -90,7 +90,13 @@ class SignalRepository(BaseRepository[SignalRecord]):
                 SignalAnalysisRecord(
                     signal_id=record.id,
                     analysis_text=signal.analysis_text,
-                    market_snapshot=market_snapshot or {},
+                    # نسخهٔ ۲.۵.۵: عکس لحظه‌ای تصمیم هوشمند برای یادگیری از
+                    # نتیجه؛ در ستون JSON موجود (بدون مهاجرت پایگاه داده).
+                    market_snapshot=(
+                        {**(market_snapshot or {}), "intelligence": dict(signal.intelligence)}
+                        if getattr(signal, "intelligence", None)
+                        else (market_snapshot or {})
+                    ),
                     risk_assessment=risk_payload,
                     ai_raw_response=ai_raw_response,
                     data_timestamp=signal.created_at.replace(tzinfo=None),

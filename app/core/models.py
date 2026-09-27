@@ -395,6 +395,10 @@ class TradingSignal:
     #: کاربر خواست بداند «۱۵ دقیقه، یک ساعت و چهار ساعت بعد چه می‌شود».
     #: هر عضو یک دیکشنری از signals.forecast.HorizonForecast است.
     forecast: list[dict[str, Any]] = field(default_factory=list)
+    #: نسخهٔ ۲.۵.۵ — خروجی لایهٔ تصمیم هوشمند (signals.intelligent_decision):
+    #: technical/prediction/MTF/regime/historical/execution/final و کیفیت
+    #: STRONG/NORMAL/WEAK. خالی یعنی لایه فعال نبوده است.
+    intelligence: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """تبدیل کامل سیگنال به دیکشنری برای ذخیره در پایگاه داده و گزارش."""
@@ -425,4 +429,5 @@ class TradingSignal:
             "forecast": list(self.forecast),
             "enter_before": self.enter_before.isoformat() if self.enter_before else None,
             "expires_at": self.expires_at.isoformat() if self.expires_at else None,
+            "intelligence": dict(self.intelligence),
         }

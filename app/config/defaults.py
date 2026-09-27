@@ -182,6 +182,14 @@ class SettingKey(str, Enum):
     AUTOTRADE_ALLOCATION_PERCENT = "scalp.allocation_percent"
     #: سقف مجموع مارجین باز نسبت به موجودی (درصد)
     AUTOTRADE_MAX_TOTAL_MARGIN = "scalp.max_total_margin_percent"
+    #: نسخهٔ ۲.۵.۶ — محافظ برتری منفی اندازه‌گیری‌شده و دروازهٔ هزینهٔ اسکالپ
+    AUTOTRADE_EDGE_GUARD_ENABLED = "scalp.edge_guard_enabled"
+    AUTOTRADE_EDGE_GUARD_MIN_TRADES = "scalp.edge_guard_min_trades"
+    SCALP_MIN_COST_MULTIPLE = "scalp.min_cost_multiple"
+    #: نسخهٔ ۲.۵.۷ — سود قفل سر‌به‌سر، دسترس‌پذیری هدف، اسپرد/حد ضرر
+    AUTOTRADE_BREAK_EVEN_LOCK = "scalp.break_even_lock"
+    AUTOTRADE_REACH_RATIO = "scalp.reach_ratio"
+    AUTOTRADE_MAX_SPREAD_STOP_FRACTION = "scalp.max_spread_stop_fraction"
     UI_TIMEZONE = "ui.timezone"
     EXCHANGE_ACTIVE = "exchange.active"
     MARKET_MANUAL_TOMAN_RATE = "market.manual_toman_rate"
@@ -191,6 +199,8 @@ class SettingKey(str, Enum):
     SIGNAL_TIMEFRAMES = "signals.timeframes"
     SIGNAL_TIMEFRAME_ROLES = "signals.timeframe_roles"
     SIGNAL_MIN_CONFIDENCE = "signals.min_confidence"
+    #: نسخهٔ ۲.۵.۵ — لایهٔ تصمیم هوشمند (کیفیت STRONG/NORMAL/WEAK)
+    SIGNAL_INTELLIGENCE_ENABLED = "signals.intelligence_enabled"
     SIGNAL_REQUIRE_AI = "signals.require_ai"
     SIGNAL_AUTO_SAVE = "signals.auto_save"
     SIGNAL_AI_TIMEOUT = "signals.ai_timeout"
@@ -419,6 +429,12 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     SettingKey.AUTOTRADE_ALLOCATION_MODE.value: "fixed",
     SettingKey.AUTOTRADE_ALLOCATION_PERCENT.value: 5.0,
     SettingKey.AUTOTRADE_MAX_TOTAL_MARGIN.value: 60.0,
+    SettingKey.AUTOTRADE_EDGE_GUARD_ENABLED.value: True,
+    SettingKey.AUTOTRADE_EDGE_GUARD_MIN_TRADES.value: 50,
+    SettingKey.SCALP_MIN_COST_MULTIPLE.value: 3.0,
+    SettingKey.AUTOTRADE_BREAK_EVEN_LOCK.value: 0.1,
+    SettingKey.AUTOTRADE_REACH_RATIO.value: 0.5,
+    SettingKey.AUTOTRADE_MAX_SPREAD_STOP_FRACTION.value: 0.33,
     # --- v2.2: پویش دائمی فرصت‌ها (مستقل از موتور معامله) ---
     SettingKey.AUTOTRADE_WATCH_SCAN_ENABLED.value: True,
     SettingKey.AUTOTRADE_WATCH_SCAN_INTERVAL.value: 20,
@@ -478,6 +494,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "1d": "macro_trend",
     },
     SettingKey.SIGNAL_MIN_CONFIDENCE.value: 55,
+    SettingKey.SIGNAL_INTELLIGENCE_ENABLED.value: True,
     SettingKey.SIGNAL_REQUIRE_AI.value: False,
     SettingKey.SIGNAL_AUTO_SAVE.value: True,
     # سقف زمان انتظار برای تفسیر هوش مصنوعی؛ پس از آن سیگنال بدون تفسیر

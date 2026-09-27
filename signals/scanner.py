@@ -34,6 +34,7 @@ from typing import Any, Callable, Iterable, Sequence
 from app.core.constants import SignalDirection
 from app.core.models import TradingSignal
 from app.logging import get_logger
+from signals.intelligent_decision import eligibility_confidence
 
 logger = get_logger(__name__)
 
@@ -346,7 +347,7 @@ class MarketScanner:
                     else:
                         result.scanned += 1
                         keep = include_wait or signal.direction is not SignalDirection.WAIT
-                        if keep and int(signal.confidence or 0) >= int(min_confidence):
+                        if keep and eligibility_confidence(signal) >= int(min_confidence):
                             result.signals.append(signal)
                             if on_signal is not None:
                                 try:

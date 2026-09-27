@@ -2,15 +2,27 @@
 
 **Professional desktop app for crypto market analysis and futures signal generation**
 
-Version 2.5.4 · Windows 10/11 · Python 3.11+ (tested up to 3.13) · Persian & English
+Version 2.5.8 · Windows 10/11 · Python 3.11+ (tested up to 3.13) · Persian & English
 
 [راهنمای فارسی](README.md)
 
-> **Current delivery 2.5.4:** the app no longer closes by itself after hours (background task handles leaked
-> and the trade monitor wrote to the database hundreds of times a second); logs, crash traces and a session
-> heartbeat now go to `data\logs\`. Auto trading really opens trades and shows why candidates were rejected.
-> New **⚡ Ultra scalp** (paper, live prices): whole-market momentum scan every second, close at your net profit
-> after fees, up to 200 concurrent trades. [Release report](docs/RELEASE_2.5.4_FA.md).
+> **Current delivery 2.5.8:** signal-engine bug fixes — Bollinger %B compared on the wrong scale (94% of mean-reversion
+> votes were SHORT), STOCH/BBANDS read under wrong names (components never ran), live analysis on the still-forming candle
+> (repaint), asymmetric BREAKDOWN structure. Honest A/B backtest: bias removed, still no edge (PF < 1). [Report](docs/RELEASE_2.5.8_FA.md).
+>
+> **Previous delivery 2.5.7:** why every scalp lost — far target + short hold + costs meant ~all trades closed by timeout
+> below costs, even with the right direction. Target-reachability gate, real bid/ask before ultra entry, spread-vs-stop guard,
+> break-even that locks a small profit, exit-reason stats. [Report](docs/RELEASE_2.5.7_FA.md).
+>
+> **Previous delivery 2.5.6:** deep review — scalps lost because a no-edge direction loses the round-trip fee on every trade
+> (cost gate, honest breakeven math, measured negative-edge guard); technical confidence ≥68 was the worst bucket in both
+> backtest periods and is now damped instead of boosted. [Report](docs/RELEASE_2.5.6_FA.md).
+>
+> **Previous delivery 2.5.5:** signal intelligence upgrade without removing any feature: STRONG/NORMAL/WEAK quality,
+> separate technical and final confidence, a Signal Quality card in signal details, quality-based position size,
+> a real no-look-ahead backtest and walk-forward (`tools/run_backtest.py`), and a validation gate that keeps live
+> execution locked until performance is proven. [Release report](docs/RELEASE_2.5.5_FA.md) ·
+> [Backtest](docs/BACKTEST_2.5.5.md).
 >
 > **Previous delivery 2.5.3:** build robots fixed — the Windows installer build no longer opens app windows
 > (full tests are opt-in with `--with-tests` and run headless) and streams its output to `build_logs\`; the APK

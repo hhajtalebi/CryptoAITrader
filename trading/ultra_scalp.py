@@ -65,6 +65,9 @@ class UltraCandidate:
     #: هدف/حد ضرر ندارد؛ موتور از بودجهٔ دلاری کاربر می‌سازد
     take_profit: float = 0.0
     stop_loss: float = 0.0
+    #: نسخهٔ ۲.۵.۷ — نوسان اندازه‌گیری‌شده به ازای هر ثانیه (درصد)؛ موتور با آن
+    #: بررسی می‌کند هدف در مدت نگه‌داری اصلاً دست‌یافتنی است یا نه
+    volatility_per_second: float = 0.0
 
 
 def momentum(points: list[tuple[float, float]], *, now_ms: float, window_ms: float) -> tuple[float, float, int]:
@@ -82,6 +85,32 @@ def momentum(points: list[tuple[float, float]], *, now_ms: float, window_ms: flo
     consistency = abs(sum(steps)) / travel if travel > 0 else 0.0
     move = (last - first) / first * 100.0 if first > 0 else 0.0
     return move, consistency, len(recent)
+
+
+def volatility_per_second(
+    points: list[tuple[float, float]], *, now_ms: float, window_ms: float = 300_000.0
+) -> float:
+    """
+    انحراف معیار بازده به ازای یک ثانیه (درصد) از تاریخچهٔ تیک اخیر — نسخهٔ ۲.۵.۷.
+
+    واریانس = Σ(بازده لگاریتمی²) ÷ Σ(فاصلهٔ زمانی)؛ فاصله‌های نامنظم تیک را
+    درست وزن می‌دهد. داده ناکافی → ۰ (یعنی نامعلوم؛ دروازه اعمال نمی‌شود).
+    """
+    recent = [(ts, price) for ts, price in points if now_ms - ts <= window_ms and price > 0]
+    if len(recent) < 6:
+        return 0.0
+    total_sq = 0.0
+    total_dt = 0.0
+    for (t0, p0), (t1, p1) in zip(recent, recent[1:]):
+        dt = (t1 - t0) / 1000.0
+        if dt <= 0:
+            continue
+        r = math.log(p1 / p0)
+        total_sq += r * r
+        total_dt += dt
+    if total_dt < 30.0:
+        return 0.0
+    return math.sqrt(total_sq / total_dt) * 100.0
 
 
 class UltraScalpSource:
@@ -179,6 +208,7 @@ class UltraScalpSource:
                 symbol=symbol, price=price, direction=direction, score=round(score, 1),
                 move_percent=round(move, 4), consistency=round(consistency, 3),
                 turnover_24h=turnover,
+                volatility_per_second=round(volatility_per_second(points, now_ms=now_ms), 6),
                 reasons=[f"حرکت {move:+.3f}٪ در {window_ms / 1000:.0f} ثانیه، یکنواختی {consistency:.2f}"],
             ))
         candidates.sort(key=lambda item: item.score, reverse=True)

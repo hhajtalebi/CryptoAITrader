@@ -50,6 +50,52 @@ from ui.widgets.position_calculator import PositionCalculator
 NOT_ENTERABLE_STATES = frozenset({"STALE", "EXPIRED", "INVALIDATED"})
 
 
+def quality_rows(signal: dict[str, Any], intel: dict[str, Any], tr: Any) -> list[tuple[str, str, str]]:
+    """
+    ردیف‌های داشبورد کیفیت (بدون وابستگی به Qt تا آزمون‌پذیر باشد).
+
+    خروجی: [(برچسب، مقدار، لحن)] — لحن bullish/bearish/"".
+    """
+    def pct(value: Any) -> str:
+        return f"{int(value)}%" if isinstance(value, (int, float)) else "—"
+
+    def label(key: str, default: str) -> str:
+        return tr.tr(f"signals.quality.{key}", default)
+
+    quality = str(intel.get("quality") or "")
+    decision = str(intel.get("decision") or "")
+    tone = {"STRONG": "bullish", "WEAK": "bearish"}.get(quality, "")
+    direction = str(intel.get("base_direction") or signal.get("direction") or "")
+    shown = direction if decision != "NO_TRADE" else f"NO_TRADE ({direction})"
+    rr = signal.get("risk_reward")
+    rows: list[tuple[str, str, str]] = [
+        (label("signal", "Signal"), shown, "bearish" if decision == "NO_TRADE" else ""),
+        (label("technical", "Technical confidence"), pct(intel.get("technical_confidence")), ""),
+        (label("prediction", "Prediction probability"), pct(intel.get("prediction_probability")), ""),
+        (label("mtf", "MTF alignment"), pct(intel.get("mtf_alignment")), ""),
+        (
+            label("regime", "Regime"),
+            f"{intel.get('regime') or 'unknown'} ({pct(intel.get('regime_score'))})",
+            "",
+        ),
+        (
+            label("historical_edge", "Historical edge"),
+            f"{pct(intel.get('historical_edge'))} (n={int(intel.get('historical_samples') or 0)})",
+            "",
+        ),
+        (label("risk_reward", "R/R"), f"{float(rr):.2f}" if isinstance(rr, (int, float)) else "—", ""),
+        (label("final", "Final confidence"), pct(intel.get("final_confidence")), tone),
+        (label("quality", "Quality"), quality or decision or "—", tone),
+    ]
+    size = intel.get("size_multiplier")
+    if isinstance(size, (int, float)) and decision == "TRADE":
+        rows.append((label("size", "Position size"), f"×{float(size):.2f}", ""))
+    weak = str(intel.get("weak_reason") or "")
+    if weak and (quality == "WEAK" or decision == "NO_TRADE"):
+        rows.append((label("weak_reason", "Why weak"), weak, "bearish"))
+    return rows
+
+
 class _TokenOnly:
     """
     آداپتور کوچک برای `color_for` که یک شیء دارای `token` می‌خواهد.
@@ -124,6 +170,9 @@ class SignalDetailDialog(QDialog):
         recommendation = self._build_recommendation()
         if recommendation is not None:
             body_layout.addWidget(recommendation)
+        quality = self._build_quality()
+        if quality is not None:
+            body_layout.addWidget(quality)
         body_layout.addWidget(self._build_levels())
         validity = self._build_validity()
         if validity is not None:
@@ -373,6 +422,44 @@ class SignalDetailDialog(QDialog):
     def trade_opened(self) -> None:
         """پس از باز شدن موفق معامله، پنجره بسته می‌شود (خواستهٔ کاربر)."""
         self.accept()
+
+    def _build_quality(self) -> QWidget | None:
+        """
+        داشبورد کیفیت سیگنال — نسخهٔ ۲.۵.۵.
+
+        سیگنال، اطمینان فنی، احتمال پیش‌بینی، هم‌سویی چندتایم‌فریمی، رژیم،
+        لبهٔ تاریخی، نسبت ریسک به سود، اطمینان نهایی و کیفیت؛ و وقتی
+        کیفیت WEAK است دلیلش. سیگنال همیشه نمایش داده می‌شود.
+        """
+        intel = self._signal.get("intelligence") or {}
+        if not isinstance(intel, dict) or not intel or not intel.get("decision"):
+            return None
+        rows = quality_rows(self._signal, intel, self.tr_)
+        if not rows:
+            return None
+        frame = QFrame()
+        frame.setProperty("role", "card")
+        frame.setObjectName("signalQualityCard")
+        layout = QGridLayout(frame)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setHorizontalSpacing(18)
+        layout.setVerticalSpacing(8)
+        title = QLabel(self.tr_.tr("signals.quality.title", "Signal quality"))
+        title.setProperty("role", "subtitle")
+        layout.addWidget(title, 0, 0, 1, 2)
+        row = 1
+        for key, value, tone in rows:
+            key_label = QLabel(key)
+            key_label.setProperty("role", "muted")
+            value_label = QLabel(value)
+            value_label.setWordWrap(True)
+            if tone:
+                value_label.setProperty("tone", tone)
+            layout.addWidget(key_label, row, 0)
+            layout.addWidget(value_label, row, 1)
+            row += 1
+        layout.setColumnStretch(1, 1)
+        return frame
 
     def _build_meta(self) -> QWidget:
         """اطلاعات تکمیلی: روند، ساختار بازار، زمان و منبع."""

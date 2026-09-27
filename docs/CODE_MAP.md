@@ -9817,3 +9817,26 @@ self._scorecard_timer.timeout.connect(self._scorecard_tick)
   `_schedule_auto_refresh`/`_flush_auto_refresh`، `AUTO_REJECTION_KEYS`، `_auto_scan_summary`، `_ultra_source`.
 - آزمون: `tests/test_v254_ultra_and_stability.py`.
 
+## مکمل نسخهٔ 2.5.5
+
+- `signals/intelligent_decision.py` (جدید): `DecisionConfig`، `DecisionInputs`، `EvidenceComponent`، `IntelligentDecision.to_dict()`،
+  `IntelligentDecisionEngine(config).evaluate(inputs)` / `.rescore(snapshot, cfg)`، `eligibility_confidence(signal)`،
+  `resolve_direction(evidence, weights=, min_margin=)`، `btc_context_from_candles`، `strategy_scores`، `regime_fit`.
+- `signals/orderflow.py` (جدید): `volume_delta_series`، `cvd_series`، `cvd_slope`، `orderbook_imbalance`، `OrderFlowSnapshot`،
+  `build_snapshot(candles, orderbook=, futures=)`، `series_for_features(candles, futures_series=)`. اتصال: `signals/prediction/engine.py::_orderflow_extra`.
+- `signals/learning.py` (جدید): `OutcomeRecord`، `PerformanceLearner(min_samples=30).fit(records)`، `historical_edge`، `strategy_multiplier`،
+  `multipliers_for`، `quality_report`، `health`، `wilson_interval`، `shrunk_mean`، `record_from_snapshot`، `load_records_from_database(db)`.
+- `backtest/` (جدید): `data.load_candles/resample`، `market.HistoricalMarket` (`live=False`، `candles_at`، `candle_source`)، `execution.ExecutionModel/
+  simulate_trade/TradeResult`، `metrics.summarize/by_key/calibration`، `engine.BacktestEngine/Evaluation/build_signal_engine/records_from_trades`،
+  `walk_forward.make_folds/tune/run_walk_forward/objective`.
+- `trading/validation_gate.py` (جدید): `GateCriteria`، `ValidationGate(store_path, paper_source=, learner_source=, risk_source=)`،
+  `record_backtest_report`، `evaluate`، `live_allowed()`، `paper_stats_from_database`، `summarize_pnls`.
+- `tools/run_backtest.py` (جدید): `--data-dir --out --symbols --workers --step-bars --warmup-bars --no-prediction --refresh --record-gate --from-report`.
+- `signals/engine.py`: `set_intelligence(engine, prediction_lookup=, learner=, orderbook_lookup=)`، ویژگی‌های `intelligence`/`learner`.
+- `app/application.py`: `_wire_intelligence`، `learner`، `refresh_learner()`، `validation_gate`. تنظیم `SettingKey.SIGNAL_INTELLIGENCE_ENABLED`.
+- `trading/auto_trader.py`: `AutoTrader(live_gate=)`، `live_execution_allowed()`، `live_gate_reason`، `size_multiplier` نامزد.
+- `trading/confidence_source.py`: `ConfidenceCandidate.quality/size_multiplier/intelligence`. `trading/scalp_scanner.py`: `resolve_scalp_direction`،
+  `apply_direction_evidence`، `ScalpCandidate.direction_source/conviction/evidence`. `trading/scalp_service.py`: `_resolve_directions`.
+- UI: `ui/dialogs/signal_detail_dialog.py::quality_rows` + `_build_quality` (`signalQualityCard`)، `ui/pages/signals_page.py` (کیفیت در ستون اطمینان)،
+  `ui/signal_share.py` (خط کیفیت)، `localization/*/signals.json::quality`.
+- آزمون: `tests/test_v255_intelligence.py`.

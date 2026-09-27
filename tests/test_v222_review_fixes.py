@@ -55,6 +55,8 @@ CONFIG_VALUES = dict(
     trailing_activation=2.7, trailing_offset=0.8, signal_invalidation=False,
     trend_conflict_policy="penalize", allocation_mode="percent", allocation_percent=8.0,
     max_total_margin_percent=20.0,
+    edge_guard_enabled=False, edge_guard_min_trades=75,
+    break_even_lock=0.3, reach_ratio=0.7, max_spread_stop_fraction=0.25,
 )
 
 

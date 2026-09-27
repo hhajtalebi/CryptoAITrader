@@ -990,10 +990,27 @@ class SignalsPage(BasePage):
             self._emphasise(dir_item, dir_grade.emphasis)
             self.scan_table.setItem(index, 2, dir_item)
 
-            conf_item = QTableWidgetItem(f"{conf_grade.mark}  {confidence}%")
+            # نسخهٔ ۲.۵.۵: کیفیت (STRONG/NORMAL/WEAK) کنار اطمینان نهایی؛
+            # سیگنال همیشه دیده می‌شود، فقط برچسب و راهنما اضافه شده است.
+            intel = row.get("intelligence") if isinstance(row.get("intelligence"), dict) else {}
+            quality = str(intel.get("quality") or "")
+            conf_text = f"{conf_grade.mark}  {confidence}%"
+            if quality:
+                conf_text += f" · {quality}"
+            conf_item = QTableWidgetItem(conf_text)
             conf_item.setForeground(QBrush(QColor(color_for(conf_grade, self._theme))))
             self._emphasise(conf_item, conf_grade.emphasis)
             conf_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            if intel.get("decision"):
+                tip = (
+                    f"{self.tr_.tr('signals.quality.technical', 'Technical confidence')}: "
+                    f"{intel.get('technical_confidence', '—')}% → "
+                    f"{self.tr_.tr('signals.quality.final', 'Final confidence')}: "
+                    f"{intel.get('final_confidence', confidence)}%"
+                )
+                if intel.get("weak_reason"):
+                    tip += f"\n{self.tr_.tr('signals.quality.weak_reason', 'Why weak')}: {intel['weak_reason']}"
+                conf_item.setToolTip(tip)
             self.scan_table.setItem(index, 3, conf_item)
 
             risk_item = QTableWidgetItem(

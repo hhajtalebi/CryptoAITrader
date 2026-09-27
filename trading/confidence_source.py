@@ -52,6 +52,10 @@ class ConfidenceCandidate:
     stop_loss: float = 0.0
     turnover_24h: float | None = None
     observed_at: float = field(default_factory=time.time)
+    #: نسخهٔ ۲.۵.۵ — کیفیت و ضریب اندازه از لایهٔ تصمیم هوشمند
+    quality: str = ""
+    size_multiplier: float = 1.0
+    intelligence: dict = field(default_factory=dict)
 
     @property
     def confidence(self) -> float:
@@ -159,8 +163,12 @@ class ConfidenceCandidateSource:
             return None
 
         confidence = float(getattr(signal, "confidence", 0) or 0)
-        if confidence < threshold:
+        # نسخهٔ ۲.۵.۵: صلاحیت با اطمینان فنی؛ final فقط اندازه را تعدیل می‌کند
+        from signals.intelligent_decision import eligibility_confidence
+
+        if eligibility_confidence(signal) < threshold:
             return None
+        intel = dict(getattr(signal, "intelligence", None) or {})
 
         # `TradingSignal` قیمت ورود را به‌صورت **بازه** نگه می‌دارد
         # (`entry_min`/`entry_max`) و فیلدی به نام `entry_price` ندارد.
@@ -190,4 +198,7 @@ class ConfidenceCandidateSource:
             stop_loss=float(getattr(signal, "stop_loss", 0) or 0),
             take_profit=next((float(p) for p in (getattr(signal, "take_profits", []) or [])
                               if (float(p) - price) * (1 if direction == "LONG" else -1) > 0), 0.0),
+            quality=str(intel.get("quality") or ""),
+            size_multiplier=float(intel.get("size_multiplier") or 1.0),
+            intelligence=intel,
         )

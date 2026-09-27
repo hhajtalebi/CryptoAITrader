@@ -1,9 +1,30 @@
 # تحویل پروژه به هوش مصنوعی بعدی
 
 این فایل منبع ادامهٔ کار است. با هر نسخه باید همین فایل به‌روز شود.
-تاریخ این نگارش: ۲۰۲۶-۰۹-۲۵، نسخهٔ برنامه `2.5.4`.
+تاریخ این نگارش: ۲۰۲۶-۰۹-۲۵، نسخهٔ برنامه `2.5.5`.
 
-## وضعیت جاری ۲.۵.۴ — بسته‌شدن خودکار EXE، معاملهٔ خودکاری که باز نمی‌شد، اسکالپ فوق‌سریع
+## وضعیت جاری ۲.۵.۵ — ارتقای هوشمندی سیگنال (بدون بازنویسی)
+
+درخواست کاربر: لایهٔ تحلیل هوشمند روی معماری موجود (سیگنال پایه ← پیش‌بینی + MTF + رژیم + زمینه ← نهایی)، کیفیت
+STRONG/NORMAL/WEAK، خروجی‌های جدا، NO_TRADE فقط در تعارض شدید، بک‌تست و walk-forward واقعی، دروازهٔ قفل اجرای واقعی.
+- `signals/intelligent_decision.py`: `IntelligentDecisionEngine.evaluate(DecisionInputs)` ← `IntelligentDecision` (technical/final
+  confidence، prediction_probability، mtf_alignment، regime_score، historical_edge، execution_quality، quality، size_multiplier ۱/۰٫۷۵/۰٫۵،
+  weak_reason)، `rescore(snapshot, cfg)` برای walk-forward، `eligibility_confidence(signal)` (آستانهٔ کاربر با اطمینان **فنی**)،
+  `resolve_direction`. NO_TRADE: ≥۳ از (prediction, mtf, regime, history) با امتیاز ≤ −۰٫۵ و نسبت ≤ −۰٫۴۵.
+- `signals/orderflow.py` (CVD/دلتا/دفتر سفارش؛ فیوچرز «ناموجود»)، `signals/learning.py` (`PerformanceLearner`، حداقل ۳۰ نمونه،
+  Wilson، shrinkage؛ `load_records_from_database`)، `backtest/` (`HistoricalMarket` بدون look-ahead، `simulate_trade` با
+  کارمزد/اسپرد/لغزش، `summarize`/`calibration`، `make_folds`/`tune`/`run_walk_forward`)، `trading/validation_gate.py`
+  (`ValidationGate.live_allowed()`، پیش‌فرض قفل)، `tools/run_backtest.py` (`--record-gate`، `--from-report`).
+- اتصال: `SignalEngine.set_intelligence(...)` در `app/application.py::_wire_intelligence` (تنظیم `signals.intelligence_enabled`)؛
+  `TradingSignal.intelligence` در `market_snapshot`؛ `AutoTrader(live_gate=)` ← با live و دروازهٔ قفل ورود کاغذی و بدون درگاه؛
+  `size_multiplier` روی مارجین؛ اسکالپ: `apply_direction_evidence` (تنظیم `scalp.evidence_direction`)؛ UI: کارت `signalQualityCard`
+  (`quality_rows`)، کیفیت در جدول پویش و متن کپی، کلیدهای `signals.quality.*`.
+- بک‌تست واقعی (۱۲ نماد ۵m، ۱۸٬۳۷۲ ارزیابی): تعداد سیگنال یکسان، NO_TRADE=۰؛ بهبود امید/افت فقط از اندازهٔ کوچک‌تر، ترتیب
+  کیفیت و کالیبراسیون تأیید نشد، جهت شواهدی اسکالپ بهبود نداد؛ دروازه قفل. `docs/BACKTEST_2.5.5.md`.
+آزمون: `tests/test_v255_intelligence.py` (۴۰)؛ کل مجموعه 2604 پاس + 2 skip. گزارش: `docs/RELEASE_2.5.5_FA.md`.
+**commit نشده** (آخرین commit: `d842827` = 2.5.3+2.5.4).
+
+## وضعیت قبلی ۲.۵.۴ — بسته‌شدن خودکار EXE، معاملهٔ خودکاری که باز نمی‌شد، اسکالپ فوق‌سریع
 
 گزارش کاربر: (۱) EXE پس از چند دقیقه/ساعت خودش بسته می‌شود؛ (۲) معاملهٔ خودکار هیچ معامله‌ای باز نمی‌کند؛
 (۳) «اسکالپ فوق‌سریع» با اهرم بالا، بستن در سود خالص کاربر (مثلاً ۲–۳ دلار پس از کارمزد) و ~۱۰۰ معاملهٔ هم‌زمان
@@ -28,7 +49,7 @@
   (`MAX_STREAMED_SYMBOLS`)، بقیه با REST هر ۳ ثانیه.
 آزمون: `tests/test_v254_ultra_and_stability.py`؛ کل مجموعه 2564 پاس + 2 skip. شبیه‌سازی ۳۰۰ نماد: ۱۰۰ معامله در
 کمتر از ۸ ثانیه، بستن در سود خالص ≈ ۲ دلار (دادهٔ مصنوعی؛ نشانهٔ سودآوری نیست). گزارش: `docs/RELEASE_2.5.4_FA.md`.
-**commit نشده** (آخرین commit: `511d2b5` = 2.5.1+2.5.2؛ 2.5.3 هم commit نشده است).
+commit شد: `d842827` (2.5.3+2.5.4).
 
 ## وضعیت قبلی ۲.۵.۳ — ربات‌های ساخت فایل نصبی ویندوز و APK
 
@@ -511,3 +532,45 @@ commit/push می‌دهد.
 ## پیشنهادهای بعدی
 
 فهرست جداست: `ADVANCED_FEATURES_FA.md`.
+
+
+## نسخهٔ 2.5.6 — بازبینی عمیق (2026-09-26)
+- ریشهٔ منفی بودن اسکالپ: جهت بی‌برتری + هزینهٔ رفت‌وبرگشت. امید ریاضی بدون برتری = −کارمزد (`MicroPlan.no_edge_expectancy`).
+- اسکالپ:
+  - دروازهٔ هزینه `scalp.min_cost_multiple`=3 (`score_candidate(min_cost_multiple=...)`).
+  - فیلدهای `cost_percent`/`breakeven_win_rate`.
+  - محافظ `AutoTradeConfig.edge_guard_enabled/edge_guard_min_trades` (حد بالای ۹۵٪ یک‌طرفه < ۰ → رد `negative_edge`؛ `start()` آمار را صفر می‌کند).
+- سیگنال:
+  - اطمینان فنی ≥۷۰ در هر دو دورهٔ بک‌تست ۲۷–۲۹٪ درست بود.
+  - `DecisionConfig.saturation_start=68` پایه را بازتاب می‌دهد و شاهد `exhaustion` را اضافه می‌کند (نه NO_TRADE، تعداد سیگنال ثابت).
+  - `rescore` هم اعمال می‌کند.
+- کشیدگی:
+  - `extension_atr`/`extension_bucket` در intelligence ذخیره می‌شوند.
+  - یادگیرنده: الگوی (جهت، رژیم، ext:سطل) با برگشت به سطوح قبلی.
+  - `BacktestEngine.annotate_extension` برای کش‌های قدیمی.
+- فیلتر ثابت ضدکشیدگی رد شد: اثرش بین ۲۰۱۸ و ۲۰۲۵ عکس بود (بیش‌برازش).
+- ابزارها: `tools/scalp_diagnostics.py`، `tools/signal_diagnostics.py`. گزارش: `docs/RELEASE_2.5.6_FA.md`.
+
+
+## نسخهٔ 2.5.8 — رفع باگ‌های موتور سیگنال (2026-09-26)
+- B1 `mean_reversion`: %B (۰..۱۰۰) با ۰٫۰۵/۰٫۹۵ مقایسه می‌شد ⇒ ۹۴٪ رأی SHORT. ثابت‌های `PERCENT_B_LOW=5`/`PERCENT_B_HIGH=95`.
+- B2 `momentum`: `STOCHASTIC` ← `STOCH`. B3 `volatility_regime`: `BOLLINGER` ← `BBANDS` (هر دو جزء هرگز اجرا نمی‌شدند).
+- B4 `signals/engine.py`: `closed_candles(candles, tf, now)` کندل باز را (بر اساس زمان باز شدن) از تحلیل زنده کنار می‌گذارد؛
+  `analysis['last_price']` قیمت ورود و مرکز `forecast_next(price=)`؛ حذف `[:-1]` تکراری در رژیم/جریان سفارش؛ `market.live=False` دست‌نخورده.
+- B5/B6 `intelligent_decision.structure_sign`: BREAKDOWN هم‌وزن BREAKOUT در `_structure` و `_mtf`.
+- ممیزی: SHORT ۱۸۰۵→۱۱۵۸، LONG ۷۲۳→۱۰۵۷. بک‌تست A/B: معاملات ۲۵۳→۲۶۶، PF کل ۰٫۶۴۳→۰٫۶۵۶؛ walk-forward بدتر
+  (۲۰۱۸: ۰٫۵۱۸→۰٫۴۵۱)، چون سوگیری SHORT قبلی در پنجره‌های نزولی شانسی سود می‌داد. هر دو PF<1؛ لبه ساخته نشد؛ دروازه قفل.
+- آزمون: `tests/test_v258_signal_bug_fixes.py` (۱۶؛ شامل محافظ ارجاع اندیکاتور). گزارش: `docs/RELEASE_2.5.8_FA.md`.
+
+## نسخهٔ 2.5.7 — چرا همهٔ اسکالپ‌ها ضرر بودند (2026-09-26)
+- ریشه: پیش‌تنظیم Ultra (TP ۰٫۵۲٪ حرکت، نگه‌داری ۱۸۰ ثانیه). حرکت معمول ۳ دقیقه ۰٫۰۷ تا ۰٫۱۳٪ است، پس ۹۴ تا ۱۰۰٪ معاملات با timeout و حرکتی کمتر از هزینه (کارمزد ۰٫۱۲ + لغزش ۰٫۰۴ + اسپرد) بسته می‌شدند. حتی با جهت درست و ۰٫۰۹٪ حرکت هم‌جهت، ۸۲٪ زیان بود.
+- باگ‌های اجرایی:
+  - ورود اولترا روی Last بدون دفتر و خروج روی Bid/Ask، یعنی اسپرد پنهان. دروازهٔ اسپرد هم برای فید کل بازار کور بود (spread=0).
+  - خروج سر‌به‌سر دقیقاً روی خالص صفر بود و با پرش تیک همیشه ≤۰ می‌شد.
+- اصلاح:
+  - `reach_ratio`=0.5: σ×√hold ≥ max(0.5×حرکت TP، ۲×هزینه). رد: `target_unreachable`.
+  - `max_spread_stop_fraction`=0.33. رد: `spread_eats_stop`.
+  - اولترا بدون Bid/Ask تازه: `no_orderbook` + خواندن دفتر در پس‌زمینه (بدون تأخیر ورود دیگران).
+  - `break_even_lock`=0.1$.
+  - `edge_stats()['exit_reasons']` در خط وضعیت.
+- شبیه‌سازی بازار ترکیبی (`.cache/ultra_mix.py`): برد ۱۲٪ → ۲۸٪، زیان کل −۵۸۹۹ → −۹۳۷ (۶۰۰۰ نامزد). میانگین هر معامله هنوز ≈ −کارمزد (بدون برتری جهت).

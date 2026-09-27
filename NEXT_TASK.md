@@ -1,6 +1,38 @@
 # کار بعدی
 
-## وضعیت جاری ۲.۵.۴ — بسته‌شدن خودکار EXE، معاملهٔ خودکاری که باز نمی‌شد، اسکالپ فوق‌سریع
+## وضعیت جاری ۲.۵.۸ — رفع باگ‌های موتور سیگنال (2026-09-26)
+- B1 `mean_reversion`: %B (۰..۱۰۰) با ۰٫۰۵/۰٫۹۵ مقایسه می‌شد ⇒ ۹۴٪ رأی SHORT. ثابت‌های `PERCENT_B_LOW=5`/`PERCENT_B_HIGH=95`.
+- B2 `momentum`: `STOCHASTIC` ← `STOCH`. B3 `volatility_regime`: `BOLLINGER` ← `BBANDS` (هر دو جزء هرگز اجرا نمی‌شدند).
+- B4 `signals/engine.py`: `closed_candles(candles, tf, now)` کندل باز را (بر اساس زمان باز شدن) از تحلیل زنده کنار می‌گذارد؛
+  `analysis['last_price']` قیمت ورود و مرکز `forecast_next(price=)`؛ حذف `[:-1]` تکراری در رژیم/جریان سفارش؛ `market.live=False` دست‌نخورده.
+- B5/B6 `intelligent_decision.structure_sign`: BREAKDOWN هم‌وزن BREAKOUT در `_structure` و `_mtf`.
+- ممیزی: SHORT ۱۸۰۵→۱۱۵۸، LONG ۷۲۳→۱۰۵۷. بک‌تست A/B: معاملات ۲۵۳→۲۶۶، PF کل ۰٫۶۴۳→۰٫۶۵۶؛ walk-forward بدتر
+  (۲۰۱۸: ۰٫۵۱۸→۰٫۴۵۱)، چون سوگیری SHORT قبلی در پنجره‌های نزولی شانسی سود می‌داد. هر دو PF<1؛ لبه ساخته نشد؛ دروازه قفل.
+- آزمون: `tests/test_v258_signal_bug_fixes.py` (۱۶؛ شامل محافظ ارجاع اندیکاتور). گزارش: `docs/RELEASE_2.5.8_FA.md`.
+**commit نشده** (آخرین commit: `d842827`). پیشنهادهای طراحی §۱۹ سند مسیر منتظر تأیید کاربر.
+
+## وضعیت جاری ۲.۵.۵ — ارتقای هوشمندی سیگنال (بدون بازنویسی)
+
+درخواست کاربر: لایهٔ تحلیل هوشمند روی معماری موجود (سیگنال پایه ← پیش‌بینی + MTF + رژیم + زمینه ← نهایی)، کیفیت
+STRONG/NORMAL/WEAK، خروجی‌های جدا، NO_TRADE فقط در تعارض شدید، بک‌تست و walk-forward واقعی، دروازهٔ قفل اجرای واقعی.
+- `signals/intelligent_decision.py`: `IntelligentDecisionEngine.evaluate(DecisionInputs)` ← `IntelligentDecision` (technical/final
+  confidence، prediction_probability، mtf_alignment، regime_score، historical_edge، execution_quality، quality، size_multiplier ۱/۰٫۷۵/۰٫۵،
+  weak_reason)، `rescore(snapshot, cfg)` برای walk-forward، `eligibility_confidence(signal)` (آستانهٔ کاربر با اطمینان **فنی**)،
+  `resolve_direction`. NO_TRADE: ≥۳ از (prediction, mtf, regime, history) با امتیاز ≤ −۰٫۵ و نسبت ≤ −۰٫۴۵.
+- `signals/orderflow.py` (CVD/دلتا/دفتر سفارش؛ فیوچرز «ناموجود»)، `signals/learning.py` (`PerformanceLearner`، حداقل ۳۰ نمونه،
+  Wilson، shrinkage؛ `load_records_from_database`)، `backtest/` (`HistoricalMarket` بدون look-ahead، `simulate_trade` با
+  کارمزد/اسپرد/لغزش، `summarize`/`calibration`، `make_folds`/`tune`/`run_walk_forward`)، `trading/validation_gate.py`
+  (`ValidationGate.live_allowed()`، پیش‌فرض قفل)، `tools/run_backtest.py` (`--record-gate`، `--from-report`).
+- اتصال: `SignalEngine.set_intelligence(...)` در `app/application.py::_wire_intelligence` (تنظیم `signals.intelligence_enabled`)؛
+  `TradingSignal.intelligence` در `market_snapshot`؛ `AutoTrader(live_gate=)` ← با live و دروازهٔ قفل ورود کاغذی و بدون درگاه؛
+  `size_multiplier` روی مارجین؛ اسکالپ: `apply_direction_evidence` (تنظیم `scalp.evidence_direction`)؛ UI: کارت `signalQualityCard`
+  (`quality_rows`)، کیفیت در جدول پویش و متن کپی، کلیدهای `signals.quality.*`.
+- بک‌تست واقعی (۱۲ نماد ۵m، ۱۸٬۳۷۲ ارزیابی): تعداد سیگنال یکسان، NO_TRADE=۰؛ بهبود امید/افت فقط از اندازهٔ کوچک‌تر، ترتیب
+  کیفیت و کالیبراسیون تأیید نشد، جهت شواهدی اسکالپ بهبود نداد؛ دروازه قفل. `docs/BACKTEST_2.5.5.md`.
+آزمون: `tests/test_v255_intelligence.py` (۴۰)؛ کل مجموعه 2604 پاس + 2 skip. گزارش: `docs/RELEASE_2.5.5_FA.md`.
+**commit نشده** (آخرین commit: `d842827` = 2.5.3+2.5.4).
+
+## وضعیت قبلی ۲.۵.۴ — بسته‌شدن خودکار EXE، معاملهٔ خودکاری که باز نمی‌شد، اسکالپ فوق‌سریع
 
 گزارش کاربر: (۱) EXE پس از چند دقیقه/ساعت خودش بسته می‌شود؛ (۲) معاملهٔ خودکار هیچ معامله‌ای باز نمی‌کند؛
 (۳) «اسکالپ فوق‌سریع» با اهرم بالا، بستن در سود خالص کاربر (مثلاً ۲–۳ دلار پس از کارمزد) و ~۱۰۰ معاملهٔ هم‌زمان
@@ -25,7 +57,7 @@
   (`MAX_STREAMED_SYMBOLS`)، بقیه با REST هر ۳ ثانیه.
 آزمون: `tests/test_v254_ultra_and_stability.py`؛ کل مجموعه 2564 پاس + 2 skip. شبیه‌سازی ۳۰۰ نماد: ۱۰۰ معامله در
 کمتر از ۸ ثانیه، بستن در سود خالص ≈ ۲ دلار (دادهٔ مصنوعی؛ نشانهٔ سودآوری نیست). گزارش: `docs/RELEASE_2.5.4_FA.md`.
-**commit نشده** (آخرین commit: `511d2b5` = 2.5.1+2.5.2؛ 2.5.3 هم commit نشده است).
+commit شد: `d842827` (2.5.3+2.5.4).
 
 ## وضعیت قبلی ۲.۵.۳ — ربات‌های ساخت فایل نصبی ویندوز و APK
 
@@ -295,3 +327,9 @@ LSTM بدون torch اختیاری).
 
 کامیت و پوش فقط وقتی کاربر همین نسخه را تست کرد و صریح تأیید کرد.
 تا پیش از آن، تحویل فقط زیپ روی صفحهٔ دانلود است.
+
+
+## پس از 2.5.6
+- اجرای کاغذی چندهفته‌ای برای تغذیهٔ یادگیرنده (الگوی کشیدگی) و دروازهٔ اعتبارسنجی.
+- دادهٔ تاریخی بیشتر (ماه‌ها، بازارهای USDT) برای اعتبارسنجی مستقل پیش از هر تغییر وزن.
+- بررسی وزن بیشتر mean_reversion در رژیم range (تنها استراتژی با دقت بالای ۵۰٪) — فقط با walk-forward.

@@ -28,6 +28,7 @@ from typing import Any
 
 from app.logging import get_logger
 from trading.scalp_scanner import (
+    DEFAULT_MIN_COST_MULTIPLE,
     ScalpCandidate,
     feasibility_note,
     prefilter_symbols,
@@ -100,6 +101,10 @@ class ScalpService:
             len(tickers), len(shortlist),
         )
 
+        try:
+            cost_multiple = float(self._setting("scalp.min_cost_multiple", DEFAULT_MIN_COST_MULTIPLE))
+        except (TypeError, ValueError):
+            cost_multiple = DEFAULT_MIN_COST_MULTIPLE
         semaphore = asyncio.Semaphore(FETCH_CONCURRENCY)
 
         async def evaluate(ticker: Any) -> ScalpCandidate | None:
@@ -116,6 +121,7 @@ class ScalpService:
                     candles,
                     spread=spread_from_orderbook(book),
                     max_spread=max_spread,
+                    min_cost_multiple=cost_multiple,
                 )
 
         results = await asyncio.gather(
@@ -125,6 +131,11 @@ class ScalpService:
             item for item in results if isinstance(item, ScalpCandidate)
         ]
         ranked = rank_candidates(candidates, limit=10)
+        # نسخهٔ ۲.۵.۵: اسکنر نامزد پیدا می‌کند؛ جهت با شواهد چندتایم‌فریمی
+        # (۱m/۵m/۱۵m/۱h/۴h + دفتر سفارش) تعیین می‌شود، نه فقط مومنتوم.
+        if ranked and bool(self._setting("scalp.evidence_direction", True)):
+            ranked = await self._resolve_directions(ranked)
+            ranked = rank_candidates(ranked, limit=10)
         logger.info("Scalp scan produced %d candidates", len(ranked))
 
         should_use_ai = (
@@ -133,6 +144,55 @@ class ScalpService:
         if should_use_ai and ranked:
             ranked = await self._ai_review(ranked)
         return ranked
+
+    async def _resolve_directions(self, ranked: list[ScalpCandidate]) -> list[ScalpCandidate]:
+        """
+        تعیین جهت نامزدهای برتر با شواهد چندتایم‌فریمی.
+
+        کندل‌های تایم‌فریم بالا ۶۰ ثانیه کش می‌شوند تا پویش سریع اسکالپ
+        بار اضافه‌ای نسازد. خطای هر نماد → همان نامزد بدون تغییر.
+        """
+        from signals.orderflow import orderbook_imbalance
+        from trading.scalp_scanner import apply_direction_evidence
+
+        cache: dict[tuple[str, str], tuple[float, list[Any]]] = getattr(self, "_htf_cache", {})
+        self._htf_cache = cache
+        loop = asyncio.get_running_loop()
+        semaphore = asyncio.Semaphore(FETCH_CONCURRENCY)
+
+        async def candles(symbol: str, timeframe: str, ttl: float) -> list[Any]:
+            key = (symbol, timeframe)
+            hit = cache.get(key)
+            if hit is not None and loop.time() - hit[0] < ttl:
+                return hit[1]
+            data = list(await self._app.market.get_candles(symbol, timeframe, 60) or [])
+            cache[key] = (loop.time(), data)
+            return data
+
+        async def resolve(candidate: ScalpCandidate) -> ScalpCandidate:
+            async with semaphore:
+                try:
+                    frames: dict[str, list[Any]] = {}
+                    for timeframe, ttl in (("1m", 5.0), ("5m", 10.0), ("15m", 60.0), ("1h", 60.0), ("4h", 120.0)):
+                        try:
+                            frames[timeframe] = await candles(candidate.symbol, timeframe, ttl)
+                        except Exception:  # noqa: BLE001 - یک تایم‌فریم نبود، بقیه هست
+                            continue
+                    imbalance = None
+                    try:
+                        imbalance = orderbook_imbalance(
+                            await self._app.market.get_orderbook(candidate.symbol, 20)
+                        )
+                    except Exception:  # noqa: BLE001
+                        imbalance = None
+                    return apply_direction_evidence(candidate, frames, orderbook_imbalance=imbalance)
+                except Exception:  # noqa: BLE001
+                    logger.debug("Scalp direction evidence failed for %s", candidate.symbol, exc_info=True)
+                    return candidate
+
+        if len(cache) > 400:
+            cache.clear()
+        return list(await asyncio.gather(*(resolve(c) for c in ranked)))
 
     # ---- بازبینی هوش مصنوعی ------------------------------------------
 
@@ -158,7 +218,9 @@ class ScalpService:
                 "momentum_percent": round(c.momentum, 3),
                 "spread_percent": round(c.spread_percent, 4),
                 "turnover_24h_usd": round(c.turnover_24h),
-                "expected_net_percent": round(c.expected_net_percent, 3),
+                "expected_net_percent_if_direction_right": round(c.expected_net_percent, 3),
+                "round_trip_cost_percent": round(c.cost_percent, 3),
+                "breakeven_win_rate_percent": round(c.breakeven_win_rate, 1),
             }
             for c in top
         ]
@@ -283,6 +345,11 @@ class ScalpService:
             max_hold_seconds=int(self._setting("scalp.max_hold_seconds", 900)),
             poll_seconds=float(self._setting("scalp.poll_seconds", 5.0)),
             daily_loss_limit=float(self._setting("scalp.daily_loss_limit", 20.0)),
+            edge_guard_enabled=self._bool_setting("scalp.edge_guard_enabled", True),
+            edge_guard_min_trades=int(self._setting("scalp.edge_guard_min_trades", 50) or 50),
+            break_even_lock=float(self._setting("scalp.break_even_lock", 0.1)),
+            reach_ratio=float(self._setting("scalp.reach_ratio", 0.5)),
+            max_spread_stop_fraction=float(self._setting("scalp.max_spread_stop_fraction", 0.33)),
             mode=str(self._setting("scalp.mode", "paper")),
             live_confirmation=str(self._setting("scalp.live_confirmation", "")),
             fee_rate=float(0.0006 if fee_rate is None else fee_rate),

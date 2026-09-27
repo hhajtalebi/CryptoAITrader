@@ -4394,6 +4394,11 @@ class MainController(QObject):
             "created_at_raw": record.created_at,
             "timeframes": list(timeframes),
             **self._review_payload(record_id),
+            # نسخهٔ ۲.۵.۵: داشبورد کیفیت سیگنال از عکس لحظه‌ای ذخیره‌شده
+            "intelligence": dict(
+                ((getattr(analysis, "market_snapshot", None) or {}) if analysis else {}).get("intelligence")
+                or {}
+            ),
         }
 
     def _analysis_payload(self, analysis_text: str) -> dict[str, Any]:
@@ -5919,6 +5924,11 @@ class MainController(QObject):
                 risk_percent = float(self.app.settings.get("risk.risk_percent", 1) or 1)
                 distance = abs(entry - stop) or entry * 0.01
                 quantity = (balance * risk_percent / 100.0) / distance
+                # نسخهٔ ۲.۵.۵: کیفیت سیگنال اندازه را تعدیل می‌کند
+                # (STRONG 1.0 / NORMAL 0.75 / WEAK 0.5)
+                intel_size = (signal.get("intelligence") or {}).get("size_multiplier")
+                if isinstance(intel_size, (int, float)) and 0 < intel_size <= 1:
+                    quantity *= float(intel_size)
 
             raw_targets = signal.get("take_profits") or signal.get("take_profit") or []
             targets = clean_targets(raw_targets, entry=entry, side=side)
@@ -5931,6 +5941,9 @@ class MainController(QObject):
                 "fee_rate": fee_rate,
                 "source": "signal",
                 "staged": len(targets) > 1,
+                # عکس لحظه‌ای تصمیم هوشمند: سنجش عملکرد به تفکیک کیفیت + یادگیری
+                "quality": str((signal.get("intelligence") or {}).get("quality") or ""),
+                "intelligence": dict(signal.get("intelligence") or {}),
             }
 
             trade = self.app.trade_repository.open_trade(
@@ -6062,6 +6075,8 @@ class MainController(QObject):
             user_id=self.app.auth.user_id,
             portfolio_source=self._portfolio_snapshot,
             invalidation_source=self._prediction_direction,
+            # نسخهٔ ۲.۵.۵: اجرای واقعی تا عبور از دروازهٔ اعتبارسنجی قفل است
+            live_gate=self.app.validation_gate.live_allowed,
         )
         # مسیر تیک: هر تیک وب‌سوکت بلافاصله TP/SL/سر‌به‌سر/تریلینگ را
         # می‌سنجد — پایش فقط fallback است (خواستهٔ §۶).
@@ -6271,7 +6286,7 @@ class MainController(QObject):
     #: توضیح فارسی/انگلیسی دلیل‌های رد رایج (کلید ترجمه)
     AUTO_REJECTION_KEYS = (
         "stale_data", "price_unavailable", "wide_spread", "low_liquidity", "trend_conflict",
-        "no_available_margin", "max_concurrent_reached", "daily_loss_limit",
+        "no_available_margin", "max_concurrent_reached", "daily_loss_limit", "negative_edge", "target_unreachable", "spread_eats_stop", "no_orderbook",
         "fees_exceed_loss_budget", "risk_exceeds_loss_budget", "poor_net_reward_risk",
         "invalid_risk_levels", "symbol_already_open", "stale_candidate", "symbol_not_selected",
         "no_price",
@@ -6287,12 +6302,27 @@ class MainController(QObject):
             key = f"trades.auto.reject.{reason}"
             label = self.tr_.tr(key) if reason in self.AUTO_REJECTION_KEYS and self.tr_.has(key) else reason
             parts.append(f"{label}×{count}")
-        return self.tr_.tr(
+        text = self.tr_.tr(
             "trades.auto.scan_summary",
             candidates=int(stats.get("candidates", 0) or 0),
             opened=int(stats.get("opened", 0) or 0),
             reasons="، ".join(parts) if parts else "—",
         )
+        # نسخهٔ ۲.۵.۷: نتیجهٔ واقعی همین اجرا — برد و دلیل‌های خروج
+        edge = engine.edge_stats() if hasattr(engine, "edge_stats") else {}
+        if edge and int(edge.get("trades", 0) or 0) > 0:
+            exits = sorted((edge.get("exit_reasons") or {}).items(), key=lambda kv: -kv[1])[:3]
+            exit_text = "، ".join(f"{name}×{count}" for name, count in exits) or "—"
+            summary = self.tr_.tr(
+                "trades.auto.edge_summary",
+                trades=int(edge["trades"]),
+                win=f"{float(edge.get('win_rate') or 0.0):.0f}",
+                mean=f"{float(edge.get('mean') or 0.0):+.2f}",
+                exits=exit_text,
+            )
+            if summary != "trades.auto.edge_summary":
+                text = f"{text} • {summary}"
+        return text
 
     def toggle_auto_trading(self, start: bool) -> None:
         """روشن یا خاموش کردن معاملهٔ خودکار به درخواست کاربر."""
@@ -7256,13 +7286,23 @@ class MainController(QObject):
                 config.max_loss,
                 config.fee_rate,
             )
-            return self.tr_.tr(
+            text = self.tr_.tr(
                 "trades.auto.economics",
                 notional=f"{plan.notional:.0f}",
                 fee=f"{plan.round_trip_fee:.2f}",
                 target=f"{plan.net_target:.2f}",
                 gross=f"{plan.gross_target:.2f}",
             )
+            # نسخهٔ ۲.۵.۶: برد لازم و امید ریاضی بدون برتری، صادقانه
+            edge = self.tr_.tr(
+                "trades.auto.edge",
+                tp=f"{plan.target_move_percent:.2f}",
+                sl=f"{plan.stop_move_percent:.2f}",
+                be=f"{plan.breakeven_win_rate:.0f}",
+                rw=f"{plan.random_win_rate:.0f}",
+                ev=f"{plan.no_edge_expectancy:+.2f}",
+            )
+            return f"{text}\n{edge}" if edge and edge != "trades.auto.edge" else text
         except Exception:  # noqa: BLE001
             return ""
 

@@ -65,7 +65,9 @@ async def test_planned_levels_are_net_dollars_and_metadata_reaches_managed(direc
     price = trade.entry_price + trade.direction_sign * 2
     trade.mark(price, trader.config)
     assert trade.break_even_armed
-    assert trade.net_unrealised(trade.effective_stop) == pytest.approx(0)
+    # نسخهٔ ۲.۵.۷: سر‌به‌سر کمی سود قفل می‌کند تا خروجش زیان ثبت نشود
+    assert trade.net_unrealised(trade.effective_stop) == pytest.approx(trader.config.break_even_lock)
+    assert trader.config.break_even_lock > 0
 
 
 async def test_breakeven_waits_for_net_trigger_and_never_weakens_stop():

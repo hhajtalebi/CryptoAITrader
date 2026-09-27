@@ -225,6 +225,79 @@ class Application:
         logger.info("Predictive intelligence engine initialised")
         return self._prediction_engine
 
+    # ------------------------------------------------------------------
+    # نسخهٔ ۲.۵.۵ — تصمیم هوشمند، یادگیری و دروازهٔ اعتبارسنجی
+    # ------------------------------------------------------------------
+    @property
+    def learner(self) -> Any:
+        """یادگیرندهٔ نتایج (تنبل؛ بدون داده کاملاً خنثی)."""
+        learner = getattr(self, "_learner", None)
+        if learner is None:
+            from signals.learning import PerformanceLearner
+
+            learner = self._learner = PerformanceLearner()
+        return learner
+
+    def refresh_learner(self) -> dict[str, Any]:
+        """بازآموزی یادگیرنده از نتایج بسته‌شده و معاملات کاغذی."""
+        from signals.learning import load_records_from_database
+
+        try:
+            self.learner.fit(load_records_from_database(self.database))
+        except Exception:  # noqa: BLE001 - یادگیری هرگز برنامه را متوقف نمی‌کند
+            logger.warning("Learner refresh failed", exc_info=True)
+        return self.learner.health()
+
+    @property
+    def validation_gate(self) -> Any:
+        """دروازهٔ اعتبارسنجی اجرای واقعی (پیش‌فرض قفل)."""
+        gate = getattr(self, "_validation_gate", None)
+        if gate is None:
+            from trading.validation_gate import ValidationGate, paper_stats_from_database
+
+            def _risk() -> dict[str, Any]:
+                return {
+                    "max_loss_set": float(self.settings.get("scalp.max_loss", 0) or 0) > 0,
+                    "daily_limit_set": float(self.settings.get("scalp.daily_loss_limit", 0) or 0) > 0,
+                }
+
+            gate = self._validation_gate = ValidationGate(
+                self.paths.data_dir / "validation_gate.json",
+                paper_source=lambda: paper_stats_from_database(self.database),
+                learner_source=lambda: self.learner.health(),
+                risk_source=_risk,
+            )
+        return gate
+
+    def _wire_intelligence(self) -> None:
+        """
+        اتصال لایهٔ تصمیم هوشمند به موتور سیگنال (اگر تنظیم فعال باشد).
+
+        پیش‌بینی فقط از کش خوانده می‌شود (report همگام) تا پویش انبوه کند
+        نشود؛ نبود گزارش یعنی مؤلفهٔ پیش‌بینی بی‌اثر است.
+        """
+        if self.signals is None:
+            return
+        try:
+            enabled = bool(self.settings.get("signals.intelligence_enabled", True))
+        except Exception:  # noqa: BLE001
+            enabled = True
+        if not enabled:
+            self.signals.set_intelligence(None)
+            return
+        from signals.intelligent_decision import IntelligentDecisionEngine
+
+        def _prediction(symbol: str) -> Any:
+            engine = self._prediction_engine
+            return engine.report(symbol) if engine is not None else None
+
+        self.refresh_learner()
+        self.signals.set_intelligence(
+            IntelligentDecisionEngine(),
+            prediction_lookup=_prediction,
+            learner=self.learner,
+        )
+
     def invalidate_prediction_engine(self) -> None:
         """بازسازی موتور پیش‌بینی — مثلاً پس از تغییر صرافی فعال."""
         self._prediction_engine = None
@@ -269,6 +342,7 @@ class Application:
             calibration_source=self.outcome_repository,
         )
         self.signals.set_compute_pool(self.compute_pool())
+        self._wire_intelligence()
         logger.info("Application started with exchange '%s'", exchange_name)
 
     async def switch_exchange(self, exchange_name: str = "") -> str:
@@ -322,6 +396,7 @@ class Application:
             calibration_source=self.outcome_repository,
         )
         self.signals.set_compute_pool(self.compute_pool())
+        self._wire_intelligence()
         # عامل هوش مصنوعی هم موتور قدیمی را نگه داشته؛ دور ریخته می‌شود
         # تا با صرافی تازه بازساخته شود.
         self._ai_analyst = None

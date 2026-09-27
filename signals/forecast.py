@@ -146,6 +146,7 @@ def forecast_next(
     direction: SignalDirection | str = SignalDirection.WAIT,
     confidence: int = 0,
     atr: float | None = None,
+    price: float | None = None,
 ) -> Forecast:
     """
     برآورد بازهٔ محتمل قیمت برای افق‌های بعدی.
@@ -157,6 +158,8 @@ def forecast_next(
         direction: جهت سیگنال موتور؛ فقط مرکز بازه را جابه‌جا می‌کند.
         confidence: اطمینان سیگنال؛ مبنای احتمال اعلام‌شده.
         atr: در صورت محاسبه‌شدن از بیرون، دوباره حساب نمی‌شود.
+        price: قیمت لحظه‌ای (۲.۵.۸)؛ وقتی کندل‌ها فقط بسته‌شده‌اند مرکز بازه
+            باید قیمت روز باشد، نه close آخرین کندل بسته. None → close آخر.
 
     بازگشتی: شیء Forecast. اگر داده کافی نباشد، فهرست افق‌ها خالی است و
     `note` دلیل را توضیح می‌دهد — بدون عددسازی.
@@ -169,7 +172,7 @@ def forecast_next(
             note="no_candles",
         )
 
-    last_price = float(candles[-1].close)
+    last_price = float(price) if price and price > 0 else float(candles[-1].close)
     if last_price <= 0:
         return Forecast(
             symbol=symbol,

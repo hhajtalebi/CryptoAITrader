@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -77,6 +78,41 @@ TIMEFRAME_WEIGHTS: dict[str, float] = {
 
 #: آستانه تصمیم‌گیری؛ زیر این مقدار یعنی عوامل به‌اندازه کافی هم‌سو نیستند
 DECISION_THRESHOLD = 0.22
+
+
+def closed_candles(candles: list[Any], timeframe: str, now: float | None = None) -> list[Any]:
+    """
+    فقط کندل‌های بسته‌شده — نسخهٔ ۲.۵.۸.
+
+    بازار زنده کندل جاری (باز) را هم برمی‌گرداند (`_merge_live_candle`)،
+    ولی بک‌تست و walk-forward فقط کندل بسته می‌بینند. تحلیل روی کندل باز
+    یعنی اندیکاتور، ساختار و رأی راهبرد در طول کندل مدام عوض می‌شوند
+    (repaint؛ برای 1d یعنی روز نیمه‌کاره) و رفتار زنده با رفتار سنجیده‌شده
+    یکی نیست. `Candle.timestamp` زمان **باز شدن** (UTC ثانیه) است؛ کندل
+    آخر فقط اگر واقعاً هنوز باز باشد کنار گذاشته می‌شود.
+    """
+    if not candles:
+        return candles
+    try:
+        from market.quality import timeframe_seconds
+
+        length = timeframe_seconds(timeframe)
+    except Exception:  # noqa: BLE001 - تایم‌فریم ناشناخته → دست‌نخورده
+        return candles
+    current = time.time() if now is None else now
+    try:
+        stamp = getattr(candles[-1], "timestamp", 0)
+        # datetime (دادهٔ قدیمی/آزمون) یا عدد ثانیه/میلی‌ثانیه
+        last_open = float(stamp.timestamp()) if hasattr(stamp, "timestamp") else float(stamp or 0)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return candles  # زمان نامعلوم → هرگز تحلیل را خراب نکن
+    if last_open > 1e11:  # میلی‌ثانیه
+        last_open /= 1000.0
+    if last_open <= 0:
+        return candles
+    if last_open + length > current:
+        return candles[:-1]
+    return candles
 
 
 def compute_timeframe_analysis(
@@ -149,6 +185,16 @@ class SignalEngine:
         self._compute_gate_loop: Any = None
         # نسخهٔ ۲.۴.۲ — استخر فرایند برای پویش انبوه (اختیاری)
         self._compute_pool: Any = None
+        # نسخهٔ ۲.۵.۵ — لایهٔ تصمیم هوشمند (اختیاری؛ برنامه وصلش می‌کند).
+        # نبودش یعنی رفتار دقیقاً همان موتور قبلی است.
+        self._intelligence: Any = None
+        self._prediction_lookup: Any = None
+        self._learner: Any = None
+        self._orderbook_lookup: Any = None
+        self._btc_cache: dict[str, tuple[float, dict[str, Any] | None]] = {}
+        #: عمر کش بافت BTC (ثانیه)؛ بک‌تست صفر می‌گذارد تا زمان شبیه‌سازی رعایت شود
+        self.btc_cache_ttl = 120.0
+        self._regime_features: Any = None
 
     def _gate(self) -> asyncio.Lock:
         """قفل محاسبهٔ متعلق به حلقهٔ جاری."""
@@ -166,6 +212,40 @@ class SignalEngine:
     def set_risk_parameters(self, parameters: RiskParameters) -> None:
         """به‌روزرسانی پارامترهای ریسک."""
         self._risk_engine.set_parameters(parameters)
+
+    # ------------------------------------------------------------------
+    # نسخهٔ ۲.۵.۵ — لایهٔ تصمیم هوشمند
+    # ------------------------------------------------------------------
+    def set_intelligence(
+        self,
+        engine: Any,
+        *,
+        prediction_lookup: Any = None,
+        learner: Any = None,
+        orderbook_lookup: Any = None,
+    ) -> None:
+        """
+        اتصال لایهٔ تصمیم هوشمند.
+
+        engine            : IntelligentDecisionEngine یا None (خاموش).
+        prediction_lookup : تابع symbol → dict گزارش پیش‌بینی (از کش) یا None.
+        learner           : PerformanceLearner (ضرایب وزن + لبهٔ تاریخی).
+        orderbook_lookup  : تابع symbol → دفتر سفارش کش‌شده یا None.
+        """
+        self._intelligence = engine
+        self._prediction_lookup = prediction_lookup
+        self._learner = learner
+        self._orderbook_lookup = orderbook_lookup
+
+    @property
+    def intelligence(self) -> Any:
+        """لایهٔ تصمیم هوشمند متصل (یا None)."""
+        return self._intelligence
+
+    @property
+    def learner(self) -> Any:
+        """یادگیرندهٔ متصل (یا None)."""
+        return self._learner
 
     # ------------------------------------------------------------------
     # تولید سیگنال
@@ -241,11 +321,23 @@ class SignalEngine:
                 strategy.evaluate(context) for strategy in self._registry.all()
             ]
 
-        total_score, alignment, vote_reasons = self._aggregate(votes_by_timeframe)
+        # نسخهٔ ۲.۵.۵: رژیم تایم‌فریم اصلی پیش از جمع‌بندی، تا ضرایب
+        # یادگرفته‌شدهٔ «راهبرد × رژیم» (محدود ۰٫۸..۱٫۲۵) اعمال شود.
+        # گزارش پیش‌بینی تنبل است و فقط برای سیگنال جهت‌دار خوانده می‌شود
+        # (در _apply_intelligence)؛ اینجا طبقه‌بند سبک رژیم کافی است.
+        regime_info = (
+            self._primary_regime(symbol, primary, analyses[primary], None)
+            if self._intelligence
+            else None
+        )
+        multipliers = self._weight_multipliers(regime_info)
+        total_score, alignment, vote_reasons = self._aggregate(
+            votes_by_timeframe, weight_multipliers=multipliers
+        )
         direction = self._decide(total_score)
 
         primary_analysis = analyses[primary]
-        entry = primary_analysis["candles"][-1].close
+        entry = float(primary_analysis.get("last_price") or primary_analysis["candles"][-1].close)
         atr = self._atr_of(primary_analysis)
 
         if direction == SignalDirection.WAIT:
@@ -268,6 +360,7 @@ class SignalEngine:
             # احتمالاً در چه محدوده‌ای می‌ماند؛ همین بازه به او می‌گوید
             # منتظر شکست کدام عدد باشد.
             self._attach_forecast(waiting, analyses, primary)
+            self._attach_wait_intelligence(waiting, primary, regime_info, votes_by_timeframe)
             return waiting
 
         # محاسبه حد ضرر و اهداف بر پایه ساختار واقعی
@@ -308,6 +401,7 @@ class SignalEngine:
             )
             signal.risk = assessment
             self._attach_forecast(signal, analyses, primary)
+            self._attach_wait_intelligence(signal, primary, regime_info, votes_by_timeframe)
             return signal
 
         entry_band = atr * 0.15 if atr else entry * 0.001
@@ -340,6 +434,18 @@ class SignalEngine:
         # کندل از بین می‌رود.
         self._stamp_validity(signal)
         self._attach_forecast(signal, analyses, primary)
+        if self._intelligence is not None:
+            signal = await self._apply_intelligence(
+                signal,
+                analyses=analyses,
+                votes_by_timeframe=votes_by_timeframe,
+                total_score=total_score,
+                primary=primary,
+                regime_info=regime_info,
+                notes=notes,
+            )
+            if signal.direction == SignalDirection.WAIT:
+                return signal
         logger.info(
             "Signal for %s: %s | entry %.6g | SL %.6g | R/R %.2f | confidence %d",
             symbol, direction.value, entry, stop_loss, assessment.risk_reward, confidence,
@@ -384,6 +490,7 @@ class SignalEngine:
                 direction=signal.direction,
                 confidence=signal.confidence,
                 atr=atr_value,
+                price=analysis.get("last_price"),
             )
             signal.forecast = [h.as_dict() for h in result.horizons]
         except Exception:  # pragma: no cover - پیش‌بینی هرگز مسدودکننده نیست
@@ -404,6 +511,257 @@ class SignalEngine:
             minutes=entry_window_minutes(frame)
         )
         signal.expires_at = signal.created_at + timedelta(minutes=expiry_minutes(frame))
+
+    # ------------------------------------------------------------------
+    # نسخهٔ ۲.۵.۵ — کمکی‌های لایهٔ هوشمند (هیچ‌کدام مسدودکننده نیستند)
+    # ------------------------------------------------------------------
+    async def _lookup_prediction(self, symbol: str) -> dict[str, Any] | None:
+        """
+        گزارش پیش‌بینی (همگام از کش یا ناهمگام در بک‌تست)؛ نبود/خطا → None.
+
+        فقط برای سیگنال جهت‌دار تأییدشده صدا زده می‌شود تا هزینه‌ای به
+        پویش‌های انبوه (که بیشترشان WAIT هستند) اضافه نشود.
+        """
+        lookup = self._prediction_lookup
+        if lookup is None:
+            return None
+        try:
+            report = lookup(symbol)
+            if hasattr(report, "__await__"):
+                report = await report
+        except Exception:  # noqa: BLE001
+            logger.debug("Prediction lookup failed for %s", symbol, exc_info=True)
+            return None
+        if report is None:
+            return None
+        if isinstance(report, dict):
+            return report
+        to_dict = getattr(report, "to_dict", None)
+        return to_dict() if callable(to_dict) else None
+
+    def _primary_regime(
+        self,
+        symbol: str,
+        primary: str,
+        analysis: dict[str, Any],
+        prediction_report: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """
+        رژیم تایم‌فریم اصلی: اول از گزارش پیش‌بینی (اگر همان تایم‌فریم را
+        دارد)، وگرنه با همان طبقه‌بند رژیم موتور پیش‌بینی روی کندل‌های
+        بسته‌شده (~۱۰ms). خطا → None (مؤلفهٔ رژیم بی‌اثر می‌شود).
+        """
+        regimes = (prediction_report or {}).get("regimes") or {}
+        cached = regimes.get(primary)
+        if isinstance(cached, dict) and cached.get("regime"):
+            return {**cached, "timeframe": primary, "source": "prediction"}
+        candles = analysis.get("candles") or []
+        if len(candles) < MIN_CANDLES_FOR_ANALYSIS:
+            return None
+        try:
+            from signals.prediction.features import FeatureStore
+            from signals.prediction.regime import classify_timeframe
+
+            if self._regime_features is None:
+                self._regime_features = FeatureStore(self._indicators)
+            # نسخهٔ ۲.۵.۸: `analysis["candles"]` از قبل فقط کندل بسته دارد
+            # (closed_candles)؛ کنار گذاشتن دوبارهٔ کندل آخر یک کندل بسته را
+            # حذف می‌کرد. «اکنون» = پایان آخرین کندل بسته.
+            from market.quality import timeframe_seconds
+
+            closed = candles
+            features = self._regime_features.build(
+                candles, primary, symbol=symbol,
+                now=candles[-1].timestamp + timeframe_seconds(primary),
+            )
+            result = classify_timeframe(primary, closed, features).to_dict()
+            result["source"] = "engine"
+            return result
+        except Exception:  # noqa: BLE001
+            logger.debug("Regime classification failed for %s", symbol, exc_info=True)
+            return None
+
+    def _weight_multipliers(self, regime_info: dict[str, Any] | None) -> dict[str, float] | None:
+        """ضرایب راهبرد برای رژیم جاری از یادگیرنده؛ بدون داده → None."""
+        learner = self._learner
+        if learner is None or not regime_info:
+            return None
+        try:
+            multipliers = learner.multipliers_for(str(regime_info.get("regime") or ""))
+        except Exception:  # noqa: BLE001
+            return None
+        return multipliers or None
+
+    async def _btc_context(self, symbol: str) -> dict[str, Any] | None:
+        """
+        بافت BTC برای آلت‌کوین‌های USDT (۵m/۱۵m/۱h/۴h) با کش ۱۲۰ ثانیه.
+
+        برای خود BTC یا جفت‌های غیر USDT → None. خطای داده → None؛ بافت
+        BTC فقط اطمینان را تعدیل می‌کند و هرگز سیگنال را مسدود نمی‌کند.
+        """
+        base, _, quote = symbol.partition("/")
+        if quote.upper() != "USDT" or base.upper() in ("BTC", "WBTC"):
+            return None
+        btc_symbol = "BTC/USDT"
+        now = time.monotonic()
+        cached = self._btc_cache.get(btc_symbol)
+        if cached is not None and self.btc_cache_ttl > 0 and now - cached[0] < self.btc_cache_ttl:
+            return cached[1]
+        from signals.intelligent_decision import btc_context_from_candles
+
+        frames: dict[str, list[Any]] = {}
+        for timeframe in ("5m", "15m", "1h", "4h"):
+            try:
+                candles = await self._market.get_candles(btc_symbol, timeframe, 120)
+            except Exception:  # noqa: BLE001
+                continue
+            if candles:
+                frames[timeframe] = (
+                    closed_candles(list(candles), timeframe)
+                    if getattr(self._market, "live", True) else list(candles)
+                )
+        context = btc_context_from_candles(frames) if frames else None
+        self._btc_cache[btc_symbol] = (now, context)
+        return context
+
+    def _attach_wait_intelligence(
+        self,
+        signal: TradingSignal,
+        primary: str,
+        regime_info: dict[str, Any] | None,
+        votes_by_timeframe: dict[str, list[StrategyVote]],
+    ) -> None:
+        """عکس لحظه‌ای سبک برای سیگنال WAIT (نمایش + یادگیری)."""
+        if self._intelligence is None:
+            return
+        try:
+            from signals.intelligent_decision import strategy_scores
+
+            signal.intelligence = {
+                "version": 1,
+                "decision": "WAIT",
+                "quality": "",
+                "technical_confidence": signal.confidence,
+                "final_confidence": signal.confidence,
+                "regime": str((regime_info or {}).get("regime") or "unknown"),
+                "primary_timeframe": primary,
+                "strategy_scores": {
+                    k: round(v, 3) for k, v in strategy_scores(votes_by_timeframe).items()
+                },
+            }
+        except Exception:  # noqa: BLE001
+            logger.debug("WAIT intelligence snapshot failed", exc_info=True)
+
+    async def _apply_intelligence(
+        self,
+        signal: TradingSignal,
+        *,
+        analyses: dict[str, dict[str, Any]],
+        votes_by_timeframe: dict[str, list[StrategyVote]],
+        total_score: float,
+        primary: str,
+        regime_info: dict[str, Any] | None,
+        notes: list[str],
+    ) -> TradingSignal:
+        """
+        اعمال لایهٔ هوشمند روی سیگنال جهت‌دار تأییدشده.
+
+        • confidence ← final_confidence (technical در intelligence می‌ماند)
+        • فقط در تعارض شدید → WAIT با decision=NO_TRADE
+        • هر خطا → همان سیگنال پایه بدون تغییر (لایه هرگز مسدودکننده نیست)
+        """
+        try:
+            from signals.intelligent_decision import DECISION_NO_TRADE, DecisionInputs
+            from signals.orderflow import build_snapshot
+
+            prediction_report = await self._lookup_prediction(signal.symbol)
+            # رژیم گزارش پیش‌بینی (اگر همان تایم‌فریم را دارد) دقیق‌تر است
+            report_regime = ((prediction_report or {}).get("regimes") or {}).get(primary)
+            if isinstance(report_regime, dict) and report_regime.get("regime"):
+                regime_info = {**report_regime, "timeframe": primary, "source": "prediction"}
+            from signals.intelligent_decision import extension_atr, extension_bucket
+
+            sign = 1 if signal.direction == SignalDirection.LONG else -1
+            extension = extension_atr(analyses[primary].get("candles") or [], sign)
+            bucket = extension_bucket(extension)
+            history = None
+            if self._learner is not None:
+                history = self._learner.historical_edge(
+                    signal.direction.value,
+                    str((regime_info or {}).get("regime") or "unknown"),
+                    primary,
+                    extension=bucket,
+                )
+            orderbook = None
+            if self._orderbook_lookup is not None:
+                try:
+                    orderbook = self._orderbook_lookup(signal.symbol)
+                except Exception:  # noqa: BLE001
+                    orderbook = None
+            primary_candles = analyses[primary].get("candles") or []
+            decision = self._intelligence.evaluate(
+                DecisionInputs(
+                    symbol=signal.symbol,
+                    direction=signal.direction,
+                    technical_confidence=signal.confidence,
+                    primary_timeframe=primary,
+                    total_score=total_score,
+                    analyses=analyses,
+                    votes_by_timeframe=votes_by_timeframe,
+                    risk_reward=signal.risk_reward,
+                    prediction=prediction_report,
+                    regime=regime_info,
+                    btc=await self._btc_context(signal.symbol),
+                    orderflow=build_snapshot(primary_candles, orderbook=orderbook),
+                    history=history,
+                )
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("Intelligent decision failed for %s; base signal kept", signal.symbol, exc_info=True)
+            return signal
+
+        payload = decision.to_dict()
+        # نسخهٔ ۲.۵.۶: کشیدگی حرکت برای حافظهٔ الگو و نمایش
+        payload["extension_atr"] = None if extension is None else round(extension, 3)
+        payload["extension_bucket"] = bucket
+        if decision.decision == DECISION_NO_TRADE:
+            waiting = self._wait_signal(
+                signal.symbol,
+                list(analyses),
+                reason=(
+                    f"A {signal.direction.value} setup (technical confidence {signal.confidence}) "
+                    f"was found, but independent evidence strongly disagrees: {decision.weak_reason}. "
+                    "NO_TRADE is issued only for severe multi-factor conflict."
+                ),
+                status=AnalysisStatus.OK,
+                notes=notes,
+                confidence=decision.final_confidence,
+                trend=signal.trend,
+                structure=signal.market_structure,
+            )
+            waiting.risk = signal.risk
+            waiting.forecast = signal.forecast
+            payload["base_setup"] = {
+                "entry": signal.entry_max if signal.direction == SignalDirection.LONG else signal.entry_min,
+                "entry_min": signal.entry_min,
+                "entry_max": signal.entry_max,
+                "stop_loss": signal.stop_loss,
+                "take_profits": list(signal.take_profits),
+                "risk_reward": signal.risk_reward,
+            }
+            waiting.intelligence = payload
+            return waiting
+
+        signal.confidence = decision.final_confidence
+        signal.intelligence = payload
+        quality_line = (
+            f" Signal quality: {decision.quality} (technical {decision.technical_confidence} → "
+            f"final {decision.final_confidence})."
+        )
+        if decision.weak_reason:
+            quality_line += f" Weak because: {decision.weak_reason}."
+        signal.reason = signal.reason + quality_line
+        return signal
 
     # ------------------------------------------------------------------
     # غنی‌سازی اختیاری با هوش مصنوعی
@@ -439,7 +797,17 @@ class SignalEngine:
     # ------------------------------------------------------------------
     async def _analyze_timeframe(self, symbol: str, timeframe: str) -> dict[str, Any]:
         """گردآوری کندل، اندیکاتور، ساختار و سطوح یک تایم‌فریم."""
-        candles = await self._market.get_candles(symbol, timeframe, self._candle_limit)
+        raw = await self._market.get_candles(symbol, timeframe, self._candle_limit)
+        # نسخهٔ ۲.۵.۸: تحلیل فقط روی کندل‌های بسته؛ قیمت لحظه‌ای جدا نگه داشته
+        # می‌شود تا قیمت ورود همان قیمت روز بماند.
+        live_price = float(raw[-1].close) if raw else 0.0
+        candles = closed_candles(list(raw), timeframe) if getattr(self._market, "live", True) else list(raw)
+        payload = await self._analyze_closed(symbol, timeframe, candles)
+        payload["last_price"] = live_price or (float(candles[-1].close) if candles else 0.0)
+        return payload
+
+    async def _analyze_closed(self, symbol: str, timeframe: str, candles: list[Any]) -> dict[str, Any]:
+        """تحلیل کندل‌های بسته‌شده (استخر محاسبه یا محلی)."""
         pool = self._compute_pool
         if pool is not None and is_bulk_fetch() and len(candles) >= MIN_CANDLES_FOR_ANALYSIS:
             # نسخهٔ ۲.۴.۲: در پویش انبوه محاسبهٔ سنگین در فرایند کارگر جدا
@@ -491,6 +859,8 @@ class SignalEngine:
     def _aggregate(
         self,
         votes_by_timeframe: dict[str, list[StrategyVote]],
+        *,
+        weight_multipliers: dict[str, float] | None = None,
     ) -> tuple[float, float, list[str]]:
         """
         جمع‌بندی وزن‌دار رأی راهبردها در همه تایم‌فریم‌ها.
@@ -522,8 +892,10 @@ class SignalEngine:
             for vote in votes:
                 if not vote.applicable:
                     continue
-                weighted_sum += vote.weighted_score * tf_weight
-                weight_total += vote.weight * tf_weight
+                # ضریب یادگرفته‌شده (بدون داده دقیقاً ۱٫۰)
+                learned = (weight_multipliers or {}).get(str(vote.strategy), 1.0)
+                weighted_sum += vote.weighted_score * tf_weight * learned
+                weight_total += vote.weight * tf_weight * learned
                 directional_votes.append(vote.direction)
                 if vote.direction != SignalDirection.WAIT:
                     votes_by_strategy.setdefault(str(vote.strategy), set()).add(

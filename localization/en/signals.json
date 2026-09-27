@@ -196,5 +196,20 @@
   "trade_open_failed": "Could not open the trade: entry or stop-loss is invalid",
   "trade_refused_stop": "Trade not opened: live price ({price}) is already past the stop-loss",
   "trade_refused_target": "Trade not opened: live price ({price}) is already past TP1 — the entry is gone",
-  "trade_margin_capped": "Size was capped to the available paper balance"
+  "trade_margin_capped": "Size was capped to the available paper balance",
+  "quality": {
+    "title": "Signal quality",
+    "signal": "Signal",
+    "technical": "Technical confidence",
+    "prediction": "Prediction probability",
+    "mtf": "MTF alignment",
+    "regime": "Regime",
+    "historical_edge": "Historical edge",
+    "risk_reward": "R/R",
+    "final": "Final confidence",
+    "quality": "Quality",
+    "size": "Position size",
+    "weak_reason": "Why weak",
+    "column": "Quality"
+  }
 }

@@ -92,7 +92,8 @@ class VolatilityRegimeStrategy(BaseStrategy):
 
         # تأیید باند بولینگر در صورت وجود: فشردگی باند، همان سیگنال
         # فشردگی است از منبعی مستقل.
-        bandwidth = context.indicator_value("BOLLINGER", "bandwidth")
+        # نسخهٔ ۲.۵.۸: نام درست «BBANDS» است؛ «BOLLINGER» همیشه None بود.
+        bandwidth = context.indicator_value("BBANDS", "bandwidth")
         if bandwidth is not None and bandwidth < 2.0:
             score *= 1.15
             reasons.append(f"Bollinger bandwidth {bandwidth:.2f}% confirms the squeeze")

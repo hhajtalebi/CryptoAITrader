@@ -114,6 +114,15 @@ def format_signal_text(signal: dict[str, Any] | None, translator: Any = None) ->
         except (TypeError, ValueError):
             pass
 
+    # نسخهٔ ۲.۵.۵: کیفیت سیگنال در متن کپی/اشتراک
+    intel = signal.get("intelligence") if isinstance(signal.get("intelligence"), dict) else {}
+    if intel.get("quality"):
+        lines.append(
+            f"{_tr(translator, 'signals.quality.quality', 'Quality')}: {intel['quality']}"
+            f" ({_tr(translator, 'signals.quality.technical', 'Technical confidence')} "
+            f"{intel.get('technical_confidence', '—')}%)"
+        )
+
     entry_min = signal.get("entry_min")
     entry_max = signal.get("entry_max")
     entry_single = signal.get("entry") or signal.get("entry_price")
