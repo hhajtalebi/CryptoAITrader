@@ -401,6 +401,8 @@ class MainController(QObject):
         self.trades.filters_changed.connect(lambda _f: self.refresh_trades())
         self.trades.refresh_requested.connect(self.refresh_trades)
         self.trades.close_requested.connect(self.close_paper_trade)
+        if hasattr(self.trades, "manual_trade_requested"):
+            self.trades.manual_trade_requested.connect(lambda: self.open_manual_trade_dialog())
         self.trades.close_blocked.connect(
             lambda: self._toast(
                 self.tr_.tr("trades.no_open_trade_selected"), level="warning"
@@ -583,6 +585,8 @@ class MainController(QObject):
         self._apply_display_settings()
         self.load_conversations()
         self.status(self.tr_.tr("common.online"))
+        # نسخهٔ ۲.۵.۹: اولامای محلی روشن و مدلش در پس‌زمینه بارگذاری می‌شود
+        QTimer.singleShot(2_000, self._warm_up_local_ai)
         self.dashboard.set_connection_status(self.tr_.tr("common.online"), "bullish")
         self.window.set_connection_indicator(True)
         self.markets.set_palette(self.themes.palette)
@@ -3126,6 +3130,11 @@ class MainController(QObject):
         dialog.trade_requested.connect(
             lambda payload, d=dialog: self._on_trade_requested(payload, dialog=d)
         )
+        # v2.5.9: «ویرایش و باز کردن معامله» با فرم معاملهٔ دستی
+        if hasattr(dialog, "manual_trade_requested"):
+            dialog.manual_trade_requested.connect(
+                lambda values, d=dialog: self.open_manual_trade_dialog(values, parent=d)
+            )
         # از همین پنجره هم باید بشود تحلیل هوشمند خواست؛ کاربر خواسته
         # بود بعد از پویش، هر نماد را جداگانه به هوش مصنوعی بسپارد.
         if hasattr(dialog, "ai_analysis_requested"):
@@ -4186,6 +4195,11 @@ class MainController(QObject):
         dialog.trade_requested.connect(
             lambda payload, d=dialog: self._on_trade_requested(payload, dialog=d)
         )
+        # v2.5.9: «ویرایش و باز کردن معامله» با فرم معاملهٔ دستی
+        if hasattr(dialog, "manual_trade_requested"):
+            dialog.manual_trade_requested.connect(
+                lambda values, d=dialog: self.open_manual_trade_dialog(values, parent=d)
+            )
         dialog.exec()
 
     def _prime_calculator(self, dialog: Any) -> None:
@@ -4563,6 +4577,155 @@ class MainController(QObject):
         self.status(message)
         self._toast(message, level="success")
 
+    # ------------------------------------------------------------------
+    # معاملهٔ دستی (v2.5.9)
+    # ------------------------------------------------------------------
+    def _manual_trade_symbols(self) -> list[str]:
+        """نمادهای پیشنهادی فرم: جدول بازارها + قیمت‌های زنده + تاریخچهٔ معاملات."""
+        symbols: set[str] = set()
+        for row in getattr(self.markets, "_all_rows", []) or []:
+            if row.get("symbol"):
+                symbols.add(str(row["symbol"]))
+        for source in (getattr(self, "_live_prices", {}) or {}).keys():
+            symbols.add(str(source))
+        for row in getattr(self.trades, "_rows", []) or []:
+            if row.get("symbol"):
+                symbols.add(str(row["symbol"]))
+        return sorted(s for s in symbols if s)
+
+    def open_manual_trade_dialog(self, prefill: dict[str, Any] | None = None, parent: Any = None) -> Any:
+        """
+        پنجرهٔ «باز کردن معامله»: نماد، مبلغ از موجودی، اسپات/فیوچرز، اهرم ۱–۱۰۰،
+        حد سود و ضرر. از سیگنال با مقادیر پر شده، یا خالی از صفحهٔ معاملات.
+        """
+        from ui.dialogs.manual_trade_dialog import ManualTradeDialog
+
+        available = 0.0
+        try:
+            available = float(self._paper_account().available) if self._is_paper_mode() else 0.0
+        except Exception:  # noqa: BLE001
+            logger.debug("Paper balance unavailable for manual trade", exc_info=True)
+        if available <= 0:
+            try:
+                available = float(self._trading_capital()[0] or 0.0)
+            except Exception:  # noqa: BLE001
+                available = 0.0
+        fee_rate = float(self.app.settings.get("scalp.taker_fee_rate", 0.0006) or 0.0)
+        dialog = ManualTradeDialog(
+            self.tr_,
+            symbols=self._manual_trade_symbols(),
+            available=available,
+            fee_rate=fee_rate,
+            parent=parent or self.window,
+        )
+        dialog.price_requested.connect(lambda symbol, d=dialog: self._manual_trade_price(symbol, d))
+        dialog.order_requested.connect(lambda order, d=dialog: self._on_manual_order(order, dialog=d))
+        values = dict(prefill or {})
+        if values:
+            dialog.prefill(values)
+        symbol = dialog.symbol()
+        if symbol:
+            # قیمت لحظه‌ای فقط وقتی جایگزین ورود می‌شود که سیگنالی ورود نداده باشد
+            if not values.get("entry"):
+                self._manual_trade_price(symbol, dialog)
+        self._manual_trade_dialog = dialog
+        dialog.show()
+        return dialog
+
+    def _manual_trade_price(self, symbol: str, dialog: Any) -> None:
+        """قیمت لحظه‌ای: کش زنده/جدول بازارها، وگرنه تیکر صرافی در پس‌زمینه."""
+        price = self._live_fill_price(symbol, "long") or self._last_price(symbol)
+        if price > 0:
+            dialog.set_price(symbol, price)
+            return
+        market = getattr(self.app, "market", None)
+        if market is None:
+            return
+
+        async def fetch() -> float:
+            ticker = await market.get_ticker(symbol)
+            return float(getattr(ticker, "last_price", 0.0) or 0.0)
+
+        self.runner.submit(
+            f"manual-price-{symbol}",
+            fetch(),
+            on_success=lambda value, d=dialog, sym=symbol: d.set_price(sym, float(value or 0.0)),
+            on_error=lambda message, exc=None: logger.info("Manual trade price failed: %s", message),
+        )
+
+    def _on_manual_order(self, order: dict[str, Any], dialog: Any = None) -> None:
+        """
+        ثبت معاملهٔ دستی (کاغذی با قیمت زنده).
+
+        ورود = قیمت قابل‌اجرای زندهٔ تازه (Ask/Bid) اگر هست، وگرنه عدد فرم؛
+        با قیمت تازه دوباره اعتبارسنجی می‌شود تا حد ضرر/سود سمت اشتباه نیفتد.
+        """
+        from trading.manual_order import ManualOrderRequest, plan_manual_order
+
+        symbol = str(order.get("symbol") or "")
+        side = "long" if str(order.get("direction") or "LONG").upper() == "LONG" else "short"
+        fill = self._live_fill_price(symbol, side) or float(order.get("entry") or 0.0)
+        plan = plan_manual_order(ManualOrderRequest(
+            symbol=symbol,
+            market_type=str(order.get("market_type") or "futures"),
+            direction=str(order.get("direction") or "LONG"),
+            amount=float(order.get("amount") or 0.0),
+            leverage=int(order.get("leverage") or 1),
+            entry=fill,
+            take_profit=float(order.get("take_profit") or 0.0),
+            stop_loss=float(order.get("stop_loss") or 0.0),
+            available=float(order.get("available") or 0.0),
+            fee_rate=float(self.app.settings.get("scalp.taker_fee_rate", 0.0006) or 0.0),
+        ))
+        if not plan.valid:
+            keys = ", ".join(self.tr_.tr(f"trades.manual.error_{key}") for key in plan.errors)
+            text = self.tr_.tr("trades.manual.refused_live", price=self.tr_.format_number(fill, 6), reasons=keys)
+            if dialog is not None and hasattr(dialog, "show_error"):
+                dialog.show_error(text)
+            self._toast(text, level="warning")
+            return
+
+        record = {
+            "symbol": plan.symbol,
+            "direction": plan.direction,
+            "entry_price": plan.entry,
+            "stop_loss": plan.stop_loss or None,
+            "take_profits": [plan.take_profit] if plan.take_profit else [],
+            "leverage": float(plan.leverage),
+            "quantity": plan.quantity,
+            "margin": plan.amount,
+            "market_type": plan.market_type,
+            "source": str(order.get("source") or "manual"),
+            "reason": self.tr_.tr("trades.manual.note", market=plan.market_type, leverage=plan.leverage),
+        }
+        trade = self.record_paper_trade(record)
+        if not trade:
+            return
+        try:
+            self._update_streamed_symbols()
+        except Exception:  # noqa: BLE001
+            logger.debug("Stream update after manual trade failed", exc_info=True)
+        if dialog is not None:
+            closer = getattr(dialog, "trade_opened", None) or getattr(dialog, "accept", None)
+            if callable(closer):
+                closer()
+        self._go_to("nav.trades")
+        try:
+            self.trades.show_open_history()
+        except Exception:  # noqa: BLE001
+            logger.debug("Showing open trades failed", exc_info=True)
+        self.refresh_trades()
+        message = self.tr_.tr(
+            "trades.manual.opened_toast",
+            direction=self.tr_.tr(f"signals.{plan.direction.lower()}", plan.direction),
+            symbol=plan.symbol,
+            entry=self.tr_.format_number(plan.entry, 6),
+            leverage=plan.leverage,
+            amount=self._money(plan.amount),
+        )
+        self.status(message)
+        self._toast(message, level="success")
+
     def _paper_trader(self) -> Any:
         """ساخت تنبل دفتر معاملهٔ تمرینی."""
         if getattr(self, "_paper_trader_instance", None) is None:
@@ -4788,6 +4951,41 @@ class MainController(QObject):
             self.settings_page.ai_key_input.setPlaceholderText("••••••••")
         else:
             self.settings_page.ai_key_input.setPlaceholderText("")
+
+    def _warm_up_local_ai(self) -> None:
+        """
+        روشن کردن اولامای نصب‌شده و بارگذاری مدل در پس‌زمینه (نسخهٔ ۲.۵.۹).
+
+        بدون این، اولین تحلیل یا چت باید منتظر بارگذاری چند گیگابایت بماند و
+        معمولاً از مهلت می‌گذشت. شکست فقط در لاگ ثبت می‌شود؛ خطا نیست.
+        """
+        app = self.app
+        try:
+            if not app.ai_enabled() or str(app.settings.get("ai.provider", "") or "").lower() != "ollama":
+                return
+            if app.ai_analyst() is None:
+                return
+            manager = getattr(app, "_ai_manager", None)
+            provider = manager.get("ollama") if manager is not None else None
+        except Exception:  # noqa: BLE001 - گرم‌کردن اختیاری است
+            logger.debug("Local AI warm-up skipped", exc_info=True)
+            return
+        warm = getattr(provider, "warm_up", None)
+        if not callable(warm):
+            return
+
+        def done(result: Any) -> None:
+            ok, detail = result if isinstance(result, tuple) else (False, str(result))
+            logger.info("Local AI warm-up: %s (%s)", "ok" if ok else "failed", detail)
+            if not ok:
+                self.status(self.tr_.tr("settings.ai_warmup_failed", detail=detail))
+
+        self.runner.submit(
+            "ai-warm-up",
+            warm(),
+            on_success=done,
+            on_error=lambda message, exc=None: logger.info("Local AI warm-up failed: %s", message),
+        )
 
     def test_ai_connection(self) -> None:
         """
@@ -5939,7 +6137,10 @@ class MainController(QObject):
                 "original_quantity": quantity,
                 "realized_gross": 0.0,
                 "fee_rate": fee_rate,
-                "source": "signal",
+                "source": str(signal.get("source") or "signal"),
+                # v2.5.9: معاملهٔ دستی — نوع بازار و مبلغ انتخابی کاربر
+                "market_type": str(signal.get("market_type") or "futures"),
+                "margin": float(signal.get("margin") or 0.0),
                 "staged": len(targets) > 1,
                 # عکس لحظه‌ای تصمیم هوشمند: سنجش عملکرد به تفکیک کیفیت + یادگیری
                 "quality": str((signal.get("intelligence") or {}).get("quality") or ""),

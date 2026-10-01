@@ -115,6 +115,75 @@ def has_wsl() -> bool:
     return result.returncode == 0
 
 
+#: توزیع لینوکسی انتخاب‌شده داخل WSL (نسخهٔ ۲.۵.۹)؛ خالی = پیش‌فرض WSL
+WSL_DISTRO = ""
+#: توزیع‌هایی که bash/apt ندارند و برای ساخت قابل استفاده نیستند
+UNUSABLE_DISTRO_PREFIXES = ("docker-desktop", "rancher-desktop", "podman")
+INSTALL_UBUNTU_COMMAND = "wsl --install -d Ubuntu"
+
+
+def decode_wsl_output(raw: bytes | str) -> str:
+    """
+    خروجی `wsl.exe` را درست می‌خواند.
+
+    خود wsl.exe پیام‌هایش را UTF-16 می‌نویسد؛ با خواندن UTF-8 هر حرف با یک
+    NUL جدا می‌شد و گزارش کاربر «W i n d o w s   S u b s y s t e m …» شد.
+    """
+    if isinstance(raw, str):
+        return raw.replace("\x00", "")
+    if not raw:
+        return ""
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")) or raw.count(b"\x00") >= max(1, len(raw) // 4):
+        try:
+            return raw.decode("utf-16-le", errors="replace").lstrip("\ufeff").replace("\x00", "")
+        except UnicodeDecodeError:
+            pass
+    return raw.decode("utf-8", errors="replace").replace("\x00", "")
+
+
+def wsl_env() -> dict[str, str]:
+    """محیط اجرای wsl.exe با خروجی UTF-8 (`WSL_UTF8=1`، ویندوز ۱۱ و WSL جدید)."""
+    env = dict(os.environ)
+    env["WSL_UTF8"] = "1"
+    return env
+
+
+def list_wsl_distros() -> list[str]:
+    """فهرست توزیع‌های نصب‌شده در WSL (`wsl -l -q`)؛ خالی اگر هیچ توزیعی نیست."""
+    try:
+        result = subprocess.run(  # noqa: S603
+            ["wsl", "-l", "-q"], capture_output=True, timeout=30, check=False, env=wsl_env()
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if result.returncode != 0:
+        return []
+    names = []
+    for line in decode_wsl_output(result.stdout).splitlines():
+        name = line.strip().strip("*").strip()
+        if name:
+            names.append(name)
+    return names
+
+
+def usable_distros(names: list[str]) -> list[str]:
+    """توزیع‌های قابل ساخت، اوبونتو اول (docker-desktop و مشابه کنار می‌روند)."""
+    usable = [n for n in names if not n.lower().startswith(UNUSABLE_DISTRO_PREFIXES)]
+    return sorted(usable, key=lambda n: (not n.lower().startswith("ubuntu"), usable.index(n)))
+
+
+def no_distro_message(found: list[str]) -> str:
+    """راهنمای دقیق وقتی WSL هست ولی توزیع لینوکسی قابل استفاده‌ای نیست."""
+    extra = f" (فقط این‌ها هست که برای ساخت مناسب نیستند: {', '.join(found)})" if found else ""
+    return (
+        "WSL نصب است ولی هیچ توزیع لینوکسی (Ubuntu) روی آن نصب نیست" + extra + ". "
+        f"یک بار در PowerShell یا CMD اجرا کنید: {INSTALL_UBUNTU_COMMAND}  — "
+        "پس از نصب، پنجرهٔ Ubuntu باز می‌شود و یک نام کاربری و رمز می‌خواهد (همان را بسازید). "
+        "اگر ویندوز ری‌استارت خواست، ری‌استارت کنید و سپس scripts\\build_apk.bat را دوباره اجرا کنید. "
+        "(scripts\\build_apk.bat همین نصب را با پرسش بله/خیر خودش پیشنهاد می‌کند.)"
+    )
+
+
 def wrap_for_platform(command: list[str], workdir: str) -> list[str]:
     """
     آماده‌سازی فرمان برای محیط جاری.
@@ -156,6 +225,8 @@ def _run(
 def shell_command(script: str) -> list[str]:
     """اجرای یک اسکریپت bash: روی ویندوز داخل WSL، وگرنه bash محلی."""
     if is_windows():
+        if WSL_DISTRO:
+            return ["wsl", "-d", WSL_DISTRO, "bash", "-lc", script]
         return ["wsl", "bash", "-lc", script]
     return ["bash", "-lc", script]
 
@@ -265,7 +336,17 @@ def check_environment(report: ApkReport) -> bool:
             )
             report.steps.append(step)
             return False
-        step.detail = "ویندوز + WSL — ساخت داخل WSL انجام می‌شود"
+        # نسخهٔ ۲.۵.۹: `wsl --status` حتی بدون هیچ توزیعی موفق است؛ گزارش
+        # کاربر دقیقاً همین بود («has no installed distributions»).
+        global WSL_DISTRO
+        found = list_wsl_distros()
+        usable = usable_distros(found)
+        if not usable:
+            step.detail = no_distro_message(found)
+            report.steps.append(step)
+            return False
+        WSL_DISTRO = usable[0]
+        step.detail = f"ویندوز + WSL ({WSL_DISTRO}) — ساخت داخل WSL انجام می‌شود"
     else:
         step.detail = f"{platform.system()} — ساخت مستقیم"
 

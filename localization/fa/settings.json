@@ -324,5 +324,6 @@
   "speed_profile": "پروفایل سرعت هوش مصنوعی",
   "speed_fast": "سریع",
   "speed_balanced": "متعادل",
-  "speed_deep": "عمیق"
+  "speed_deep": "عمیق",
+  "ai_warmup_failed": "اولاما در پس‌زمینه آماده نشد: {detail}"
 }

@@ -723,9 +723,10 @@ class Application:
 
     def ai_speed_limits(self) -> Any:
         """سقف سرعت هوش مصنوعی. متعادل عددهای ذخیره‌شده را بازنویسی نمی‌کند."""
-        from ai.speed_profile import limits_for
+        from ai.speed_profile import effective_limits
 
-        return limits_for(self.settings)
+        # نسخهٔ ۲.۵.۹: با اولاما کف مهلت‌ها بالاتر است (مدل محلی کند است)
+        return effective_limits(self.settings)
 
     def signal_ai_timeout(self) -> float:
         """مهلت سیگنال، با رعایت پروفایل سرعت."""

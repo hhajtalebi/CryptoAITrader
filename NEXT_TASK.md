@@ -1,6 +1,21 @@
 # کار بعدی
 
-## وضعیت جاری ۲.۵.۸ — رفع باگ‌های موتور سیگنال (2026-09-26)
+## وضعیت جاری ۲.۵.۹ — معاملهٔ دستی، اولامای کارا، APK روی WSL بدون توزیع (2026-10-01)
+- معاملهٔ دستی: `trading/manual_order.py` (`plan_manual_order`، `prefill_from_signal`، `normalize_symbol` ← `BTC/USDT`، اهرم ۱..۱۰۰،
+  اسپات بدون اهرم/شورت، خطا/هشدار با کلید ترجمه `trades.manual.*`) + `ui/dialogs/manual_trade_dialog.py` (`ManualTradeDialog`).
+  ورودی‌ها: `TradesPage.manual_trade_requested` (سربرگ + کنار «بستن معامله»)، `SignalDetailDialog.manual_trade_requested` («ویرایش و باز کردن»).
+  کنترلر: `open_manual_trade_dialog`، `_manual_trade_price` (کش زنده ← تیکر)، `_on_manual_order` (قیمت زندهٔ تازه + اعتبارسنجی دوباره ←
+  `record_paper_trade` با `source=manual`، `extra.market_type/margin`، `signal_id=None`).
+- اولاما: `think:false` برای مدل‌های استدلالی (gpt-oss: "low")، تلاش دوباره پس از پاسخ «فقط فکر»/رد think، stream،
+  `probe_generation` (آزمایش اتصال و `health_check` تولید واقعی می‌خواهند)، `ai/ollama_launcher.py` (یافتن و اجرای `ollama serve`، warm-up)،
+  `_warm_up_local_ai` در کنترلر، `speed_profile.effective_limits` (کف مهلت مدل محلی ۳۰۰/۳۰۰/۱۸۰).
+- APK: `build_apk.bat` با `wsl -e true` + پیشنهاد `wsl --install -d Ubuntu`؛ `build_apk.py` `list_wsl_distros`/`usable_distros`/`wsl -d`؛
+  `run_streaming` حذف NUL + `WSL_UTF8=1`.
+- آزمون: `tests/test_v259_{manual_trade,ollama,wsl}.py` (۳۰+۲۱+۱۵). گزارش: `docs/RELEASE_2.5.9_FA.md`.
+
+**commit نشده** (آخرین commit: `97ff3a2`، شامل ۲.۵.۵ تا ۲.۵.۸).
+
+## وضعیت قبلی ۲.۵.۸ — رفع باگ‌های موتور سیگنال (2026-09-26)
 - B1 `mean_reversion`: %B (۰..۱۰۰) با ۰٫۰۵/۰٫۹۵ مقایسه می‌شد ⇒ ۹۴٪ رأی SHORT. ثابت‌های `PERCENT_B_LOW=5`/`PERCENT_B_HIGH=95`.
 - B2 `momentum`: `STOCHASTIC` ← `STOCH`. B3 `volatility_regime`: `BOLLINGER` ← `BBANDS` (هر دو جزء هرگز اجرا نمی‌شدند).
 - B4 `signals/engine.py`: `closed_candles(candles, tf, now)` کندل باز را (بر اساس زمان باز شدن) از تحلیل زنده کنار می‌گذارد؛

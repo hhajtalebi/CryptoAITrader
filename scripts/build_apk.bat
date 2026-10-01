@@ -59,6 +59,9 @@ if errorlevel 1 (
     echo.
     goto :fail
 )
+REM  نسخه 2.5.9: wsl --status حتي بدون هيچ توزيع لينوكسي موفق است.
+wsl -e true >nul 2>&1
+if errorlevel 1 goto :no_distro
 echo       WSL موجود است.
 
 echo [2/2] اجراي ربات ساخت APK ...
@@ -81,6 +84,35 @@ if "%RESULT%"=="0" (
 echo.
 pause
 endlocal & exit /b %RESULT%
+
+:no_distro
+echo.
+echo [خطا] WSL نصب است ولي هيچ توزيع لينوكسي - Ubuntu - روي آن نصب نيست.
+echo.
+echo   buildozer فقط داخل لينوكس كار مي كند. نصب Ubuntu يك بار لازم است
+echo   و چند دقيقه طول مي كشد، اينترنت لازم دارد.
+echo.
+choice /c YN /n /m "   الان Ubuntu نصب شود؟  Y = بله  /  N = خير : "
+if errorlevel 2 goto :no_distro_manual
+echo.
+echo   در حال نصب Ubuntu ...
+wsl --install -d Ubuntu
+echo.
+echo   پس از پايان نصب، پنجره Ubuntu يك نام كاربري و رمز مي خواهد؛ آن را بسازيد.
+echo   اگر ويندوز ري استارت خواست، ري استارت كنيد.
+echo   سپس همين فايل را دوباره اجرا كنيد. ربات ابزارهاي لازم را بررسي مي كند
+echo   و فرمان دقيق نصب آن ها را نشان مي دهد.
+goto :fail
+
+:no_distro_manual
+echo.
+echo   دستي در PowerShell يا CMD اجرا كنيد:
+echo.
+echo       wsl --install -d Ubuntu
+echo.
+echo   سپس پنجره Ubuntu را يك بار باز كنيد، نام كاربري و رمز بسازيد و
+echo   اين فايل را دوباره اجرا كنيد.
+goto :fail
 
 :fail
 echo.

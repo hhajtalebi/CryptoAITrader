@@ -72,6 +72,8 @@ def run_streaming(
     tail: deque[str] = deque(maxlen=max(1, tail_lines))
 
     def emit(line: str) -> None:
+        # نسخهٔ ۲.۵.۹: پیام‌های UTF-16 خود wsl.exe با NUL میان حروف می‌آمدند
+        line = line.replace("\x00", "")
         tail.append(line)
         if echo:
             try:
@@ -85,6 +87,9 @@ def run_streaming(
     if log is not None:
         log.write(f"\n$ {' '.join(str(part) for part in command)}\n")
         log.flush()
+    if command and Path(str(command[0])).name.lower() in {"wsl", "wsl.exe"}:
+        # خروجی خود wsl.exe به‌جای UTF-16 با UTF-8 (WSL جدید)
+        env = {**(dict(env) if env is not None else dict(os.environ)), "WSL_UTF8": "1"}
     try:
         process = subprocess.Popen(  # noqa: S603
             [str(part) for part in command],

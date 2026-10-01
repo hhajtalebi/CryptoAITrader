@@ -125,6 +125,52 @@ FALLBACK_NUM_CTX = 4096
 #: بیشترین توکن پاسخ در حالت کم‌حافظه
 FALLBACK_NUM_PREDICT = 700
 
+#: خانواده‌های مدل «استدلالی» (thinking) — نسخهٔ ۲.۵.۹.
+#:
+#: اولامای جدید استدلال این مدل‌ها را در فیلد جدای `message.thinking`
+#: برمی‌گرداند. مدل کل سقف `num_predict` را صرف فکر کردن می‌کرد و `content`
+#: خالی می‌آمد؛ مدیر سرویس‌ها آن را «پاسخ خالی» می‌دانست و چت/تحلیل هیچ
+#: جوابی نمی‌داد، در حالی که تنظیمات «اولاما وصل است» نشان می‌داد.
+#: برای این خانواده‌ها از ابتدا `think: false` فرستاده می‌شود.
+THINKING_MODEL_MARKERS = (
+    "qwen3", "deepseek-r1", "qwq", "magistral", "phi4-reasoning", "cogito",
+    "deepseek-v3.1", "exaone-deep", "openthinker", "smallthinker",
+)
+#: gpt-oss استدلال را خاموش نمی‌کند؛ فقط سطح آن قابل تنظیم است.
+THINK_LEVEL_MODELS = ("gpt-oss",)
+#: سقف پاسخ در تلاش دوباره پس از پاسخ خالیِ «فقط فکر»
+THINKING_RETRY_NUM_PREDICT = 2048
+#: پیام آزمون تولید واقعی در «آزمایش اتصال»
+PROBE_PROMPT = "Reply with exactly one word: OK"
+
+
+def think_setting(model: str) -> bool | str | None:
+    """
+    مقدار `think` برای یک مدل: False (خاموش)، "low" (gpt-oss) یا None (نفرست).
+
+    مدل غیراستدلالی چیزی نمی‌گیرد تا رفتار اولاماهای قدیمی‌تر عوض نشود.
+    """
+    name = (model or "").strip().lower()
+    if any(marker in name for marker in THINK_LEVEL_MODELS):
+        return "low"
+    if any(marker in name for marker in THINKING_MODEL_MARKERS):
+        return False
+    return None
+
+
+def _thinking_text(data: dict[str, Any]) -> str:
+    """متن فیلد استدلال پاسخ اولاما (اگر باشد)."""
+    message = data.get("message") or {}
+    return str(message.get("thinking") or data.get("thinking") or "")
+
+
+def _rejects_think(response: Any) -> bool:
+    """آیا اولاما پارامتر `think` را برای این مدل/نسخه رد کرده است؟"""
+    if getattr(response, "status_code", 0) != 400:
+        return False
+    return "think" in (_response_error(response) or "").lower()
+
+
 #: نشانه‌های متنی خطای کمبود حافظه در پاسخ اولاما
 MEMORY_ERROR_HINTS = (
     "memory",
@@ -276,6 +322,34 @@ class OllamaProvider(AIProvider):
         #: در صف اولاما روی هم می‌افتند و حافظهٔ KV را دو برابر می‌کنند.
         #: این قفل تضمین می‌کند در هر لحظه فقط یک درخواست در راه است.
         self._request_lock = asyncio.Lock()
+        #: مدل‌هایی که پاسخ خالیِ «فقط فکر» داده‌اند؛ از این پس think خاموش (۲.۵.۹)
+        self._thinking_off: set[str] = set()
+        #: مدل‌هایی که اولاما پارامتر think را برایشان نمی‌پذیرد
+        self._think_unsupported: set[str] = set()
+        #: راه‌اندازی خودکار سرویس فقط یک بار در هر نمونه تلاش می‌شود
+        self._launch_attempted = False
+        #: آخرین نتیجهٔ راه‌اندازی خودکار (برای پیام وضعیت)
+        self.launch_note: str = ""
+
+    # ------------------------------------------------------------------
+    # استدلال (thinking) — نسخهٔ ۲.۵.۹
+    # ------------------------------------------------------------------
+    def _think_for(self, model: str) -> bool | str | None:
+        """مقدار `think` درخواست، با احتساب آنچه از پاسخ‌های قبلی آموخته شد."""
+        if model in self._think_unsupported:
+            return None
+        value = think_setting(model)
+        if value is None and model in self._thinking_off:
+            return False
+        return value
+
+    def _apply_think(self, payload: dict[str, Any], model: str) -> None:
+        """گذاشتن یا برداشتن `think` در بدنهٔ درخواست."""
+        value = self._think_for(model)
+        if value is None:
+            payload.pop("think", None)
+        else:
+            payload["think"] = value
 
     # ------------------------------------------------------------------
     # اتصال
@@ -302,6 +376,19 @@ class OllamaProvider(AIProvider):
                 errors.append(f"{candidate} → HTTP {response.status_code}")
             except httpx.HTTPError as exc:
                 errors.append(f"{candidate} → {exc.__class__.__name__}")
+
+        # نسخهٔ ۲.۵.۹: اولامای نصب‌شده ولی خاموش را خودمان روشن می‌کنیم.
+        if not self._launch_attempted:
+            self._launch_attempted = True
+            from ai.ollama_launcher import ensure_running, is_local_url
+
+            configured = (self._config.base_url or DEFAULT_OLLAMA_URL).rstrip("/")
+            if is_local_url(configured):
+                ok, note = await ensure_running(configured)
+                self.launch_note = note
+                if ok:
+                    return await self._resolve_base_url()
+                errors.append(note)
 
         raise AIProviderError(
             "Could not reach the local Ollama service",
@@ -379,6 +466,7 @@ class OllamaProvider(AIProvider):
         self._resolved_url = ""
         self._resolved_model = ""
         self._context_ceiling = 0
+        self._launch_attempted = False
 
     @property
     def active_model(self) -> str:
@@ -437,16 +525,15 @@ class OllamaProvider(AIProvider):
                 messages, json_mode=json_mode, temperature=temperature
             )
 
-    async def _generate_once(
-        self, messages: list[AIMessage], *, json_mode: bool = False, temperature: float | None = None
-    ) -> AIResponse:
-        """
-        یک درخواست تولید، بدون مدیریت همزمانی.
-
-        در حالت json_mode از پارامتر format=json خود Ollama استفاده می‌شود که
-        مدل را وادار می‌کند خروجی JSON معتبر بدهد.
-        """
-        model = await self.resolve_model()
+    def _build_payload(
+        self,
+        model: str,
+        messages: list[AIMessage],
+        *,
+        json_mode: bool = False,
+        temperature: float | None = None,
+    ) -> dict[str, Any]:
+        """بدنهٔ درخواست `/api/chat` — مشترک بین تولید عادی و جریانی (۲.۵.۹)."""
         options: dict[str, Any] = {
             "temperature": self._config.temperature if temperature is None else temperature,
         }
@@ -508,11 +595,31 @@ class OllamaProvider(AIProvider):
         }
         if json_mode:
             payload["format"] = "json"
+        self._apply_think(payload, model)
+        return payload
+
+    async def _generate_once(
+        self, messages: list[AIMessage], *, json_mode: bool = False, temperature: float | None = None
+    ) -> AIResponse:
+        """
+        یک درخواست تولید، بدون مدیریت همزمانی.
+
+        در حالت json_mode از پارامتر format=json خود Ollama استفاده می‌شود که
+        مدل را وادار می‌کند خروجی JSON معتبر بدهد.
+        """
+        model = await self.resolve_model()
+        payload = self._build_payload(model, messages, json_mode=json_mode, temperature=temperature)
 
         started_at = time.monotonic()
         try:
             client = await self._get_client()
             response = await client.post("/api/chat", json=payload)
+            if "think" in payload and _rejects_think(response):
+                # اولامای قدیمی‌تر یا مدلی که think را نمی‌شناسد
+                logger.info("Ollama rejected 'think' for '%s'; retrying without it", model)
+                self._think_unsupported.add(model)
+                payload.pop("think", None)
+                response = await client.post("/api/chat", json=payload)
 
             if response.status_code >= 500 and _is_runner_crash(response):
                 # اجراکنندهٔ مدل وسط کار مُرد.
@@ -627,6 +734,26 @@ class OllamaProvider(AIProvider):
                     },
                 )
             data = response.json()
+            if (
+                isinstance(data, dict)
+                and not str((data.get("message") or {}).get("content") or "").strip()
+                and _thinking_text(data)
+                and payload.get("think") not in (False, "low")
+                and model not in self._think_unsupported
+            ):
+                # نسخهٔ ۲.۵.۹: مدل کل سقف پاسخ را صرف استدلال کرد و متنی نداد.
+                # یک بار با استدلال خاموش و سقف بزرگ‌تر؛ برای این مدل به خاطر سپرده می‌شود.
+                logger.warning(
+                    "Ollama model '%s' returned only reasoning; retrying with thinking off", model
+                )
+                self._thinking_off.add(model)
+                payload["think"] = think_setting(model) if think_setting(model) is not None else False
+                payload["options"]["num_predict"] = max(
+                    int(payload["options"].get("num_predict") or 0), THINKING_RETRY_NUM_PREDICT
+                )
+                retry = await client.post("/api/chat", json=payload)
+                if retry.status_code < 400:
+                    data = retry.json()
         except httpx.TimeoutException as exc:
             raise TimeoutErrorApp(
                 f"Local model '{model}' timed out; a smaller model may be needed"
@@ -645,6 +772,12 @@ class OllamaProvider(AIProvider):
         # قطع شده؛ آن‌وقت متن خام را برمی‌گردانیم تا لایهٔ بالا دست‌کم
         # چیزی برای نمایش داشته باشد.
         content = strip_reasoning_block(raw_content) or raw_content
+        if not content.strip() and _thinking_text(data):
+            raise AIProviderError(
+                f"Local model '{model}' used its whole reply budget on reasoning and returned no answer; "
+                "choose a non-reasoning model (e.g. qwen2.5, llama3.1) or raise the max tokens setting",
+                details={"provider": self.name, "model": model, "reason": "thinking_only"},
+            )
         return AIResponse(
             content=content,
             provider=self.name,
@@ -958,6 +1091,153 @@ class OllamaProvider(AIProvider):
             int(self._config.max_tokens),
             ceiling=self._memory_ceiling(),
         )
+
+    # ------------------------------------------------------------------
+    # جریان، آزمون واقعی و گرم‌کردن — نسخهٔ ۲.۵.۹
+    # ------------------------------------------------------------------
+    @property
+    def supports_streaming(self) -> bool:
+        """اولاما پاسخ را تکه‌تکه (NDJSON) می‌فرستد."""
+        return True
+
+    async def stream(
+        self,
+        messages: list[AIMessage],
+        on_chunk: Any,
+        *,
+        temperature: float | None = None,
+    ) -> AIResponse:
+        """
+        پاسخ جریانی: متن چت همان لحظه که تولید می‌شود روی صفحه می‌آید.
+
+        پیش‌تر اولاما مسیر پیش‌فرض را داشت (کل پاسخ، سپس یک تکه). روی CPU
+        یک پاسخ کامل بیش از مهلت چت طول می‌کشید و کاربر «هیچ پاسخی» نمی‌دید.
+        مهلت خواندن httpx در جریان برای هر تکه است نه کل پاسخ.
+
+        هر خطا پیش از نخستین تکه (۴xx/۵xx، رد think، پاسخ «فقط فکر») به مسیر
+        `generate()` با همهٔ تلاش‌های نجاتش برمی‌گردد.
+        """
+        fallback = False
+        async with self._request_lock:
+            try:
+                response = await self._stream_once(messages, on_chunk, temperature)
+                if response is not None:
+                    return response
+                fallback = True
+            except httpx.TimeoutException as exc:
+                raise TimeoutErrorApp(
+                    f"Local model '{self.active_model}' timed out; a smaller model may be needed"
+                ) from exc
+            except httpx.HTTPError:
+                fallback = True
+        if fallback:
+            response = await self.generate(messages, temperature=temperature)
+            if response.content:
+                on_chunk(response.content)
+            return response
+        raise AIProviderError("Ollama stream ended unexpectedly")  # pragma: no cover
+
+    async def _stream_once(
+        self, messages: list[AIMessage], on_chunk: Any, temperature: float | None
+    ) -> AIResponse | None:
+        """یک درخواست جریانی؛ None یعنی «به generate برگرد» (هنوز چیزی نشان داده نشده)."""
+        import json as _json
+
+        model = await self.resolve_model()
+        payload = self._build_payload(model, messages, temperature=temperature)
+        payload["stream"] = True
+        client = await self._get_client()
+        started_at = time.monotonic()
+        parts: list[str] = []
+        thinking = False
+        final: dict[str, Any] = {}
+        async with client.stream("POST", "/api/chat", json=payload) as response:
+            if response.status_code >= 400:
+                await response.aread()
+                if "think" in payload and _rejects_think(response):
+                    self._think_unsupported.add(model)
+                return None
+            async for line in response.aiter_lines():
+                if not line.strip():
+                    continue
+                try:
+                    item = _json.loads(line)
+                except ValueError:
+                    continue
+                if item.get("error"):
+                    if parts:
+                        raise AIProviderError(f"Ollama stream failed: {item['error']}")
+                    return None
+                chunk = str((item.get("message") or {}).get("content") or "")
+                if _thinking_text(item):
+                    thinking = True
+                if chunk:
+                    parts.append(chunk)
+                    on_chunk(chunk)
+                if item.get("done"):
+                    final = item
+                    break
+        raw = "".join(parts)
+        content = strip_reasoning_block(raw) or raw
+        if not content.strip():
+            if thinking:
+                self._thinking_off.add(model)
+            return None
+        return AIResponse(
+            content=content,
+            provider=self.name,
+            model=str(final.get("model") or model),
+            finish_reason="stop" if final.get("done") else "",
+            prompt_tokens=int(final.get("prompt_eval_count") or 0),
+            completion_tokens=int(final.get("eval_count") or 0),
+            latency_seconds=round(time.monotonic() - started_at, 3),
+        )
+
+    async def probe_generation(self) -> tuple[bool, str]:
+        """
+        «آزمایش اتصال» واقعی: مدل باید واقعاً یک کلمه تولید کند.
+
+        پیش‌تر آزمایش فقط فهرست مدل‌ها (`/api/tags`) را می‌خواند؛ برای همین
+        تنظیمات «اولاما وصل است» نشان می‌داد در حالی که مدل هیچ پاسخی
+        نمی‌داد. پیام شامل مدل و زمان پاسخ است تا کندی دیده شود.
+        """
+        try:
+            model = await self.resolve_model()
+        except AIProviderError as exc:
+            return False, exc.message
+        except httpx.HTTPError:
+            return False, "Ollama service is not running on this machine"
+        started = time.monotonic()
+        try:
+            response = await self.generate([AIMessage("user", PROBE_PROMPT)], temperature=0.0)
+        except TimeoutErrorApp:
+            return False, (
+                f"Ollama is running but model '{model}' did not answer in time "
+                f"(>{int(max(float(self._config.timeout), MIN_READ_TIMEOUT))}s); try a smaller model"
+            )
+        except AIProviderError as exc:
+            return False, f"Ollama is running but model '{model}' failed: {exc.message}"
+        seconds = time.monotonic() - started
+        answer = response.content.strip().replace("\n", " ")[:40]
+        if not answer:
+            return False, f"Ollama is running but model '{model}' returned an empty answer"
+        return True, f"Model '{model}' answered in {seconds:.1f}s («{answer}»)"
+
+    async def warm_up(self) -> tuple[bool, str]:
+        """بارگذاری مدل در حافظه در پس‌زمینه تا اولین تحلیل/چت منتظر نماند."""
+        from ai.ollama_launcher import warm_up as _warm_up
+
+        try:
+            base_url = await self._resolve_base_url()
+            model = await self.resolve_model()
+        except (AIProviderError, httpx.HTTPError) as exc:
+            return False, getattr(exc, "message", exc.__class__.__name__)
+        ok, seconds, reason = await _warm_up(base_url, model)
+        if ok:
+            logger.info("Ollama model '%s' loaded in %.1fs", model, seconds)
+            return True, f"Model '{model}' loaded in {seconds:.1f}s"
+        logger.warning("Ollama warm-up of '%s' failed: %s", model, reason)
+        return False, f"Model '{model}' could not be loaded: {reason}"
 
     async def list_models(self) -> list[str]:
         """فهرست مدل‌های نصب‌شده روی دستگاه کاربر (قوی‌ترین اول)."""

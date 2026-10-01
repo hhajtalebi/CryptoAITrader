@@ -197,6 +197,8 @@ class TradesPage(BasePage):
     ai_opinion_requested = Signal(str)
     #: پیام کوتاه برای اعلان شناور (مثل نتیجهٔ عکس‌لحظه‌ای)
     notice_requested = Signal(str)
+    #: v2.5.9: باز کردن پنجرهٔ معاملهٔ دستی (نماد، مبلغ، اسپات/فیوچرز، اهرم، TP/SL)
+    manual_trade_requested = Signal()
 
     def __init__(self, translator: Translator, parent: Any = None) -> None:
         self._rows: list[dict[str, Any]] = []
@@ -232,6 +234,12 @@ class TradesPage(BasePage):
         self.export_button = make_button(self.tr_.tr("trades.export_csv"))
         self.export_button.clicked.connect(self.export_requested)
         self.header.add_action(self.export_button)
+
+        # v2.5.9: معاملهٔ دستی — همیشه در سربرگ، از هر دو زبانه در دسترس
+        self.manual_trade_button = make_button("＋ " + self.tr_.tr("trades.manual.button"), primary=True)
+        self.manual_trade_button.setObjectName("manualTradeButton")
+        self.manual_trade_button.clicked.connect(self.manual_trade_requested)
+        self.header.add_action(self.manual_trade_button)
 
         self.clear_button = make_button(self.tr_.tr("trades.clear_history"))
         self.clear_button.clicked.connect(self.clear_requested)
@@ -1043,6 +1051,10 @@ class TradesPage(BasePage):
         self.close_hint = QLabel(self.tr_.tr("trades.close_hint"))
         self.close_hint.setProperty("role", "faint")
         self.close_hint.setWordWrap(True)
+        # v2.5.9: «باز کردن معامله» کنار «بستن معامله» در تاریخچه
+        self.history_open_trade_button = make_button("＋ " + self.tr_.tr("trades.manual.button"))
+        self.history_open_trade_button.clicked.connect(self.manual_trade_requested)
+        actions_row.addWidget(self.history_open_trade_button)
         actions_row.addWidget(self.close_trade_button)
         actions_row.addWidget(self.close_hint, 1)
         layout.addLayout(actions_row)
@@ -2313,6 +2325,10 @@ class TradesPage(BasePage):
         self.refresh_button.setText(self.tr_.tr("common.refresh"))
         self.export_button.setText(self.tr_.tr("trades.export_csv"))
         self.clear_button.setText(self.tr_.tr("trades.clear_history"))
+        for button in (getattr(self, "manual_trade_button", None),
+                       getattr(self, "history_open_trade_button", None)):
+            if button is not None:
+                button.setText("＋ " + self.tr_.tr("trades.manual.button"))
         self.notice.setText(self.tr_.tr("trades.paper_notice"))
         self.from_label.setText(self.tr_.tr("trades.from_date"))
         self.to_label.setText(self.tr_.tr("trades.to_date"))

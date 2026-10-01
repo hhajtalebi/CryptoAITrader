@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 
@@ -76,6 +76,31 @@ def limits_for(settings: Any) -> SpeedProfile:
     )
 
 
+#: کمینهٔ مهلت‌ها برای مدل محلی (اولاما) — نسخهٔ ۲.۵.۹.
+#:
+#: مدل محلی روی CPU برای بارگذاری اولیه و هر پاسخ ده‌ها ثانیه تا چند دقیقه
+#: می‌خواهد. با مهلت ۱۲۰ ثانیهٔ چت (برای تا سه دور ابزار) پاسخ تقریباً
+#: هرگز نمی‌رسید و کاربر «هیچ پاسخی» می‌دید. عددهای بزرگ‌ترِ کاربر دست
+#: نمی‌خورند؛ فقط کف بالا می‌رود.
+LOCAL_MODEL_FLOORS = {"agent_timeout": 300, "chat_timeout": 300, "signal_timeout": 180}
+LOCAL_PROVIDERS = {"ollama"}
+
+
+def is_local_provider(settings: Any) -> bool:
+    """آیا سرویس فعال یک مدل محلی است؟"""
+    return str(_read(settings, "ai.provider", "") or "").strip().lower() in LOCAL_PROVIDERS
+
+
+def effective_limits(settings: Any) -> SpeedProfile:
+    """`limits_for` + کف مهلت مدل محلی (فقط وقتی سرویس فعال اولاما است)."""
+    limits = limits_for(settings)
+    if not is_local_provider(settings):
+        return limits
+    return replace(limits, **{
+        name: max(int(getattr(limits, name)), floor) for name, floor in LOCAL_MODEL_FLOORS.items()
+    })
+
+
 def signal_timeout_seconds(settings: Any) -> float:
-    """مهلت تولید سیگنال، با رعایت پروفایل سرعت."""
-    return float(limits_for(settings).signal_timeout)
+    """مهلت تولید سیگنال، با رعایت پروفایل سرعت و کف مدل محلی."""
+    return float(effective_limits(settings).signal_timeout)

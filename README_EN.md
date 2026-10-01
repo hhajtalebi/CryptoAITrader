@@ -2,11 +2,15 @@
 
 **Professional desktop app for crypto market analysis and futures signal generation**
 
-Version 2.5.8 · Windows 10/11 · Python 3.11+ (tested up to 3.13) · Persian & English
+Version 2.5.9 · Windows 10/11 · Python 3.11+ (tested up to 3.13) · Persian & English
 
 [راهنمای فارسی](README.md)
 
-> **Current delivery 2.5.8:** signal-engine bug fixes — Bollinger %B compared on the wrong scale (94% of mean-reversion
+> **Current delivery 2.5.9:** manual "Open trade" window (symbol, amount from balance, spot/futures, leverage 1–100,
+> TP/SL) from the Trades page, trade history and signal details; local Ollama that actually answers (reasoning models,
+> auto-start, real generation test); APK build guidance and Ubuntu auto-install when WSL has no distro. [Report](docs/RELEASE_2.5.9_FA.md).
+>
+> **Previous delivery 2.5.8:** signal-engine bug fixes — Bollinger %B compared on the wrong scale (94% of mean-reversion
 > votes were SHORT), STOCH/BBANDS read under wrong names (components never ran), live analysis on the still-forming candle
 > (repaint), asymmetric BREAKDOWN structure. Honest A/B backtest: bias removed, still no edge (PF < 1). [Report](docs/RELEASE_2.5.8_FA.md).
 >

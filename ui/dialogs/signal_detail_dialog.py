@@ -123,6 +123,8 @@ class SignalDetailDialog(QDialog):
 
     #: وقتی کاربر دکمهٔ اقدام را می‌زند، با دادهٔ سیگنال منتشر می‌شود
     trade_requested = Signal(dict)
+    #: v2.5.9: «ویرایش و باز کردن معامله» — پنجرهٔ معاملهٔ دستی با مقادیر همین سیگنال
+    manual_trade_requested = Signal(dict)
 
     def __init__(
         self,
@@ -759,6 +761,14 @@ class SignalDetailDialog(QDialog):
         self.trade_button.clicked.connect(self._on_trade_clicked)
         layout.addWidget(self.trade_button)
 
+        # نسخهٔ ۲.۵.۹: مقادیر سیگنال در فرم معاملهٔ دستی پر می‌شوند و کاربر
+        # نماد، مبلغ، اسپات/فیوچرز، اهرم، حد سود و ضرر را تغییر یا تأیید می‌کند.
+        self.manual_trade_button = make_button("✎ " + self.tr_.tr("trades.manual.edit_and_open"))
+        self.manual_trade_button.setObjectName("signalManualTrade")
+        self.manual_trade_button.setToolTip(self.tr_.tr("trades.manual.edit_and_open_tip"))
+        self.manual_trade_button.clicked.connect(self._on_manual_trade_clicked)
+        layout.addWidget(self.manual_trade_button)
+
         # نسخهٔ ۲.۴.۲: کپی نام نماد و متن کامل سیگنال برای ارسال به جای دیگر
         self.copy_symbol_button = make_button(self.tr_.tr("signals.share.copy_symbol"))
         self.copy_symbol_button.setToolTip(self.tr_.tr("signals.share.copy_symbol_tip"))
@@ -854,6 +864,29 @@ class SignalDetailDialog(QDialog):
     def _on_trade_clicked(self) -> None:
         """اعلام درخواست اقدام به کنترلر."""
         self.trade_requested.emit(self.trade_payload())
+
+    def manual_trade_prefill(self) -> dict[str, Any]:
+        """مقادیر اولیهٔ فرم معاملهٔ دستی: سیگنال + اعداد ویرایش‌شدهٔ ماشین‌حساب."""
+        from trading.manual_order import prefill_from_signal
+
+        values = prefill_from_signal(self._signal)
+        calculator = getattr(self, "calculator", None)
+        if calculator is not None:
+            plan = calculator.trade_values()
+            if plan.get("entry"):
+                values["entry"] = float(plan["entry"])
+            if plan.get("stop_loss"):
+                values["stop_loss"] = float(plan["stop_loss"])
+            targets = plan.get("targets") or []
+            if targets:
+                values["take_profit"] = float(targets[0])
+            if plan.get("leverage"):
+                values["leverage"] = int(plan["leverage"])
+        values["source"] = "signal_manual"
+        return values
+
+    def _on_manual_trade_clicked(self) -> None:
+        self.manual_trade_requested.emit(self.manual_trade_prefill())
 
     def _entry_text(self) -> str:
         """قالب‌بندی محدودهٔ ورود که ممکن است تک‌قیمت یا بازه باشد."""
