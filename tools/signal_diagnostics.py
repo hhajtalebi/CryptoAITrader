@@ -226,4 +226,11 @@ def management_variants(candles: dict[str, list[Any]], evals: list[dict[str, Any
 
 
 if __name__ == "__main__":
+    # نسخهٔ ۲.۷.۰: خروجی هدایت‌شده به فایل در ویندوز cp1252 است و متن فارسی
+    # UnicodeEncodeError می‌داد (doctor_report.txt خالی/خطا).
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
     raise SystemExit(main())

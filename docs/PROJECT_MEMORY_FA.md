@@ -472,6 +472,17 @@ MainController علاوه بر Application اجزای اجرایی دیگری م
 - ابزارها: `tools/scalp_diagnostics.py`، `tools/signal_diagnostics.py`. گزارش: `docs/RELEASE_2.5.6_FA.md`.
 
 
+
+## نسخهٔ 2.7.0 — موبایل نو، سقف ضرر قابل تنظیم، رفع لاگ ویندوز (2026-10-02)
+- موبایل: ۵ صفحه + نوار پایین (`mobile/main.py`, `mobile/app/{widgets,screens,store,viewmodel}.py`)؛ APK و اسکرین‌شات با `.github/workflows/build-apk.yml` (کاربر از وب اضافه می‌کند؛ توکن ما مجوز workflows ندارد).
+- سقف ضرر روزانه: ۰ = خاموش، پیش‌فرض کاغذی خاموش. پژوهش آفلاین: `research/scalp_lab` + `scalp-research.yml`.
+- لاگ ویندوز پایتون ۳.۱۴:
+  - RR: `signals/risk_engine.py` با `round(rr, 2)` مقایسه می‌کند (گرد کردن ۸ رقمی TP روی کوین ارزان RR=1.498 می‌ساخت). حداقل ۱٫۵ ثابت.
+  - BBANDS: `replace(0, np.nan)`؛ `indicators/base.py` با `pd.to_numeric(errors="coerce")`.
+  - `async_runner._is_websockets_handshake_cleanup_bug`: AttributeError `recv_messages` در `connection_lost` → DEBUG.
+  - `rest_client`: `describe_connect_error` (متن + علت)، `system_proxy()`، تعویض trust_env پس از شکست همهٔ دامنه‌ها، `RestPausedError` و مکث ۵→۳۰ ثانیه، `_mark_reachable` با هر پاسخ.
+- آزمون: `tests/test_v270_runtime_fixes.py` (۱۳). کل: ۲۸۵۸ موفق، ۲ رد شده.
+
 ## نسخهٔ 2.6.3 — طوفان تعویض دامنهٔ REST (2026-10-01)
 - لاگ کاربر پس از ۲.۶.۲ (ساعت درست شده بود، ‎+03:30): همهٔ درخواست‌های REST با ConnectError روی هر سه دامنه، هر ~۰٫۳ ثانیه
   یک «switching»، و ClosedResourceError در ping/کندل؛ WebSocket وصل؛ ۱۰۳۷ نماد stale.

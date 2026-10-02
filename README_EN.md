@@ -2,11 +2,16 @@
 
 **Professional desktop app for crypto market analysis and futures signal generation**
 
-Version 2.6.3 · Windows 10/11 · Python 3.11+ (tested up to 3.13) · Persian & English
+Version 2.7.0 · Windows 10/11 · Python 3.11+ (tested up to 3.13) · Persian & English
 
 [راهنمای فارسی](README.md)
 
-> **Current delivery 2.6.3:** REST host-rotation storm fixed — one connect error used to close the shared HTTP client
+> **Current delivery 2.7.0:** new 5-screen mobile UI + cloud APK build; configurable daily loss limit (0 = off);
+> Windows-log fixes: R/R 1.50 < 1.5 rounding rejection, BBANDS crash on flat markets, websockets TLS-cleanup noise,
+> REST circuit breaker (proxy/direct fallback, pause instead of endless host rotation, real error text logged).
+> [Report](docs/RELEASE_2.7.0_FA.md).
+>
+> **Previous 2.6.3:** REST host-rotation storm fixed — one connect error used to close the shared HTTP client
 > under every concurrent request, each of which rotated the host again (endless ConnectError/ClosedResourceError while the
 > WebSocket stayed up). Now one rotation per failing host, old clients closed after 30 s. [Report](docs/RELEASE_2.6.3_FA.md).
 >

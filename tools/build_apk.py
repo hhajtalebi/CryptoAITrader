@@ -40,6 +40,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO
@@ -70,6 +71,22 @@ APT_BASE = ("python3-pip python3-venv zlib1g-dev libncurses-dev libffi-dev "
 PATH_PREFIX = f'export PATH="{BUILDOZER_VENV}/bin:$HOME/.local/bin:$PATH"'
 
 _LOG: IO[str] | None = None
+
+#: کد خروج ویژه وقتی WSL هست ولی توزیع لینوکسی قابل استفاده‌ای نیست (نسخهٔ ۲.۷.۰).
+#: scripts\build_apk.bat با این کد مستقیم پیشنهاد نصب Ubuntu (بله/خیر) را می‌دهد.
+NO_DISTRO_EXIT = 3
+_NO_DISTRO = False
+
+
+def _log_line(text: str) -> None:
+    """نوشتن یک سطر در گزارش ساخت (اگر باز است). خطای نوشتن هرگز ساخت را نمی‌شکند."""
+    if _LOG is None:
+        return
+    try:
+        _LOG.write(text.rstrip("\n") + "\n")
+        _LOG.flush()
+    except (OSError, ValueError):
+        pass
 
 
 @dataclass
@@ -156,6 +173,10 @@ def list_wsl_distros() -> list[str]:
         )
     except (OSError, subprocess.SubprocessError):
         return []
+    _log_line(
+        f"wsl -l -q → exit {result.returncode}; stdout={decode_wsl_output(result.stdout)!r}; "
+        f"stderr={decode_wsl_output(result.stderr)!r}"
+    )
     if result.returncode != 0:
         return []
     names = []
@@ -342,6 +363,8 @@ def check_environment(report: ApkReport) -> bool:
         found = list_wsl_distros()
         usable = usable_distros(found)
         if not usable:
+            global _NO_DISTRO
+            _NO_DISTRO = True
             step.detail = no_distro_message(found)
             report.steps.append(step)
             return False
@@ -469,9 +492,21 @@ def main() -> int:
     global _LOG
     log_path, _LOG = open_log("apk")
     print(f"گزارش کامل ساخت: {log_path}", flush=True)
+    _log_line(f"CryptoAITrader APK build — {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    _log_line(f"python {sys.version.split()[0]} on {platform.platform()}; args={vars(args)}")
     print("ساخت نخست APK ۴۰ تا ۹۰ دقیقه طول می‌کشد (دانلود SDK/NDK)؛ پنجره را نبندید.", flush=True)
     try:
         report = build(release=args.release, clean=args.clean, skip_tests=skip)
+        # نسخهٔ ۲.۷.۰: خلاصهٔ گام‌ها در گزارش هم نوشته می‌شود؛ قبلاً اگر ساخت
+        # پیش از اجرای فرمانی شکست می‌خورد، فایل گزارش کاملاً خالی می‌ماند.
+        _log_line("")
+        for step in report.steps:
+            mark = "SKIPPED" if step.skipped else ("OK" if step.ok else "FAILED")
+            _log_line(f"[{mark}] {step.name}: {step.detail}")
+        _log_line(f"result: {'success' if report.succeeded else 'failed'}")
+    except BaseException as exc:
+        _log_line(f"crash: {exc.__class__.__name__}: {exc}")
+        raise
     finally:
         _LOG.close()
         _LOG = None
@@ -495,8 +530,17 @@ def main() -> int:
         print("APK ساخته نشد. علت در گام «شکست» بالا آمده است.")
         print(f"گزارش کامل: {log_path}  (در صورت نیاز همین فایل را بفرستید)")
     print("=" * 66)
+    if _NO_DISTRO and not report.succeeded:
+        return NO_DISTRO_EXIT
     return 0 if report.succeeded else 1
 
 
 if __name__ == "__main__":
+    # نسخهٔ ۲.۷.۰: خروجی هدایت‌شده به فایل در ویندوز cp1252 است و متن فارسی
+    # UnicodeEncodeError می‌داد (doctor_report.txt خالی/خطا).
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
     sys.exit(main())

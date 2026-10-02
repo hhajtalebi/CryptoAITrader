@@ -224,7 +224,12 @@ class RiskEngine:
             approved = False
             rejection.append("Stop loss is on the wrong side of entry")
 
-        if risk_reward < self._params.min_risk_reward - FLOAT_TOLERANCE:
+        # نسخهٔ ۲.۷.۰: مقایسه با همان RR دو‌رقمی که نمایش و ذخیره می‌شود.
+        # TP1 دقیقاً روی ۱٫۵R ساخته می‌شود ولی قیمت‌ها به ۸ رقم گرد می‌شوند؛
+        # در کوین‌های ارزان (DOGE، WIF، XLM) با حد ضرر نزدیک، همین گردکردن RR
+        # را به ۱٫۴۹۸ می‌رساند و ستاپ خود موتور با پیام «1.50 کمتر از 1.5» رد
+        # می‌شد. حداقل کاربر تغییری نکرده است.
+        if round(risk_reward, 2) < self._params.min_risk_reward - FLOAT_TOLERANCE:
             approved = False
             rejection.append(
                 f"Risk/reward {risk_reward:.2f} is below the minimum {self._params.min_risk_reward:g}"

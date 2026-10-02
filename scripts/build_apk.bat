@@ -1,5 +1,7 @@
 @echo off
 chcp 65001 >nul 2>&1
+set "PYTHONUTF8=1"
+set "PYTHONIOENCODING=utf-8"
 REM ======================================================================
 REM   ربات ساخت APK - Crypto AI Trader Mobile
 REM
@@ -68,6 +70,8 @@ echo [2/2] اجراي ربات ساخت APK ...
 echo.
 %PY_CMD% tools\build_apk.py %*
 set "RESULT=%ERRORLEVEL%"
+REM  نسخه 2.7.0: ربات پايتون هم نبود توزيع لينوكسي را تشخيص مي دهد - كد 3.
+if "%RESULT%"=="3" goto :no_distro
 
 echo.
 if "%RESULT%"=="0" (

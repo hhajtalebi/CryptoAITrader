@@ -27,7 +27,7 @@ BOM = b"\xef\xbb\xbf"
 # ---------------------------------------------------------------------------
 # فایل‌های bat و Inno Setup
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("name", ["build_installer.bat", "build_apk.bat", "build_windows.bat"])
+@pytest.mark.parametrize("name", ["build_installer.bat", "build_apk.bat", "build_windows.bat", "doctor.bat"])
 def test_bat_files_have_no_bom_so_echo_off_works(name: str) -> None:
     """BOM جزو فرمان اول خوانده می‌شد و `@echo off` اجرا نمی‌شد (همهٔ فرمان‌ها تکرار می‌شد)."""
     content = (ROOT / "scripts" / name).read_bytes()

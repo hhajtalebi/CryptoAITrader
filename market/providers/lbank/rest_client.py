@@ -89,6 +89,44 @@ def _cloudflare_code(body: str) -> str:
     return ""
 
 
+REST_PAUSE_MIN = 5.0
+REST_PAUSE_MAX = 30.0
+
+
+class RestPausedError(NetworkError):
+    """REST موقتاً متوقف است چون همهٔ دامنه‌ها در دسترس نبودند (بدون تلاش مجدد)."""
+
+
+def system_proxy() -> str:
+    """پراکسی سیستم که httpx با trust_env به کار می‌برد ('' اگر نیست)."""
+    try:
+        import urllib.request  # noqa: PLC0415
+
+        proxies = urllib.request.getproxies()
+    except Exception:  # noqa: BLE001
+        return ""
+    return str(proxies.get("https") or proxies.get("all") or proxies.get("http") or "")
+
+
+def describe_connect_error(exc: BaseException) -> str:
+    """
+    علت واقعی خطای اتصال، کوتاه و خوانا.
+
+    httpx خطای TLS، DNS، پراکسی و ردشدن اتصال را همه زیر «ConnectError»
+    می‌گذارد؛ بدون متن خطا تشخیص علت (فیلتر، VPN، گواهی) ممکن نیست.
+    """
+    parts: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen and len(parts) < 3:
+        seen.add(id(current))
+        text = str(current).strip()
+        name = current.__class__.__name__
+        parts.append(f"{name}: {text}" if text and text not in " ".join(parts) else name)
+        current = current.__cause__ or current.__context__
+    return " <- ".join(parts)[:240]
+
+
 class LBankRestClient:
     """
     کلاینت سطح پایین ارتباط با REST API صرافی LBank.
@@ -115,6 +153,16 @@ class LBankRestClient:
         else:
             self._base_urls = (self._base_url,)
         self._base_index = 0
+        # نسخهٔ ۲.۷.۰: مدار قطع. وقتی همهٔ دامنه‌ها پشت سر هم شکست بخورند،
+        # (۱) اگر پراکسی سیستم تنظیم است، حالت دیگر (مستقیم/پراکسی) امتحان
+        # می‌شود؛ (۲) اگر هر دو حالت شکست خورد، REST چند ثانیه مکث می‌کند به‌جای
+        # صدها تلاش بی‌ثمر در ثانیه (لاگ پر از ConnectError، بار بی‌دلیل).
+        self._trust_env = True
+        self._cycle_failures = 0
+        self._mode_toggled = False
+        self._paused_until = 0.0
+        self._pause_seconds = REST_PAUSE_MIN
+        self._last_connect_error = ""
         self._api_key = api_key or ""
         self._api_secret = api_secret or ""
         self._timeout = timeout
@@ -138,8 +186,10 @@ class LBankRestClient:
                 timeout=httpx.Timeout(self._timeout),
                 headers={"User-Agent": "CryptoAITrader/1.0", "Accept": "application/json"},
                 limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+                trust_env=self._trust_env,
             )
-            logger.debug("LBank REST client opened for %s", self._base_url)
+            logger.debug("LBank REST client opened for %s (system proxy: %s)",
+                         self._base_url, "on" if self._trust_env else "off")
 
     async def close(self) -> None:
         """بستن کلاینت HTTP و آزادسازی اتصال‌ها."""
@@ -189,6 +239,11 @@ class LBankRestClient:
         """
 
         async def _do_request() -> Any:
+            remaining = self._paused_until - time.monotonic()
+            if remaining > 0:
+                raise RestPausedError(
+                    f"LBank REST paused for {remaining:.0f}s (all hosts unreachable): {endpoint}"
+                )
             await self._rate_limiter.acquire()
             await self.open()
             client, host = self._client, self._base_url
@@ -211,6 +266,7 @@ class LBankRestClient:
                 if isinstance(exc, RuntimeError) and "closed" not in str(exc).lower():
                     raise
                 raise NetworkError(f"Connection closed while calling {endpoint}") from exc
+            self._mark_reachable()
             return self._handle_response(response, endpoint)
 
         return await retry_async(
@@ -218,8 +274,22 @@ class LBankRestClient:
             max_attempts=self._max_retries,
             retry_on=(NetworkError, TransientExchangeError),
             operation_name=f"GET {endpoint}",
-            no_retry_on=(RateLimitError, AccessBlockedError),
+            no_retry_on=(RateLimitError, AccessBlockedError, RestPausedError),
         )
+
+    def _mark_reachable(self) -> None:
+        """پاسخ گرفتیم (حتی خطای HTTP): شبکه برقرار است؛ شمارنده‌های قطعی صفر."""
+        if self._cycle_failures or self._mode_toggled or self._pause_seconds != REST_PAUSE_MIN:
+            if self._mode_toggled:
+                logger.info("LBank REST reachable again via %s (system proxy: %s)",
+                            self._base_url, "on" if self._trust_env else "off")
+            self._cycle_failures = 0
+            self._mode_toggled = False
+            self._pause_seconds = REST_PAUSE_MIN
+
+    @property
+    def paused(self) -> bool:
+        return self._paused_until > time.monotonic()
 
     @property
     def base_url(self) -> str:
@@ -248,10 +318,38 @@ class LBankRestClient:
         client, self._client = self._client, None
         if client is not None and not client.is_closed:
             self._retire(client)
+        detail = describe_connect_error(exc)
+        self._last_connect_error = detail
+        self._cycle_failures += 1
         logger.warning(
             "LBank REST host %s unreachable (%s); switching to %s",
-            previous, exc.__class__.__name__, self._base_url,
+            previous, detail, self._base_url,
         )
+        if self._cycle_failures >= len(self._base_urls):
+            self._on_all_hosts_failed(detail)
+
+    def _on_all_hosts_failed(self, detail: str) -> None:
+        """همهٔ دامنه‌ها پشت سر هم شکست خوردند."""
+        self._cycle_failures = 0
+        proxy = system_proxy()
+        if proxy and not self._mode_toggled:
+            self._trust_env = not self._trust_env
+            self._mode_toggled = True
+            tried = "directly" if self._trust_env else f"via system proxy {proxy}"
+            now = f"via system proxy {proxy}" if self._trust_env else "directly (bypassing the system proxy)"
+            logger.warning("All LBank REST hosts failed %s (last: %s); retrying %s", tried, detail, now)
+            return
+        self._mode_toggled = False
+        if proxy:
+            self._trust_env = not self._trust_env  # دور بعد از حالت دیگر شروع کن
+        self._paused_until = time.monotonic() + self._pause_seconds
+        logger.error(
+            "All LBank REST hosts unreachable%s (last: %s); pausing REST for %.0fs — "
+            "check internet/VPN/proxy; stored candles are used meanwhile",
+            " with and without system proxy " + proxy if proxy else "",
+            detail, self._pause_seconds,
+        )
+        self._pause_seconds = min(self._pause_seconds * 2, REST_PAUSE_MAX)
 
     def _retire(self, client: httpx.AsyncClient, delay: float = 30.0) -> None:
         """بستن کلاینت قدیمی با تأخیر تا درخواست‌های در راهِ آن تمام شوند."""

@@ -150,7 +150,12 @@ class BaseIndicator(ABC):
         latest: dict[str, float | None] = {}
         values: dict[str, list[float | None]] = {}
         for key, series in outputs.items():
-            clean = series.astype(float)
+            # نسخهٔ ۲.۷.۰: to_numeric + na_value به‌جای astype(float)؛ سری object با
+            # pd.NA (یا مقدار غیرعددی) دیگر کل اندیکاتور را از کار نمی‌اندازد.
+            clean = pd.Series(
+                pd.to_numeric(series, errors="coerce").to_numpy(dtype=float, na_value=np.nan),
+                index=series.index,
+            )
             # بردار numpy به‌جای pd.isna روی تک‌تک مقدارها (۲.۴.۱): همان خروجی،
             # ولی بدون صدها هزار فراخوان تابع در پویش کل بازار.
             raw = clean.to_numpy(dtype=float, na_value=np.nan)

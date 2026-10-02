@@ -64,7 +64,27 @@ def _log_loop_exception(loop: asyncio.AbstractEventLoop, context: dict[str, Any]
     if "shielded future" in str(message) and _is_network_error(exception):
         logger.debug("Shared request failed after its waiter left: %r", exception)
         return
+    if _is_websockets_handshake_cleanup_bug(exception, message):
+        logger.debug("websockets cleanup after failed TLS handshake (harmless): %r", exception)
+        return
     logger.error("Unhandled asyncio error: %s", message, exc_info=exception)
+
+
+def _is_websockets_handshake_cleanup_bug(exception: BaseException | None, message: object) -> bool:
+    """
+    نسخهٔ ۲.۷.۰: اشکال شناخته‌شدهٔ websockets روی پایتون ۳.۱۴.
+
+    websockets شیء `recv_messages` را در `connection_made` می‌سازد. وقتی
+    دست‌دهی TLS شکست بخورد (ConnectionReset، خطای گواهی)، asyncio پایتون
+    ۳.۱۴ `connection_lost` را بدون `connection_made` صدا می‌زند و کتابخانه
+    در پاک‌سازی خودش AttributeError می‌دهد. اتصال شکست‌خورده قبلاً در
+    websocket_client مدیریت و دامنهٔ بعدی امتحان شده؛ این فقط نویز لاگ است.
+    """
+    return (
+        isinstance(exception, AttributeError)
+        and "recv_messages" in str(exception)
+        and "connection_lost" in str(message)
+    )
 
 
 def _is_network_error(exception: BaseException | None) -> bool:
