@@ -21,7 +21,7 @@
   "row_risk_reward": "Risk/reward",
   "row_win_rate": "Min. win rate needed",
   "stop_loss": "Stop loss",
-  "take_profit": "Target (optional)",
+  "take_profit": "TP1 — first target",
   "title": "Position size calculator",
   "warn_fees_significant": "Fees are large relative to the amount risked. Even when right, this trade has a thin margin.",
   "warn_high_leverage": "Leverage above 10x. You are less than 10% away from liquidation.",
@@ -29,5 +29,10 @@
   "warn_low_rr": "Risk/reward below 1.5 — you would need to be right most of the time to stay profitable.",
   "warn_margin_exceeds_capital": "The required margin exceeds your capital. Raise leverage or widen the stop.",
   "warn_near_liquidation": "The stop is dangerously close to liquidation. One ordinary swing could close the position.",
-  "warn_stop_beyond_liquidation": "Your stop sits beyond the liquidation price: the whole margin is gone before the stop is reached. Reduce leverage."
+  "warn_stop_beyond_liquidation": "Your stop sits beyond the liquidation price: the whole margin is gone before the stop is reached. Reduce leverage.",
+  "take_profit_2": "TP2 — second target",
+  "take_profit_3": "TP3 — third target",
+  "capital_paper": "Capital = paper balance {amount} (mirrors your real wallet; editable)",
+  "capital_paper_settings": "Capital = paper balance {amount} (from risk settings — no exchange account connected; editable)",
+  "capital_live": "Capital = real wallet value {amount} (editable)"
 }

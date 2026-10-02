@@ -2,9 +2,126 @@
 
 **Professional desktop app for crypto market analysis and futures signal generation**
 
-Version 2.2.0 · Windows 10/11 · Python 3.11+ (tested up to 3.13) · Persian & English
+Version 2.7.0 · Windows 10/11 · Python 3.11+ (tested up to 3.13) · Persian & English
 
 [راهنمای فارسی](README.md)
+
+> **Current delivery 2.7.0:** new 5-screen mobile UI + cloud APK build; configurable daily loss limit (0 = off);
+> Windows-log fixes: R/R 1.50 < 1.5 rounding rejection, BBANDS crash on flat markets, websockets TLS-cleanup noise,
+> REST circuit breaker (proxy/direct fallback, pause instead of endless host rotation, real error text logged).
+> [Report](docs/RELEASE_2.7.0_FA.md).
+>
+> **Previous 2.6.3:** REST host-rotation storm fixed — one connect error used to close the shared HTTP client
+> under every concurrent request, each of which rotated the host again (endless ConnectError/ClosedResourceError while the
+> WebSocket stayed up). Now one rotation per failing host, old clients closed after 30 s. [Report](docs/RELEASE_2.6.3_FA.md).
+>
+> **Previous delivery 2.6.2:** the user's Windows clock was ~10.5 h ahead of the exchange (wrong time zone). The 2.6.1
+> clock correction ignored offsets above 6 h, so every REST tick/book still looked 10 hours old. Cap raised to 48 h, the
+> market engine corrects too, and the app shows a one-time warning. [Report](docs/RELEASE_2.6.2_FA.md).
+>
+> **Previous delivery 2.6.1:** scalp fix — the user's log showed 1036 of 1043 symbols "stale" and every order book
+> rejected. Causes: local clock vs exchange clock offset (now measured and corrected), a good order book discarded whenever
+> the ticker request failed, a background-runner bug ("cannot reuse already awaited coroutine") that killed every order-book
+> refresh, two REST calls per prefetch (pool timeouts), and Ultra waiting on a full-market REST call every second.
+> New paper-only diagnostic mode (`scalp.diagnostic_only`). No threshold lowered. [Report](docs/RELEASE_2.6.1_FA.md).
+>
+> **Previous delivery 2.6.0:** logging & trading diagnostics — structured logs in 12 categories (`data/logs/<category>/`,
+> daily + size rotation), audit of every signal/candidate/rejection (standard reason code + market snapshot)/entry/exit,
+> per-scan summary (Scanned/Raw/Rejected/Final/Opened), per-trade timeline in the existing SQLite, and a "Log Center" page
+> with filters, search, copy and export. No strategy or threshold changed. [Report](docs/RELEASE_2.6.0_FA.md).
+>
+> **Previous delivery 2.5.9:** manual "Open trade" window (symbol, amount from balance, spot/futures, leverage 1–100,
+> TP/SL) from the Trades page, trade history and signal details; local Ollama that actually answers (reasoning models,
+> auto-start, real generation test); APK build guidance and Ubuntu auto-install when WSL has no distro. [Report](docs/RELEASE_2.5.9_FA.md).
+>
+> **Previous delivery 2.5.8:** signal-engine bug fixes — Bollinger %B compared on the wrong scale (94% of mean-reversion
+> votes were SHORT), STOCH/BBANDS read under wrong names (components never ran), live analysis on the still-forming candle
+> (repaint), asymmetric BREAKDOWN structure. Honest A/B backtest: bias removed, still no edge (PF < 1). [Report](docs/RELEASE_2.5.8_FA.md).
+>
+> **Previous delivery 2.5.7:** why every scalp lost — far target + short hold + costs meant ~all trades closed by timeout
+> below costs, even with the right direction. Target-reachability gate, real bid/ask before ultra entry, spread-vs-stop guard,
+> break-even that locks a small profit, exit-reason stats. [Report](docs/RELEASE_2.5.7_FA.md).
+>
+> **Previous delivery 2.5.6:** deep review — scalps lost because a no-edge direction loses the round-trip fee on every trade
+> (cost gate, honest breakeven math, measured negative-edge guard); technical confidence ≥68 was the worst bucket in both
+> backtest periods and is now damped instead of boosted. [Report](docs/RELEASE_2.5.6_FA.md).
+>
+> **Previous delivery 2.5.5:** signal intelligence upgrade without removing any feature: STRONG/NORMAL/WEAK quality,
+> separate technical and final confidence, a Signal Quality card in signal details, quality-based position size,
+> a real no-look-ahead backtest and walk-forward (`tools/run_backtest.py`), and a validation gate that keeps live
+> execution locked until performance is proven. [Release report](docs/RELEASE_2.5.5_FA.md) ·
+> [Backtest](docs/BACKTEST_2.5.5.md).
+>
+> **Previous delivery 2.5.3:** build robots fixed — the Windows installer build no longer opens app windows
+> (full tests are opt-in with `--with-tests` and run headless) and streams its output to `build_logs\`; the APK
+> build checks the WSL toolchain, installs buildozer into a venv, builds on the Linux filesystem and ships the
+> missing icon/presplash/font assets. [Release report](docs/RELEASE_2.5.3_FA.md).
+>
+> **Previous delivery 2.5.2:** LBank futures HTTP 403 (Cloudflare firewall) — browser-like headers, the exact
+> Cloudflare block code and reason in the wallet report, no retries of rejected requests, and a fix hint.
+> [Release report](docs/RELEASE_2.5.2_FA.md).
+>
+> **Previous delivery 2.5.1:** the wallet shows assets again (LBank signature headers, fallback
+> balance endpoints, a sync report with the cause and fix of any error, auto-sync every 60 s); the
+> watchlist really saves and can be built from a right-click menu on any market row; markets are ordered
+> by market cap and volume (BTC, ETH first) with exact USDT prices. [Release report](docs/RELEASE_2.5.1_FA.md).
+>
+> **Previous delivery 2.5.0:** share signals (Telegram, WhatsApp, X, email, Rubika/Eitaa/Bale), a
+> stretched rounded search bar, "Act on this trade" with the calculator's entry/SL/TP1–3 and staged exits
+> (⅓ at TP1 + stop to entry, ⅓ at TP2, rest at TP3), a rebuilt trade-history table, a prefilled position
+> calculator, a three-tab wallet (Overview/Spot/Futures) with the LBank futures balance fixed, and a paper
+> balance that mirrors the real wallet. [Release report](docs/RELEASE_2.5.0_FA.md).
+>
+> **Previous delivery 2.4.2:** heavy scan computation now runs in a separate low-priority
+> worker process (the UI no longer freezes), the performance page refreshes lazily and off
+> the UI thread, repeated scans stop re-saving the same signal, a stall watchdog logs any UI
+> freeze, and you can copy a signal's symbol or full info from the tables and the details
+> dialog. [Release report](docs/RELEASE_2.4.2_FA.md).
+>
+> **Previous delivery 2.4.1:** fixes the heavy load / freezes during whole-market scans:
+> scans no longer write candles to disk or flood the shared cache, CPU share is capped,
+> the network loop stays responsive, indicators are ~45% faster and the results table is
+> light. [Release report](docs/RELEASE_2.4.1_FA.md).
+>
+> **Previous delivery 2.4.0:** Signals → Scan can cover the top symbols by turnover
+> (manual count, as before) or the **whole exchange**, with a smart filter, a minimum
+> 24h turnover, live results and an ETA. Automatic signals get a selectable source —
+> signals found above, the whole market, or both — and the full rotation covers every
+> exchange symbol. [Release report](docs/RELEASE_2.4.0_FA.md).
+>
+> **Previous delivery 2.3.2:** LBank connectivity — WebSocket now uses the official
+> `wss://api.lbank.info/ws/V2/` with fallback domains, client pings and proxy fallback;
+> LBank error 10004 ("request too frequent") is treated as a rate limit with a short
+> cooldown instead of an authentication failure. [Release report](docs/RELEASE_2.3.2_FA.md).
+>
+> **Previous delivery 2.3.1:** fixes "online for a few seconds, then disconnected"
+> (excess REST polling triggered exchange rate limits), honours 429/418 with a global
+> cooldown, treats fresh REST *or* WebSocket data as online, and adds a professional
+> dashboard command center. [Release report](docs/RELEASE_2.3.1_FA.md).
+>
+> **Previous delivery 2.3.0:** independent exit monitoring, serialized entries and
+> single-flight exits, net fee accounting, two same-provider streams with fresh REST
+> fallback, rotating liquid-market/favorite scans, and opportunity entry → open history
+> with details and explicit close actions. **758 passed / 4 skipped** in the selected
+> subset; native Qt/Windows behavior remains unverified. Profit, zero losses and uptime
+> are not guaranteed. [Release report](docs/RELEASE_2.3.0_FA.md). Source only; no commit/push.
+
+> **Previous delivery 2.2.2:** fixes prediction cache updates, complete trading
+> settings propagation and backup sensitivity metadata (encrypted keys retained).
+> Adds a separate local download portal. **708 passed / 3 skipped** in the core
+> subset; full desktop/Windows testing remains unverified. See
+> [release notes and download server instructions](docs/RELEASE_2.2.2_FA.md).
+> The 2.2.1 note below is historical. No commit or push has been made.
+
+> **2.2.1 review/documentation delivery (2026-09-23):** no application logic changes.
+> See the [project memory](docs/PROJECT_MEMORY_FA.md), [complete static code index](docs/CODE_MAP.md)
+> and [validation/open findings](docs/REVIEW_VALIDATION_FA.md) (Persian).
+> Some historical descriptions below are stale: there are 5 registered strategies and 14
+> timeframe codes; certain AI paths change decisions/levels; data defaults to the application
+> directory, and encrypted secrets can be present in the database and its backups.
+> This review ran 674 passing tests and 2 skips in a non-UI subset, not the historical full-suite
+> result. Full collection was blocked by missing Qt system libraries. This is a source delivery,
+> not a newly built executable. Commit/push require the owner's explicit permission.
 
 ---
 
@@ -151,10 +268,10 @@ The AI **cannot invent data**. It reaches real market data only through defined 
 
 ## API key security
 
-- Keys are stored in the **Windows Credential Manager** via `keyring`.
-- If no OS keyring is available, they go into an **encrypted file** outside the database.
-- Keys are **never** written to SQLite, source code, or log files — a dedicated filter masks anything key-shaped before it reaches a log.
-- Backups **never contain secrets** (there is an automated test for this).
+- SecretStore supports OS keyring, encrypted-file and encrypted-database backends. With the default `security.store_secrets_in_db=True`, Application selects the **encrypted database backend**.
+- Raw keys must not be written to source or logs. Logging/error filters redact sensitive values; encrypted ciphertext in SQLite is not the same as storing plaintext keys.
+- File/database key derivation is not equivalent to OS-backed DPAPI protection; improving it remains an open security-review item.
+- Database backups **can contain encrypted secrets**. Version 2.2.2 marks these snapshots as sensitive in the manifest without deleting keys. OS keyring data and `.secret_store.bin` are not included. Keep all personal backups private.
 
 ---
 

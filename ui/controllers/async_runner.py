@@ -15,7 +15,11 @@
 from __future__ import annotations
 
 import asyncio
+import functools
+import inspect
 import threading
+import time
+from collections import deque
 from collections.abc import Callable, Coroutine
 from typing import Any
 
@@ -25,6 +29,83 @@ from app.exceptions import AppError
 from app.logging import get_logger
 
 logger = get_logger(__name__)
+
+#: دستهٔ کار تمام‌شده پس از این مدت (ثانیه) نابود می‌شود. فاصله لازم است:
+#: سیگنال `finished` از نخ پس‌زمینه emit می‌شود و نابودکردن شیء هم‌زمان با
+#: emit در نخ دیگر رفتار تعریف‌نشده (فروپاشی) دارد.
+FINISHED_HANDLE_GRACE_SECONDS = 2.0
+
+
+def _destroy_handle(handle: QObject) -> None:
+    """نابودی هم‌گام شیء C++ دسته در نخ رابط (بدون صف DeferredDelete)."""
+    try:
+        import shiboken6
+
+        if shiboken6.isValid(handle):
+            shiboken6.delete(handle)
+    except Exception:  # noqa: BLE001 - نابودی نباید خودش مشکل بسازد
+        logger.debug("Task handle could not be destroyed", exc_info=True)
+
+
+def _log_loop_exception(loop: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
+    """
+    خطاهای بی‌صاحب حلقه (وظیفهٔ رهاشده، callback خراب) فقط ثبت می‌شوند.
+
+    پیش‌فرض asyncio آن‌ها را روی stderr می‌نوشت که در exe ویندوز وجود ندارد؛
+    یعنی هیچ ردی از علت مشکل نمی‌ماند.
+    """
+    exception = context.get("exception")
+    message = context.get("message", "")
+    if isinstance(exception, (asyncio.CancelledError, KeyboardInterrupt)):
+        return
+    # نسخهٔ ۲.۶.۱: پایتون ۳.۱۳+ وقتی منتظرِ یک درخواستِ shield‌شده زمانش تمام
+    # شود، خطای شبکهٔ همان درخواست مشترک را «exception in shielded future»
+    # گزارش می‌کند. آن خطا به منتظرهای دیگر رسیده و بی‌صاحب نیست — فقط DEBUG.
+    if "shielded future" in str(message) and _is_network_error(exception):
+        logger.debug("Shared request failed after its waiter left: %r", exception)
+        return
+    if _is_websockets_handshake_cleanup_bug(exception, message):
+        logger.debug("websockets cleanup after failed TLS handshake (harmless): %r", exception)
+        return
+    logger.error("Unhandled asyncio error: %s", message, exc_info=exception)
+
+
+def _is_websockets_handshake_cleanup_bug(exception: BaseException | None, message: object) -> bool:
+    """
+    نسخهٔ ۲.۷.۰: اشکال شناخته‌شدهٔ websockets روی پایتون ۳.۱۴.
+
+    websockets شیء `recv_messages` را در `connection_made` می‌سازد. وقتی
+    دست‌دهی TLS شکست بخورد (ConnectionReset، خطای گواهی)، asyncio پایتون
+    ۳.۱۴ `connection_lost` را بدون `connection_made` صدا می‌زند و کتابخانه
+    در پاک‌سازی خودش AttributeError می‌دهد. اتصال شکست‌خورده قبلاً در
+    websocket_client مدیریت و دامنهٔ بعدی امتحان شده؛ این فقط نویز لاگ است.
+    """
+    return (
+        isinstance(exception, AttributeError)
+        and "recv_messages" in str(exception)
+        and "connection_lost" in str(message)
+    )
+
+
+def _is_network_error(exception: BaseException | None) -> bool:
+    """خطای عادی شبکه/مهلت (نه باگ برنامه)."""
+    if exception is None:
+        return False
+    if isinstance(exception, (TimeoutError, ConnectionError, OSError)):
+        return True
+    try:
+        import httpx
+
+        if isinstance(exception, httpx.HTTPError):
+            return True
+    except ImportError:  # pragma: no cover
+        pass
+    try:
+        from app.exceptions.errors import NetworkError, RateLimitError
+
+        return isinstance(exception, (NetworkError, RateLimitError))
+    except Exception:  # noqa: BLE001  # pragma: no cover
+        return False
 
 
 class TaskHandle(QObject):
@@ -79,6 +160,10 @@ class AsyncRunner(QObject):
         #: کار در حال اجرا به ازای هر کلید، برای جلوگیری از انباشت
         self._active: dict[str, tuple[TaskHandle, Any, Any]] = {}
         self._lock = threading.Lock()
+        #: شمار کل کارهای فرستاده‌شده (برای گزارش سلامت)
+        self.submitted_total = 0
+        #: دسته‌های تمام‌شده در انتظار نابودی: (زمان پایان، دسته)
+        self._graveyard: deque[tuple[float, TaskHandle]] = deque()
 
     # ------------------------------------------------------------------
     # چرخه عمر
@@ -97,6 +182,7 @@ class AsyncRunner(QObject):
         """بدنه نخ پس‌زمینه."""
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        loop.set_exception_handler(_log_loop_exception)
         self._loop = loop
         self._ready.set()
         try:
@@ -124,6 +210,9 @@ class AsyncRunner(QObject):
         self._thread = None
         self._loop = None
         self._ready.clear()
+        # نخ پس‌زمینه تمام شده، پس هیچ emit هم‌زمانی نیست؛ دسته‌های تمام‌شده
+        # همین حالا نابود می‌شوند تا چرخهٔ ارجاعی runner را زنده نگه ندارد.
+        self.purge_finished(force=True)
         logger.debug("Async runner stopped")
 
     @property
@@ -164,11 +253,26 @@ class AsyncRunner(QObject):
                     # لغو کار قبلی. اگر هنوز شروع نشده باشد، پوششِ _wrap
                     # هرگز اجرا نمی‌شود و کوروتین اصلی باید بسته شود تا
                     # هشدار «never awaited» و نشت منبع ندهد.
+                    # نسخهٔ ۲.۶.۱: future.cancel() برای run_coroutine_threadsafe
+                    # حتی وقتی _wrap در حال اجراست True برمی‌گرداند؛ بستن
+                    # کوروتینِ در حال انتظار، خطای «cannot reuse already
+                    # awaited coroutine» می‌داد و کار قبلی وسط راه می‌مرد.
                     if old_future.cancel():
-                        try:
-                            old_coro.close()
-                        except (RuntimeError, AttributeError):
-                            logger.debug("Superseded coroutine already closed")
+                        self._close_if_unstarted(old_coro)
+
+        if self._loop is None:
+            # کار هرگز زمان‌بندی نمی‌شود: دستهٔ بی‌والد (مالکیت پایتون) و بدون
+            # deleteLater. اگر فرزند runner بود و runner پیش از پردازش
+            # DeferredDelete جمع‌آوری می‌شد، حذف دوباره به فروپاشی می‌انجامید.
+            coroutine.close()
+            orphan = TaskHandle(name)
+            if on_error is not None:
+                orphan.failed.connect(on_error)
+            if on_finished is not None:
+                orphan.finished.connect(on_finished)
+            orphan.failed.emit("Background runner is not running", RuntimeError("runner stopped"))
+            orphan.finished.emit()
+            return orphan
 
         handle = TaskHandle(name, parent=self)
         if on_success is not None:
@@ -177,15 +281,15 @@ class AsyncRunner(QObject):
             handle.failed.connect(on_error)
         if on_finished is not None:
             handle.finished.connect(on_finished)
-        handle.finished.connect(lambda: self._handles.discard(handle))
-        handle.finished.connect(lambda: self._release(name, handle))
+        # نسخهٔ ۲.۵.۴: دستهٔ هر کار فرزند Qt همین runner است و قبلاً هرگز
+        # پاک نمی‌شد. با چند کار در ثانیه (قیمت، پایش معامله، پویش)، پس از
+        # چند ساعت ده‌ها هزار QObject با اتصال‌هایشان انباشته می‌شد و حافظه
+        # و کندی رشد می‌کرد تا برنامه بسته شود. حالا دستهٔ تمام‌شده پس از
+        # مهلتی کوتاه در نخ رابط نابود می‌شود.
+        handle.finished.connect(functools.partial(self._on_handle_finished, name, handle))
         self._handles.add(handle)
-
-        if self._loop is None:
-            coroutine.close()
-            handle.failed.emit("Background runner is not running", RuntimeError("runner stopped"))
-            handle.finished.emit()
-            return handle
+        self.purge_finished()
+        self.submitted_total += 1
 
         future = asyncio.run_coroutine_threadsafe(self._wrap(handle, coroutine), self._loop)
         if coalesce:
@@ -214,12 +318,64 @@ class AsyncRunner(QObject):
         handle, future, coroutine = current
         handle.cancel()
         if future.cancel():
-            # فقط وقتی لغو موفق بود می‌توان کوروتین را بست؛ وگرنه
-            # هشدار «coroutine was never awaited» می‌گیریم.
-            close = getattr(coroutine, "close", None)
-            if callable(close):
-                close()
+            # فقط کوروتینی که هرگز شروع نشده بسته می‌شود (نسخهٔ ۲.۶.۱).
+            self._close_if_unstarted(coroutine)
         return True
+
+    def _close_if_unstarted(self, coroutine: Any) -> None:
+        """
+        بستن کوروتینی که هرگز اجرا نشده — روی نخ حلقه، بدون رقابت.
+
+        اگر _wrap شروع شده باشد، لغوِ Task خودش CancelledError را به
+        کوروتین می‌رساند؛ بستنش از بیرون ممنوع است.
+        """
+        close = getattr(coroutine, "close", None)
+        if not callable(close):
+            return
+
+        def close_now() -> None:
+            try:
+                if inspect.iscoroutine(coroutine) and (
+                    inspect.getcoroutinestate(coroutine) != inspect.CORO_CREATED
+                ):
+                    return
+                close()
+            except (RuntimeError, AttributeError):
+                logger.debug("Superseded coroutine already closed")
+
+        loop = self._loop
+        if loop is not None and not loop.is_closed():
+            try:
+                loop.call_soon_threadsafe(close_now)
+                return
+            except RuntimeError:
+                pass
+        close_now()
+
+    def _on_handle_finished(self, name: str, handle: TaskHandle) -> None:
+        """پایان کار (در نخ رابط): آزادکردن کلید و سپردن دسته به صف نابودی."""
+        self._handles.discard(handle)
+        self._release(name, handle)
+        self._graveyard.append((time.monotonic(), handle))
+        self.purge_finished()
+
+    def purge_finished(self, *, force: bool = False) -> int:
+        """نابودی دسته‌های تمام‌شده‌ای که مهلتشان گذشته (یا همه با force)."""
+        now = time.monotonic()
+        removed = 0
+        while self._graveyard and (force or now - self._graveyard[0][0] >= FINISHED_HANDLE_GRACE_SECONDS):
+            _finished_at, handle = self._graveyard.popleft()
+            _destroy_handle(handle)
+            removed += 1
+        return removed
+
+    def live_handles(self) -> int:
+        """شمار دسته‌های کارهای در حال اجرا — باید کوچک بماند."""
+        return len(self._handles)
+
+    def pending_release(self) -> int:
+        """شمار دسته‌های تمام‌شده‌ای که هنوز نابود نشده‌اند (حداکثر چند ثانیه)."""
+        return len(self._graveyard)
 
     def active_keys(self) -> list[str]:
         """کلید کارهای در حال اجرا (برای آزمون و عیب‌یابی)."""
@@ -238,6 +394,15 @@ class AsyncRunner(QObject):
 
     async def _wrap(self, handle: TaskHandle, coroutine: Coroutine[Any, Any, Any]) -> None:
         """اجرای کوروتین و تبدیل نتیجه یا خطا به سیگنال."""
+        if handle.cancelled:
+            # نسخهٔ ۲.۶.۲: کارِ جایگزین‌شده پیش از شروع، اصلاً اجرا نشود
+            # (لغو Task از نخ دیگر دیرتر از گام اول آن می‌رسد).
+            try:
+                coroutine.close()
+            except (RuntimeError, AttributeError):
+                pass
+            handle.finished.emit()
+            return
         try:
             result = await coroutine
         except asyncio.CancelledError:
@@ -249,7 +414,7 @@ class AsyncRunner(QObject):
             if not handle.cancelled:
                 handle.failed.emit(str(exc), exc)
         except Exception as exc:  # noqa: BLE001 - آخرین سد دفاعی برنامه
-            logger.exception("Unexpected failure in task %s", handle.name)
+            logger.exception("Unexpected failure in task %s: %s: %s", handle.name, type(exc).__name__, exc)
             if not handle.cancelled:
                 handle.failed.emit(str(exc) or exc.__class__.__name__, exc)
         else:

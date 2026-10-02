@@ -26,5 +26,6 @@
   "note_saved": "Note saved.",
   "moved": "Order updated.",
   "add_to_list": "Add to list",
-  "choose_list": "Which list should this symbol go to?"
+  "choose_list": "Which list should this symbol go to?",
+  "save_failed": "Could not save {symbol} to the watchlist"
 }

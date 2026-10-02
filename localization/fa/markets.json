@@ -8,7 +8,7 @@
   "added_to_watchlist": "{symbol} به فهرست پیگیری افزوده شد",
   "all_symbols": "همهٔ نمادها ({count})",
   "already_in_watchlist": "{symbol} از قبل در فهرست پیگیری است",
-  "click_hint": "برای دیدن جزئیات روی هر ارز کلیک کنید.",
+  "click_hint": "کلیک: جزئیات · کلیک راست: منوی نماد (افزودن به واچ‌لیست، تحلیل، سیگنال، هشدار، کپی)",
   "count": "{count} بازار بارگذاری شد",
   "detail_atr": "میانگین دامنهٔ واقعی",
   "detail_change": "تغییر",
@@ -64,5 +64,14 @@
     "gainers": "صعودی",
     "losers": "نزولی",
     "volume": "پرحجم"
+  },
+  "sort_market_cap": "ارزش بازار و حجم (BTC، ETH، …)",
+  "turnover_usdt": "حجم معاملات ۲۴س (USDT)",
+  "menu": {
+    "details": "جزئیات نماد",
+    "analyze": "تحلیل این نماد",
+    "signal": "سیگنال برای این نماد",
+    "copy_symbol": "کپی نام نماد",
+    "copy_price": "کپی قیمت (USDT)"
   }
 }

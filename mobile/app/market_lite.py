@@ -33,6 +33,14 @@ _LBANK_TIMEFRAMES = {
     "1d": "day1",
 }
 
+# طول هر کندل به ثانیه — برای محاسبهٔ نقطهٔ شروع درست.
+# (اشکال نسخه‌های قبل: شروع همیشه `limit × 3600` ثانیه پیش بود؛ برای ۱۵ دقیقه
+# یعنی کندل‌های ۲۰۰ ساعت پیش — دادهٔ کهنه — و برای روزانه فقط ۸ کندل.)
+_TIMEFRAME_SECONDS = {
+    "1m": 60, "5m": 300, "15m": 900, "30m": 1800,
+    "1h": 3600, "4h": 14400, "1d": 86400,
+}
+
 # چند ثانیه یک پاسخ تازه بماند. روی موبایل، هم باتری و هم مصرف داده
 # اهمیت دارد؛ درخواست تکراری پشت سر هم هیچ ارزشی ندارد.
 _CACHE_SECONDS = 20
@@ -88,7 +96,7 @@ def fetch_candles(
             "symbol": to_lbank_symbol(symbol),
             "size": str(limit),
             "type": _LBANK_TIMEFRAMES.get(timeframe, "hour1"),
-            "time": str(int(time.time()) - limit * 3600),
+            "time": str(candles_start(timeframe, limit)),
         },
     )
     if not isinstance(payload, dict) or not payload.get("data"):
@@ -106,6 +114,62 @@ def fetch_candles(
     if not closes:
         raise MarketError(f"دادهٔ کندل برای {symbol} خالی بود")
     return highs, lows, closes
+
+
+def candles_start(timeframe: str, limit: int, now: float | None = None) -> int:
+    """
+    ثانیهٔ شروع، طوری که `limit` کندلِ **آخر** برگردد.
+
+    گرد شده به مرز کندل، تا URL درون یک کندل ثابت بماند و کش کار کند.
+    """
+    step = _TIMEFRAME_SECONDS.get(timeframe, 3600)
+    current = time.time() if now is None else now
+    return (int(current) // step - (limit - 1)) * step
+
+
+def parse_tickers(payload: object, quote: str = "usdt") -> list[dict]:
+    """
+    پاسخ `ticker/24hr.do?symbol=all` ← فهرست ساده و تمیز.
+
+    فقط جفت‌های با ارز مظنهٔ `quote`؛ جفت‌های بی‌قیمت یا بی‌حجم کنار
+    گذاشته می‌شوند (روی صفحهٔ کوچک فقط شلوغی می‌سازند).
+    """
+    rows: list[dict] = []
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, list):
+        return rows
+    suffix = "_" + quote.lower()
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        pair = str(item.get("symbol", "")).lower()
+        if not pair.endswith(suffix):
+            continue
+        body = item.get("ticker") or {}
+        try:
+            price = float(body.get("latest") or 0)
+            turnover = float(body.get("turnover") or 0)
+            change = float(body.get("change") or 0)
+            high = float(body.get("high") or 0)
+            low = float(body.get("low") or 0)
+        except (TypeError, ValueError):
+            continue
+        if price <= 0 or turnover <= 0:
+            continue
+        base = pair[: -len(suffix)].upper()
+        rows.append({
+            "symbol": f"{base}/{quote.upper()}", "base": base, "price": price,
+            "change": change, "turnover": turnover, "high": high, "low": low,
+        })
+    return rows
+
+
+def fetch_tickers(quote: str = "usdt") -> list[dict]:
+    """همهٔ نمادهای بازار با یک درخواست (به‌جای یک درخواست برای هر نماد)."""
+    rows = parse_tickers(_get("/v2/ticker/24hr.do", {"symbol": "all"}), quote)
+    if not rows:
+        raise MarketError("فهرست بازار دریافت نشد")
+    return rows
 
 
 def fetch_price(symbol: str) -> float:

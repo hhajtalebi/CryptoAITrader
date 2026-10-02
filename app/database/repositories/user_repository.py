@@ -641,6 +641,7 @@ class ExchangeAccountRepository(BaseRepository[ExchangeAccountRecord]):
         total_value_usdt: float = 0.0,
         spot: dict[str, Any] | None = None,
         futures: dict[str, Any] | None = None,
+        details: dict[str, Any] | None = None,
     ) -> bool:
         """
         ذخیرهٔ خلاصهٔ دارایی‌ها برای نمایش آفلاین.
@@ -658,6 +659,9 @@ class ExchangeAccountRepository(BaseRepository[ExchangeAccountRecord]):
                     "spot": dict(spot or {}),
                     "futures": dict(futures or {}),
                 }
+                if details is not None:
+                    # v2.5.0: جزئیات آزاد/قفل/مارجین برای زبانه‌های کیف پول
+                    config["wallet_details"] = dict(details)
                 record.extra_config = config
             record.balances = dict(balances or {})
             record.total_value_usdt = float(total_value_usdt or 0.0)

@@ -59,7 +59,7 @@ def window(qt_app: QApplication, translator: Translator) -> MainWindow:
 # پنجرهٔ اصلی
 # ---------------------------------------------------------------------------
 def test_window_exposes_core_pages(window: MainWindow) -> None:
-    """یازده صفحهٔ برنامه باید موجود باشند (پیش‌بینی از v1.11.0)."""
+    """دوازده صفحهٔ برنامه باید موجود باشند (پیش‌بینی از v1.11.0، مرکز لاگ از v2.6.0)."""
     keys = [key for key, _ in window.PAGES]
     assert keys == [
         "nav.dashboard",
@@ -71,10 +71,11 @@ def test_window_exposes_core_pages(window: MainWindow) -> None:
         "nav.trades",
         "nav.wallet",
         "nav.reports",
+        "nav.logs",
         "nav.settings",
         "nav.help",
     ]
-    assert window.stack.count() == 11
+    assert window.stack.count() == 12
 
 
 def test_every_page_is_reachable(window: MainWindow) -> None:
@@ -111,7 +112,7 @@ def test_focus_mode_hides_chrome_but_keeps_pages(window: MainWindow) -> None:
     """
     window.set_focus_mode(True)
     assert window.sidebar.width() < 100
-    assert window.stack.count() == 11
+    assert window.stack.count() == 12
 
     window.set_focus_mode(False)
     assert window.sidebar.width() > 200

@@ -17,7 +17,9 @@
 نکته امنیتی:
     فایل رمزهای محرمانه (`.secret_store.bin`) و کلیدهای Keyring **هرگز**
     در پشتیبان قرار نمی‌گیرند؛ انتقال آن‌ها میان دستگاه‌ها ناامن است و
-    کاربر باید کلیدها را دوباره وارد کند.
+    کاربر باید کلیدهای خارج از DB را دوباره وارد کند. در مقابل، انبار
+    رمزنگاری‌شدهٔ داخل DB برای بازیابی بدون اتلاف نگه داشته می‌شود و
+    manifest آن را صریحاً حساس علامت می‌زند؛ backup را عمومی نکنید.
 """
 
 from __future__ import annotations
@@ -117,6 +119,13 @@ class BackupManager:
         try:
             self._snapshot_database(database_file, temp_db)
             checksum = self._sha256(temp_db)
+            # خود snapshot بررسی شود، نه تنظیم جاری برنامه: ممکن است
+            # backend عوض شده باشد ولی رکورد رمزنگاری‌شده هنوز در DB باشد.
+            encrypted_secrets = self._has_encrypted_secrets(temp_db)
+            settings_data = (
+                self._paths.settings_file.read_bytes()
+                if self._paths.settings_file.exists() else None
+            )
 
             manifest = {
                 "app_version": APP_VERSION,
@@ -125,13 +134,17 @@ class BackupManager:
                 "note": note,
                 "database_sha256": checksum,
                 "database_size": temp_db.stat().st_size,
-                "contains_secrets": False,
+                # settings.json قدیمی schema تضمین‌شده‌ای ندارد؛ اگر
+                # همراه بسته باشد، نبود راز را بی‌بررسی ادعا نمی‌کنیم.
+                "contains_secrets": encrypted_secrets or settings_data is not None,
+                "contains_encrypted_db_secrets": encrypted_secrets,
+                "contains_uninspected_settings": settings_data is not None,
             }
 
             with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
                 archive.write(temp_db, DATABASE_ENTRY)
-                if self._paths.settings_file.exists():
-                    archive.write(self._paths.settings_file, SETTINGS_ENTRY)
+                if settings_data is not None:
+                    archive.writestr(SETTINGS_ENTRY, settings_data)
                 archive.writestr(MANIFEST_NAME, json.dumps(manifest, ensure_ascii=False, indent=2))
         except BackupError:
             raise
@@ -364,6 +377,30 @@ class BackupManager:
         finally:
             source_conn.close()
             target_conn.close()
+
+    @staticmethod
+    def _has_encrypted_secrets(path: Path) -> bool:
+        """
+        تشخیص محافظه‌کارانهٔ رکورد انبار راز در snapshot، بدون رمزگشایی.
+
+        حتی رکورد خالی/ناخوانا حساس فرض می‌شود. DB پیش از اولین migration
+        ممکن است settings نداشته باشد؛ خطای خواندن واقعی باید ساخت backup
+        را متوقف کند، نه اینکه با برچسب «بدون راز» پنهان شود.
+        """
+        from app.security.db_backend import SECRETS_SETTING_KEY
+
+        connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            exists = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='settings'"
+            ).fetchone()
+            if exists is None:
+                return False
+            return connection.execute(
+                'SELECT 1 FROM settings WHERE "key" = ? LIMIT 1', (SECRETS_SETTING_KEY,)
+            ).fetchone() is not None
+        finally:
+            connection.close()
 
     @staticmethod
     def _assert_valid_sqlite(path: Path) -> None:

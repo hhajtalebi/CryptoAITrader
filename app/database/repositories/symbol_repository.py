@@ -159,18 +159,24 @@ class SymbolRepository(BaseRepository[SymbolRecord]):
             ).scalars().all()
             return list(rows)
 
-    def add_to_watchlist(self, symbol: str, exchange: str, list_name: str = "default") -> bool:
+    def add_to_watchlist(
+        self, symbol: str, exchange: str | None = None, list_name: str = "default"
+    ) -> bool:
         """
         افزودن یک نماد به فهرست پیگیری.
 
         افزودن تکراری خطا نیست و False برمی‌گرداند.
+
+        v2.5.1 — علت «واچ‌لیست همیشه خالی»: جدول `symbols` در برنامه هیچ‌وقت
+        پر نمی‌شد (`sync_symbols` فقط در آزمون صدا زده می‌شد)، پس این متد
+        رکورد نماد را پیدا نمی‌کرد و بی‌صدا False برمی‌گرداند. حالا اگر
+        رکورد نباشد همان‌جا از روی نام استاندارد (BTC/USDT) ساخته می‌شود.
         """
+        symbol = _normalize_symbol(symbol)
+        if not symbol:
+            return False
         with self._db.session_scope() as session:
-            record = session.execute(
-                select(SymbolRecord).where(
-                    SymbolRecord.symbol == symbol, SymbolRecord.exchange == exchange
-                )
-            ).scalar_one_or_none()
+            record = _find_record(session, symbol, exchange, create=True)
             if record is None:
                 return False
             already = session.execute(
@@ -193,25 +199,39 @@ class SymbolRepository(BaseRepository[SymbolRecord]):
             )
             return True
 
-    def remove_from_watchlist(self, symbol: str, exchange: str, list_name: str = "default") -> bool:
-        """حذف یک نماد از فهرست پیگیری."""
+    def is_in_watchlist(self, symbol: str, list_name: str = "default") -> bool:
+        """آیا نماد (در هر صرافی) در این فهرست هست؟ (v2.5.1)"""
+        return _normalize_symbol(symbol) in set(self.get_watchlist(list_name))
+
+    def remove_from_watchlist(
+        self, symbol: str, exchange: str | None = None, list_name: str = "default"
+    ) -> bool:
+        """
+        حذف یک نماد از فهرست پیگیری.
+
+        بدون `exchange` (یا اگر رکورد آن صرافی نباشد) هر رکوردی با همین نام
+        که در فهرست است برداشته می‌شود — ستارهٔ جدول نباید به‌خاطر تفاوت نام
+        صرافی «گیر» کند.
+        """
+        symbol = _normalize_symbol(symbol)
+        removed = False
         with self._db.session_scope() as session:
-            record = session.execute(
-                select(SymbolRecord).where(
-                    SymbolRecord.symbol == symbol, SymbolRecord.exchange == exchange
-                )
-            ).scalar_one_or_none()
-            if record is None:
-                return False
-            item = session.execute(
-                select(WatchlistItem).where(
-                    WatchlistItem.list_name == list_name, WatchlistItem.symbol_id == record.id
-                )
-            ).scalar_one_or_none()
-            if item is None:
-                return False
-            session.delete(item)
-            return True
+            stmt = (
+                select(WatchlistItem)
+                .join(SymbolRecord, WatchlistItem.symbol_id == SymbolRecord.id)
+                .where(WatchlistItem.list_name == list_name, SymbolRecord.symbol == symbol)
+            )
+            items = session.execute(stmt).scalars().all()
+            if exchange:
+                exact = [
+                    i for i in items
+                    if session.get(SymbolRecord, i.symbol_id).exchange == exchange
+                ]
+                items = exact or items
+            for item in items:
+                session.delete(item)
+                removed = True
+        return removed
 
     # ------------------- چند فهرست دیده‌بانی (مورد ۵.۳) -------------------
     #: هم‌نام ماژولی، برای کدی که از راه نمونهٔ مخزن به آن می‌رسد
@@ -419,3 +439,46 @@ class SymbolRepository(BaseRepository[SymbolRecord]):
                 )
             ).scalars().all()
         return sorted(str(name) for name in rows)
+
+
+def _normalize_symbol(symbol: str) -> str:
+    """«btc_usdt» / «BTCUSDT» نه؛ فقط شکل استاندارد «BTC/USDT» با حروف بزرگ."""
+    text = str(symbol or "").strip().upper()
+    if "/" not in text and "_" in text:
+        text = text.replace("_", "/")
+    return text
+
+
+def _find_record(session, symbol: str, exchange: str | None, *, create: bool = False):
+    """
+    یافتن رکورد نماد؛ اول همان صرافی، بعد هر صرافی؛ در صورت نیاز ساختن آن.
+    """
+    if exchange:
+        record = session.execute(
+            select(SymbolRecord).where(
+                SymbolRecord.symbol == symbol, SymbolRecord.exchange == exchange
+            )
+        ).scalar_one_or_none()
+        if record is not None:
+            return record
+    else:
+        record = session.execute(
+            select(SymbolRecord).where(SymbolRecord.symbol == symbol).order_by(SymbolRecord.id)
+        ).scalars().first()
+        if record is not None:
+            return record
+    if not create:
+        return None
+    base, _sep, quote = symbol.partition("/")
+    record = SymbolRecord(
+        exchange=str(exchange or "default"),
+        symbol=symbol,
+        exchange_symbol=symbol.replace("/", "_").lower(),
+        base_asset=base,
+        quote_asset=quote,
+        is_active=True,
+    )
+    session.add(record)
+    session.flush()
+    return record
+

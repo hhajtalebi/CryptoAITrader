@@ -47,6 +47,58 @@ class MicroPlan:
         """کارمزد خروج. فقط همین مقدار به `close_trade` داده می‌شود."""
         return self.round_trip_fee / 2.0
 
+    # ------------------------------------------------------------------
+    # نسخهٔ ۲.۵.۶ — اقتصاد صادقانهٔ معامله
+    # ------------------------------------------------------------------
+    @property
+    def target_move_percent(self) -> float:
+        """حرکت قیمت لازم تا حد سود (درصد، شامل کارمزد)."""
+        return self.gross_target / self.notional * 100.0 if self.notional > 0 else 0.0
+
+    @property
+    def stop_move_percent(self) -> float:
+        """حرکت مخالف تا حد ضرر (درصد)."""
+        return self.stop_distance / self.notional * 100.0 if self.notional > 0 else 0.0
+
+    @property
+    def breakeven_win_rate(self) -> float:
+        """درصد برد لازم برای سربه‌سر: ضرر / (سود + ضرر)."""
+        total = self.net_target + self.max_loss
+        return self.max_loss / total * 100.0 if total > 0 else 100.0
+
+    @property
+    def random_win_rate(self) -> float:
+        """
+        درصد برد یک جهت بی‌برتری (قدم‌زدن تصادفی بدون رانش).
+
+        احتمال رسیدن به +a پیش از −b برابر b/(a+b) است. چون کارمزد حد سود
+        را دورتر و حد ضرر را نزدیک‌تر می‌کند، این عدد زیر حد سربه‌سر است.
+        """
+        total = self.gross_target + self.stop_distance
+        return self.stop_distance / total * 100.0 if total > 0 else 0.0
+
+    @property
+    def no_edge_expectancy(self) -> float:
+        """
+        امید ریاضی دلاری هر معامله با جهت بی‌برتری ≈ −کارمزد رفت‌وبرگشت.
+
+        این ریشهٔ ریاضی «همهٔ اسکالپ‌ها منفی‌اند» است: بدون برتری واقعی در
+        جهت، هر معامله به‌طور میانگین همان کارمزد را از دست می‌دهد.
+        """
+        p = self.random_win_rate / 100.0
+        return p * self.net_target - (1.0 - p) * self.max_loss
+
+    def economics(self) -> dict[str, float]:
+        """خلاصهٔ قابل نمایش/ثبت."""
+        return {
+            "target_move_percent": round(self.target_move_percent, 4),
+            "stop_move_percent": round(self.stop_move_percent, 4),
+            "breakeven_win_rate": round(self.breakeven_win_rate, 1),
+            "random_win_rate": round(self.random_win_rate, 1),
+            "no_edge_expectancy": round(self.no_edge_expectancy, 4),
+            "round_trip_fee": round(self.round_trip_fee, 4),
+        }
+
 
 def plan_levels(
     margin: float,

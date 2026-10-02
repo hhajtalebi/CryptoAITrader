@@ -81,6 +81,7 @@ def configure_logging(
     console: bool = True,
     max_bytes: int = 2 * 1024 * 1024,
     backup_count: int = 5,
+    structured_dir: Path | None = None,
 ) -> logging.Logger:
     """
     پیکربندی لاگر ریشه نرم‌افزار.
@@ -91,6 +92,9 @@ def configure_logging(
         console      : نوشتن هم‌زمان روی خروجی استاندارد.
         max_bytes    : حداکثر حجم هر فایل لاگ پیش از چرخش.
         backup_count : تعداد فایل‌های پشتیبان لاگ.
+        structured_dir: (نسخهٔ ۲.۶.۰) پوشهٔ لاگ ساختاریافته؛ اگر داده شود، لاگ
+                        دسته‌ای JSONL (`<پوشه>/<دسته>/`) و بافر زندهٔ «مرکز لاگ»
+                        از طریق صف غیرمسدودکننده فعال می‌شود.
 
     این تابع «Idempotent» است: فراخوانی مجدد، Handlerهای قبلی را پاک
     می‌کند تا لاگ تکراری تولید نشود.
@@ -120,6 +124,11 @@ def configure_logging(
         file_handler.setFormatter(formatter)
         file_handler.addFilter(sensitive_filter)
         root.addHandler(file_handler)
+
+    if structured_dir is not None:
+        from app.logging.structured import setup_structured_logging
+
+        setup_structured_logging(structured_dir)
 
     # کاهش نویز کتابخانه‌های بیرونی که در سطح DEBUG بسیار پرحرف هستند.
     for noisy in ("httpx", "httpcore", "websockets", "urllib3", "asyncio", "matplotlib"):

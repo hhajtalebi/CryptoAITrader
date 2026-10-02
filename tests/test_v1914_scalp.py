@@ -362,7 +362,7 @@ class TestHardCaps:
 
     def test_concurrency_is_capped(self) -> None:
         """تعداد معاملهٔ همزمان سقف سخت دارد."""
-        config = AutoTradeConfig(max_concurrent=99).validated()
+        config = AutoTradeConfig(max_concurrent=HARD_MAX_CONCURRENT + 50).validated()
 
         assert config.max_concurrent == HARD_MAX_CONCURRENT
 

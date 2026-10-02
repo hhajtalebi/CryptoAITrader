@@ -59,9 +59,10 @@ def test_default_signal_mode_is_hybrid() -> None:
     assert DEFAULT_SETTINGS["ai.signal_mode"] == "hybrid"
 
 
-def test_default_markets_sort_is_value() -> None:
+def test_default_markets_sort_is_market_cap() -> None:
     """بازارها به‌طور پیش‌فرض بر پایهٔ ارزش مرتب می‌شوند."""
-    assert DEFAULT_SETTINGS["ui.markets_sort"] == "value"
+    # v2.5.1: پیش‌فرض «ارزش بازار + حجم» است (BTC، ETH… بالا)
+    assert DEFAULT_SETTINGS["ui.markets_sort"] == "market_cap"
 
 
 def test_narrative_enabled_by_default() -> None:
@@ -214,7 +215,7 @@ def test_load_with_missing_keys_uses_defaults(page: SettingsPage) -> None:
 def test_load_with_unknown_sort_mode_is_safe(page: SettingsPage) -> None:
     """مقدار نامعتبر در پایگاه داده نباید صفحه را خراب کند."""
     page.load_values({"ui.markets_sort": "nonsense", "ai.signal_mode": "nonsense"})
-    assert page.collect_values()["ui.markets_sort"] in {"value", "volume", "gainers", "losers", "price_desc", "price_asc", "name"}
+    assert page.collect_values()["ui.markets_sort"] in {"market_cap", "value", "volume", "gainers", "losers", "price_desc", "price_asc", "name"}
 
 
 def test_boolean_settings_round_trip_true(page: SettingsPage) -> None:

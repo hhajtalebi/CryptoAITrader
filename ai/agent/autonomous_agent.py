@@ -951,6 +951,21 @@ class AutonomousAgent:
         if not self._providers.has_providers:
             return False, "No AI provider configured"
         results = await self._providers.check_all()
+        # نسخهٔ ۲.۵.۹: «در دسترس» کافی نیست؛ سرویسی که اول زنجیره است و
+        # آزمون تولید واقعی دارد (اولاما) باید یک کلمه پاسخ بدهد. پیش‌تر
+        # تنظیمات «وصل است» نشان می‌داد در حالی که مدل هیچ پاسخی نمی‌داد.
+        ordered = getattr(self._providers, "ordered_providers", None)
+        chain = ordered(self._preferred) if callable(ordered) else []
+        for provider in chain or []:
+            name = getattr(provider, "name", "")
+            ok, message = results.get(name, (False, ""))
+            if not ok:
+                continue
+            probe = getattr(provider, "probe_generation", None)
+            if callable(probe):
+                probe_ok, probe_message = await probe()
+                return probe_ok, f"{name}: {probe_message}"
+            return True, f"{name}: {message}"
         for name, (ok, message) in results.items():
             if ok:
                 return True, f"{name}: {message}"

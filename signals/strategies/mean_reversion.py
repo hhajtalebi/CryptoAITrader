@@ -16,6 +16,10 @@ from __future__ import annotations
 
 from signals.strategies.base import BaseStrategy, StrategyContext, StrategyVote
 
+#: آستانه‌های %B در مقیاس ۰..۱۰۰ (۰ = باند پایین، ۱۰۰ = باند بالا)
+PERCENT_B_LOW = 5.0
+PERCENT_B_HIGH = 95.0
+
 
 class MeanReversionStrategy(BaseStrategy):
     """راهبرد بازگشت قیمت به میانگین."""
@@ -46,12 +50,16 @@ class MeanReversionStrategy(BaseStrategy):
             reasons.append(f"RSI {rsi:.1f} is overbought")
 
         # موقعیت نسبت به باند بولینگر
+        # نسخهٔ ۲.۵.۸: اندیکاتور BBANDS مقدار %B را در مقیاس **۰ تا ۱۰۰** می‌دهد
+        # (indicators/volatility.py). مقایسهٔ قبلی با 0.05/0.95 (مقیاس کسری)
+        # تقریباً هر قیمتی را «بالای باند بالا» می‌دید و سوگیری دائمی SHORT
+        # می‌ساخت (۹۴٪ رأی‌ها روی دادهٔ واقعی). آستانه‌ها اکنون ۵ و ۹۵.
         percent_b = context.indicator_value("BBANDS", "percent_b")
         if percent_b is not None:
-            if percent_b < 0.05:
+            if percent_b < PERCENT_B_LOW:
                 score += 0.25
                 reasons.append("Price is at or below the lower Bollinger band")
-            elif percent_b > 0.95:
+            elif percent_b > PERCENT_B_HIGH:
                 score -= 0.25
                 reasons.append("Price is at or above the upper Bollinger band")
 

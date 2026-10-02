@@ -40,6 +40,9 @@ QLabel[role="title"] {{ font-size: {font_xl}px; font-weight: 800; color: {text};
 QLabel[role="subtitle"] {{ font-size: {font_lg}px; color: {text_muted}; font-weight: 600; }}
 QLabel[role="section"] {{ font-size: {font_lg}px; font-weight: 700; color: {text}; }}
 QLabel[role="metric"] {{ font-size: {font_metric}px; font-weight: 800; color: {text}; }}
+QLabel[role="metric_up"] {{ font-size: {font_metric}px; font-weight: 800; color: {success}; }}
+QLabel[role="metric_down"] {{ font-size: {font_metric}px; font-weight: 800; color: {danger}; }}
+QLabel[role="symbol"] {{ font-weight: 700; color: {text}; }}
 QLabel[role="muted"] {{ color: {text_muted}; }}
 QLabel[role="faint"] {{ color: {text_faint}; font-size: {font_xs}px; }}
 QLabel[role="accent"] {{ color: {accent}; font-weight: 700; }}
@@ -311,9 +314,13 @@ QDoubleSpinBox::up-arrow:disabled, QDoubleSpinBox::down-arrow:disabled {{
     opacity: 0.3;
 }}
 QLineEdit[role="search"] {{
-    border-radius: {radius_pill}px; padding: 8px 16px;
+    border-radius: 19px; padding: 6px 16px;
     background-color: {surface_alt};
+    border: {border_width}px solid {border};
+    min-height: 24px;
 }}
+QLineEdit[role="search"]:hover {{ border-color: {border_strong}; }}
+QLineEdit[role="search"]:focus {{ border-color: {primary}; background-color: {surface}; }}
 QLineEdit:disabled, QTextEdit:disabled {{ color: {text_faint}; }}
 
 QComboBox {{

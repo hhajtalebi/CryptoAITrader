@@ -26,8 +26,9 @@ import asyncio
 import json
 from typing import Any
 
-from app.logging import get_logger
+from app.logging import audit, get_logger
 from trading.scalp_scanner import (
+    DEFAULT_MIN_COST_MULTIPLE,
     ScalpCandidate,
     feasibility_note,
     prefilter_symbols,
@@ -63,6 +64,8 @@ class ScalpService:
 
     def __init__(self, app: Any) -> None:
         self._app = app
+        from trading.universe import RotatingUniverse
+        self._universe = RotatingUniverse()
 
     # ---- خواندن تنظیم‌ها ---------------------------------------------
 
@@ -75,7 +78,7 @@ class ScalpService:
 
     # ---- پویش --------------------------------------------------------
 
-    async def scan(self, *, use_ai: bool | None = None) -> list[ScalpCandidate]:
+    async def scan(self, *, use_ai: bool | None = None, symbols: list[str] | None = None) -> list[ScalpCandidate]:
         """
         یک دور کامل پویش.
 
@@ -87,17 +90,31 @@ class ScalpService:
         scan_limit = int(self._setting("scalp.scan_limit", 25))
 
         tickers = await self._app.market.get_all_tickers()
-        shortlist = prefilter_symbols(
-            tickers, min_turnover=min_turnover, limit=scan_limit
-        )
+        eligible = prefilter_symbols(tickers, min_turnover=min_turnover, limit=len(tickers))
+        raw = str(self._setting("scalp.selected_symbols", "") or "")
+        favorites = [s.strip().upper() for s in raw.split(",") if s.strip()]
+        chosen = self._universe.select(eligible, limit=scan_limit, selected=symbols,
+                                       favorites=favorites, min_turnover=min_turnover)
+        shortlist = [t for t in eligible if t.symbol in chosen]
         logger.info(
             "Scalp scan: %d tickers -> %d after liquidity filter",
             len(tickers), len(shortlist),
         )
 
+        try:
+            cost_multiple = float(self._setting("scalp.min_cost_multiple", DEFAULT_MIN_COST_MULTIPLE))
+        except (TypeError, ValueError):
+            cost_multiple = DEFAULT_MIN_COST_MULTIPLE
         semaphore = asyncio.Semaphore(FETCH_CONCURRENCY)
+        # نسخهٔ ۲.۶.۰: شمارش دلیل رد هر نماد برای خلاصهٔ پویش (فقط ثبت)
+        reject_counts: dict[str, int] = {}
+        evaluated = 0
+
+        def count_reject(code: str) -> None:
+            reject_counts[code] = reject_counts.get(code, 0) + 1
 
         async def evaluate(ticker: Any) -> ScalpCandidate | None:
+            nonlocal evaluated
             async with semaphore:
                 try:
                     candles = await self._app.market.get_candles(ticker.symbol, "5m", 60)
@@ -105,12 +122,16 @@ class ScalpService:
                 except Exception:  # noqa: BLE001
                     # یک نماد خراب نباید کل پویش را متوقف کند.
                     logger.debug("Scalp data fetch failed for %s", ticker.symbol)
+                    count_reject("data_error")
                     return None
+                evaluated += 1
                 return score_candidate(
                     ticker,
                     candles,
                     spread=spread_from_orderbook(book),
                     max_spread=max_spread,
+                    min_cost_multiple=cost_multiple,
+                    on_reject=count_reject,
                 )
 
         results = await asyncio.gather(
@@ -119,7 +140,13 @@ class ScalpService:
         candidates = [
             item for item in results if isinstance(item, ScalpCandidate)
         ]
+        audit.note_scan(scanned=len(shortlist), raw=evaluated, reasons=reject_counts)
         ranked = rank_candidates(candidates, limit=10)
+        # نسخهٔ ۲.۵.۵: اسکنر نامزد پیدا می‌کند؛ جهت با شواهد چندتایم‌فریمی
+        # (۱m/۵m/۱۵m/۱h/۴h + دفتر سفارش) تعیین می‌شود، نه فقط مومنتوم.
+        if ranked and bool(self._setting("scalp.evidence_direction", True)):
+            ranked = await self._resolve_directions(ranked)
+            ranked = rank_candidates(ranked, limit=10)
         logger.info("Scalp scan produced %d candidates", len(ranked))
 
         should_use_ai = (
@@ -128,6 +155,55 @@ class ScalpService:
         if should_use_ai and ranked:
             ranked = await self._ai_review(ranked)
         return ranked
+
+    async def _resolve_directions(self, ranked: list[ScalpCandidate]) -> list[ScalpCandidate]:
+        """
+        تعیین جهت نامزدهای برتر با شواهد چندتایم‌فریمی.
+
+        کندل‌های تایم‌فریم بالا ۶۰ ثانیه کش می‌شوند تا پویش سریع اسکالپ
+        بار اضافه‌ای نسازد. خطای هر نماد → همان نامزد بدون تغییر.
+        """
+        from signals.orderflow import orderbook_imbalance
+        from trading.scalp_scanner import apply_direction_evidence
+
+        cache: dict[tuple[str, str], tuple[float, list[Any]]] = getattr(self, "_htf_cache", {})
+        self._htf_cache = cache
+        loop = asyncio.get_running_loop()
+        semaphore = asyncio.Semaphore(FETCH_CONCURRENCY)
+
+        async def candles(symbol: str, timeframe: str, ttl: float) -> list[Any]:
+            key = (symbol, timeframe)
+            hit = cache.get(key)
+            if hit is not None and loop.time() - hit[0] < ttl:
+                return hit[1]
+            data = list(await self._app.market.get_candles(symbol, timeframe, 60) or [])
+            cache[key] = (loop.time(), data)
+            return data
+
+        async def resolve(candidate: ScalpCandidate) -> ScalpCandidate:
+            async with semaphore:
+                try:
+                    frames: dict[str, list[Any]] = {}
+                    for timeframe, ttl in (("1m", 5.0), ("5m", 10.0), ("15m", 60.0), ("1h", 60.0), ("4h", 120.0)):
+                        try:
+                            frames[timeframe] = await candles(candidate.symbol, timeframe, ttl)
+                        except Exception:  # noqa: BLE001 - یک تایم‌فریم نبود، بقیه هست
+                            continue
+                    imbalance = None
+                    try:
+                        imbalance = orderbook_imbalance(
+                            await self._app.market.get_orderbook(candidate.symbol, 20)
+                        )
+                    except Exception:  # noqa: BLE001
+                        imbalance = None
+                    return apply_direction_evidence(candidate, frames, orderbook_imbalance=imbalance)
+                except Exception:  # noqa: BLE001
+                    logger.debug("Scalp direction evidence failed for %s", candidate.symbol, exc_info=True)
+                    return candidate
+
+        if len(cache) > 400:
+            cache.clear()
+        return list(await asyncio.gather(*(resolve(c) for c in ranked)))
 
     # ---- بازبینی هوش مصنوعی ------------------------------------------
 
@@ -153,7 +229,9 @@ class ScalpService:
                 "momentum_percent": round(c.momentum, 3),
                 "spread_percent": round(c.spread_percent, 4),
                 "turnover_24h_usd": round(c.turnover_24h),
-                "expected_net_percent": round(c.expected_net_percent, 3),
+                "expected_net_percent_if_direction_right": round(c.expected_net_percent, 3),
+                "round_trip_cost_percent": round(c.cost_percent, 3),
+                "breakeven_win_rate_percent": round(c.breakeven_win_rate, 1),
             }
             for c in top
         ]
@@ -246,10 +324,29 @@ class ScalpService:
             candidate.volatility_5m,
         )
 
+    def _bool_setting(self, key: str, fallback: bool) -> bool:
+        """False و رشتهٔ «false» نباید در مسیر تنظیمات به True تبدیل شوند."""
+        value = self._setting(key, fallback)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "1", "yes", "on"}:
+                return True
+            if normalized in {"false", "0", "no", "off"}:
+                return False
+            return fallback
+        return fallback if value is None else bool(value)
+
     def build_trader_config(self) -> Any:
-        """ساخت پیکربندی موتور خودکار از روی تنظیم‌های کاربر."""
+        """
+        انتقال کامل تنظیم‌ها به موتور، بدون نوشتن در تنظیم‌های ذخیره‌شده.
+
+        فیلدهای محافظ و حالت موتور نباید فقط در UI خوانده شوند و در
+        AutoTradeConfig روی پیش‌فرض بمانند. صفر کارمزد/لغزش و False معتبرند.
+        سقف‌های سخت همچنان در validated اعمال می‌شوند.
+        """
         from trading.auto_trader import AutoTradeConfig
 
+        fee_rate = self._setting("scalp.taker_fee_rate", 0.0006)
         return AutoTradeConfig(
             margin_per_trade=float(self._setting("scalp.margin_per_trade", 10.0)),
             target_profit=float(self._setting("scalp.target_profit", 2.0)),
@@ -258,8 +355,31 @@ class ScalpService:
             max_concurrent=int(self._setting("scalp.max_concurrent", 3)),
             max_hold_seconds=int(self._setting("scalp.max_hold_seconds", 900)),
             poll_seconds=float(self._setting("scalp.poll_seconds", 5.0)),
-            daily_loss_limit=float(self._setting("scalp.daily_loss_limit", 20.0)),
+            daily_loss_limit=float(self._setting("scalp.daily_loss_limit", 0.0) or 0.0),
+            edge_guard_enabled=self._bool_setting("scalp.edge_guard_enabled", True),
+            edge_guard_min_trades=int(self._setting("scalp.edge_guard_min_trades", 50) or 50),
+            break_even_lock=float(self._setting("scalp.break_even_lock", 0.1)),
+            reach_ratio=float(self._setting("scalp.reach_ratio", 0.5)),
+            max_spread_stop_fraction=float(self._setting("scalp.max_spread_stop_fraction", 0.33)),
+            diagnostic_only=self._bool_setting("scalp.diagnostic_only", False),
             mode=str(self._setting("scalp.mode", "paper")),
             live_confirmation=str(self._setting("scalp.live_confirmation", "")),
-            fee_rate=float(self._setting("scalp.taker_fee_rate", 0.0006) or 0.0006),
+            fee_rate=float(0.0006 if fee_rate is None else fee_rate),
+            engine_mode=str(self._setting("scalp.engine_mode", "scan")),
+            selected_symbols=str(self._setting("scalp.selected_symbols", "")),
+            scan_interval_seconds=float(self._setting("scalp.scan_interval_seconds", 15.0)),
+            min_liquidity=float(self._setting("scalp.min_liquidity", 2_000_000.0)),
+            max_spread_percent=float(self._setting("scalp.max_spread_percent", 0.25)),
+            stale_after_seconds=float(self._setting("scalp.stale_after_seconds", 10.0)),
+            slippage_percent=float(self._setting("scalp.slippage_percent", 0.02)),
+            break_even_enabled=self._bool_setting("scalp.break_even_enabled", True),
+            break_even_trigger=float(self._setting("scalp.break_even_trigger", 1.0)),
+            trailing_enabled=self._bool_setting("scalp.trailing_enabled", False),
+            trailing_activation=float(self._setting("scalp.trailing_activation", 1.5)),
+            trailing_offset=float(self._setting("scalp.trailing_offset", 0.4)),
+            signal_invalidation=self._bool_setting("scalp.signal_invalidation", True),
+            trend_conflict_policy=str(self._setting("scalp.trend_conflict_policy", "block")),
+            allocation_mode=str(self._setting("scalp.allocation_mode", "fixed")),
+            allocation_percent=float(self._setting("scalp.allocation_percent", 5.0)),
+            max_total_margin_percent=float(self._setting("scalp.max_total_margin_percent", 60.0)),
         ).validated()

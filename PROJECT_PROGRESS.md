@@ -1,3 +1,231 @@
+## وضعیت جاری ۲.۵.۵ — ارتقای هوشمندی سیگنال (بدون بازنویسی)
+
+درخواست کاربر: لایهٔ تحلیل هوشمند روی معماری موجود (سیگنال پایه ← پیش‌بینی + MTF + رژیم + زمینه ← نهایی)، کیفیت
+STRONG/NORMAL/WEAK، خروجی‌های جدا، NO_TRADE فقط در تعارض شدید، بک‌تست و walk-forward واقعی، دروازهٔ قفل اجرای واقعی.
+- `signals/intelligent_decision.py`: `IntelligentDecisionEngine.evaluate(DecisionInputs)` ← `IntelligentDecision` (technical/final
+  confidence، prediction_probability، mtf_alignment، regime_score، historical_edge، execution_quality، quality، size_multiplier ۱/۰٫۷۵/۰٫۵،
+  weak_reason)، `rescore(snapshot, cfg)` برای walk-forward، `eligibility_confidence(signal)` (آستانهٔ کاربر با اطمینان **فنی**)،
+  `resolve_direction`. NO_TRADE: ≥۳ از (prediction, mtf, regime, history) با امتیاز ≤ −۰٫۵ و نسبت ≤ −۰٫۴۵.
+- `signals/orderflow.py` (CVD/دلتا/دفتر سفارش؛ فیوچرز «ناموجود»)، `signals/learning.py` (`PerformanceLearner`، حداقل ۳۰ نمونه،
+  Wilson، shrinkage؛ `load_records_from_database`)، `backtest/` (`HistoricalMarket` بدون look-ahead، `simulate_trade` با
+  کارمزد/اسپرد/لغزش، `summarize`/`calibration`، `make_folds`/`tune`/`run_walk_forward`)، `trading/validation_gate.py`
+  (`ValidationGate.live_allowed()`، پیش‌فرض قفل)، `tools/run_backtest.py` (`--record-gate`، `--from-report`).
+- اتصال: `SignalEngine.set_intelligence(...)` در `app/application.py::_wire_intelligence` (تنظیم `signals.intelligence_enabled`)؛
+  `TradingSignal.intelligence` در `market_snapshot`؛ `AutoTrader(live_gate=)` ← با live و دروازهٔ قفل ورود کاغذی و بدون درگاه؛
+  `size_multiplier` روی مارجین؛ اسکالپ: `apply_direction_evidence` (تنظیم `scalp.evidence_direction`)؛ UI: کارت `signalQualityCard`
+  (`quality_rows`)، کیفیت در جدول پویش و متن کپی، کلیدهای `signals.quality.*`.
+- بک‌تست واقعی (۱۲ نماد ۵m، ۱۸٬۳۷۲ ارزیابی): تعداد سیگنال یکسان، NO_TRADE=۰؛ بهبود امید/افت فقط از اندازهٔ کوچک‌تر، ترتیب
+  کیفیت و کالیبراسیون تأیید نشد، جهت شواهدی اسکالپ بهبود نداد؛ دروازه قفل. `docs/BACKTEST_2.5.5.md`.
+آزمون: `tests/test_v255_intelligence.py` (۴۰)؛ کل مجموعه 2604 پاس + 2 skip. گزارش: `docs/RELEASE_2.5.5_FA.md`.
+**commit نشده** (آخرین commit: `d842827` = 2.5.3+2.5.4).
+
+## وضعیت قبلی ۲.۵.۴ — بسته‌شدن خودکار EXE، معاملهٔ خودکاری که باز نمی‌شد، اسکالپ فوق‌سریع
+
+گزارش کاربر: (۱) EXE پس از چند دقیقه/ساعت خودش بسته می‌شود؛ (۲) معاملهٔ خودکار هیچ معامله‌ای باز نمی‌کند؛
+(۳) «اسکالپ فوق‌سریع» با اهرم بالا، بستن در سود خالص کاربر (مثلاً ۲–۳ دلار پس از کارمزد) و ~۱۰۰ معاملهٔ هم‌زمان
+با ۱۰۰۰ دلار. پاسخ‌های کاربر: فعلاً کاغذی با قیمت زنده؛ سقف هم‌زمانی تا ۲۰۰ قابل تنظیم.
+- بسته‌شدن: هر `TaskHandle` فرزند Qt ‏`AsyncRunner` بود و هرگز پاک نمی‌شد (چند کار در ثانیه ← ده‌ها هزار QObject).
+  حالا `_on_handle_finished` ← صف `_graveyard` ← `purge_finished` (نابودی هم‌گام با `shiboken6.delete` پس از
+  `FINISHED_HANDLE_GRACE_SECONDS=2`؛ `stop()` همه را پس از join نابود می‌کند). `deleteLater` مستقیم آزمون‌ها را
+  با segfault می‌کشت (GC چرخه‌ای runner/نابودی هم‌زمان با emit) — تکرار نشود. کار زمان‌بندی‌نشده (runner متوقف)
+  دستهٔ بی‌والد می‌گیرد. `app/diagnostics.py`: `data/logs/app.log` (چرخشی ۵MB)، `crash.log` (faulthandler +
+  excepthook نخ‌ها)، `session.json` (`SessionMonitor`: ضربان ۶۰ث، `clean`؛ نشست ناتمام قبلی ← اعلان
+  `common.unclean_exit`)، پیام‌های Qt در لاگ، `MainController.health_counters/log_health`. نوشتن DB پایش معامله
+  محدود شد (`PERSIST_INTERVAL_SECONDS=2`، تغییر حد ضرر فوری). رویدادهای موتور: اعلان‌ها محدود (۲٫۵ث) و تازه‌سازی
+  جدول‌ها یکجا (۴۰۰ms: `_schedule_auto_refresh`/`_flush_auto_refresh`).
+- باز نشدن: حد ضرر دورِ سیگنال در اهرم بالا همیشه `risk_exceeds_loss_budget` می‌داد. حالا `_open_trade_locked` هدف
+  و حد ضرر را به بودجهٔ دلاری کاربر محدود می‌کند (`stop_source`/`target_source` در extra رکورد). `scan_stats()`
+  (نامزد/بازشده/دلیل‌های رد) در پنل با `trades.auto.scan_summary` و `trades.auto.reject.*` هر ۳ ثانیه دیده می‌شود.
+- فوق‌سریع: `trading/ultra_scalp.py` (`momentum`، `UltraScalpSource` از کش تیک کل بازار + فیلتر نقدینگی)، حالت موتور
+  `ultra` (`ULTRA_MIN_SCAN_INTERVAL=1`، `ULTRA_MIN_HOLD_SECONDS=10`، بدون ابطال سیگنال)، `HARD_MAX_CONCURRENT=200`،
+  دکمهٔ «⚡ اسکالپ فوق‌سریع» (`TradesPage.ULTRA_PRESET`: ۱۰$×۵۰، هدف ۲$، ضرر ۲$، ۱۰۰ هم‌زمان، ۱۸۰ث، پویش ۱ث)، فیلد
+  «بیشترین زمان باز ماندن»، تنظیم‌های `scalp.ultra_*`. کش روزانهٔ سود/زیان ۱ث و یک عکس پرتفوی برای هر ورود.
+  حالت سفارش (کاغذی/واقعی) با پیش‌تنظیم عوض نمی‌شود؛ درگاه واقعی همچنان کاغذی است. سوکت حداکثر ۸۰ نماد
+  (`MAX_STREAMED_SYMBOLS`)، بقیه با REST هر ۳ ثانیه.
+آزمون: `tests/test_v254_ultra_and_stability.py`؛ کل مجموعه 2564 پاس + 2 skip. شبیه‌سازی ۳۰۰ نماد: ۱۰۰ معامله در
+کمتر از ۸ ثانیه، بستن در سود خالص ≈ ۲ دلار (دادهٔ مصنوعی؛ نشانهٔ سودآوری نیست). گزارش: `docs/RELEASE_2.5.4_FA.md`.
+commit شد: `d842827` (2.5.3+2.5.4).
+
+## وضعیت قبلی ۲.۵.۳ — ربات‌های ساخت فایل نصبی ویندوز و APK
+
+گزارش کاربر: ساخت ویندوز «پنجره‌های زیادی از بخش‌های مختلف نرم‌افزار باز می‌کند و فایل نصبی نمی‌سازد»؛ APK با
+«APK ساخته نشد» (RESULT=1) تمام می‌شود. علت ویندوز: `tools/build_installer.py` کل آزمون‌ها را روی دسکتاپ واقعی
+(بدون offscreen) اجرا می‌کرد و هر شکست PyInstaller را متوقف می‌کرد؛ BOM در ابتدای bat جلوی `@echo off` را می‌گرفت؛
+`.iss` بدون BOM بود. رفع: `tools/build_common.py` (`run_streaming` خروجی زنده + `build_logs/*.log`، `headless_env`)،
+گام «بررسی سلامت کد» (compileall + import بی‌پنجرهٔ `SMOKE_CODE`)، آزمون کامل فقط با `--with-tests`/`RUN_TESTS=1`
+(بی‌پنجره)، `upx=False`، `tests/conftest.py` پیش‌فرض offscreen، `scripts/build_windows.bat` ← `build_installer.bat`.
+علت APK: `mobile/assets/` (آیکون/پیش‌نمایش/قلم) نبود، پذیرش مجوز SDK، `python-bidi` بدون پین (Rust)، آزمون ریاضی
+با پایتون بدون numpy/pandas، ساخت روی `/mnt/c`، `pip --user` مسدود در اوبونتو ۲۴. رفع: `mobile/assets/*`،
+`android.accept_sdk_license = True`، `python-bidi==0.4.2`، `warn_on_root = 0`، `check_toolchain`/`probe_script`
+(buildozer در `~/.cai-buildozer`، فرمان apt دقیق)، `build_script` (کپی به `~/cryptoaitrader-apk`، ساخت روی
+فایل‌سیستم لینوکس، برگرداندن APK به `mobile/bin`)، ردکردن آزمون ریاضی در نبود بسته‌ها. موبایل 1.9.13.
+آزمون: `tests/test_v253_build_tools.py`. ساخت واقعی ویندوز/APK در sandbox ممکن نیست. گزارش: `docs/RELEASE_2.5.3_FA.md`.
+**commit نشده** (آخرین commit: `511d2b5` = 2.5.1+2.5.2).
+
+## وضعیت قبلی ۲.۵.۲ — فیوچرز LBank: HTTP 403 از Cloudflare
+
+گزارش کاربر پس از 2.5.1: اسپات ✓ (۳ دارایی)، فیوچرز ✗ `NetworkError: HTTP 403 … /cfd/openApi/v1/prv/account`.
+`lbkperp.lbank.com` پشت Cloudflare است (`api.lbkex.com` نه). رفع: `BROWSER_HEADERS` در `_contract_client`،
+`LBankRestClient._classify_forbidden` + `_cloudflare_code`/`CLOUDFLARE_REASONS` ← `AccessBlockedError`
+(`app/exceptions/errors.py`, زیرکلاس `NetworkError`) در `no_retry_on`، شکستن حلقهٔ دارایی‌های فیوچرز پس از
+مسدودی، `wallet.hint.blocked/blocked_region` در `_wallet_error_hint`. کد Cloudflare واقعی کاربر هنوز نامعلوم؛
+گزارش بعدی کیف پول آن را نشان می‌دهد. گزارش: `docs/RELEASE_2.5.2_FA.md`. commit شد در `511d2b5`.
+
+## وضعیت قبلی ۲.۵.۱ — نمایش دارایی کیف پول، واچ‌لیست، ترتیب و قیمت بازارها
+
+خواسته‌های کاربر: کیف پول هیچ دارایی (کل/اسپات/فیوچرز) نشان نمی‌داد؛ ساخت واچ‌لیست با کلیک راست روی ردیف/نماد
+بازار؛ «افزودن به واچ‌لیست» مودال کار نمی‌کرد؛ ترتیب نمادها بر پایهٔ ارزش و حجم (BTC، ETH بالا)؛ قیمت دقیق تتری.
+پیاده‌سازی: `LBankRestClient.signed_headers()` (امضا در سرآیند + بدنه)، `LBankEndpoints.USER_INFO_ACCOUNT/
+USER_INFO_LEGACY`، `LBankProvider._spot_rows`/`last_sync_report`/زنجیرهٔ مسیرهای اسپات، `ExchangeAccountService`
+(شکست اسپات با فیوچرز سالم غیرکشنده، `details["report"]`)، `WalletPage` (`status_panel`/`set_sync_report`،
+`auto_sync_checkbox`، `spot_search`/`hide_small_checkbox`)، `MainController.start_wallet_auto_sync`/`sync_wallet(silent=)`/
+`_fill_wallet_report`/`_wallet_error_hint`؛ `SymbolRepository.add_to_watchlist(symbol, exchange=None)` رکورد را می‌سازد،
+`is_in_watchlist`، `MainController.set_watchlist_membership`/`_sync_symbol_table`؛ `market/market_rank.py`
+(`sort_by_market_value`, `price_decimals`, `quote_usdt_prices`)، `MarketsPage.build_context_menu` و حالت
+`market_cap`. آزمون: `tests/test_v251_wallet_watchlist_markets.py`. گزارش: `docs/RELEASE_2.5.1_FA.md`.
+**این تغییرها commit نشده‌اند** (دستور صریح کاربر)؛ آخرین commit: `982cce2` (2.5.0).
+
+## وضعیت قبلی ۲.۵.۰ — معامله از سیگنال، کیف پول سه‌زبانه، موجودی کاغذی
+
+خواسته‌های کاربر: اشتراک سیگنال در شبکه‌های اجتماعی؛ جست‌وجوی بالا کشیده و گرد؛ «اقدام به معامله» با
+ورود/SL/TP1–3 و بستن با اهداف (پاسخ کاربر: پلکانی ⅓/⅓/باقی، SL به ورود پس از TP1)، بستن مودال و رفتن به جدول
+باز؛ بازسازی جدول تاریخچه و عنوان‌ها؛ ماشین‌حساب پرشده از سیگنال؛ بی‌درنگ؛ کیف پول سه‌زبانه (نمای کلی/اسپات/
+فیوچرز) با اعداد دقیق فیوچرز؛ موجودی کاغذی جعلی برابر کیف پول واقعی. پیاده‌سازی: `trading/staged_targets.py`
+(`next_step`)، `trading/trade_monitor.evaluate_staged`، `PaperTradeRepository.partial_close/realized_pnl_since`،
+`trading/paper_account.py`، `MainController._on_trade_requested(signal, dialog=)`/`_apply_trade_step`/
+`_paper_account`/`sync_paper_balance_with_wallet`/`_fill_wallet_tabs`، `WalletPage` (سه زبانه، `MetricStrip`،
+`paper_sync_requested`)، `TradesPage.HISTORY_COLUMNS` (۱۶ ستون، عنوان هنگام ساخت، به‌روزرسانی درجا)،
+`PositionCalculator` (TP2/TP3، `signal_entry`, `trade_values`)، `SignalDetailDialog` (`share_to`, `trade_payload`,
+`trade_opened`)، `LBankRestClient._handle_response(contract=True)` (پاسخ `success:true`/`result:""` قبلاً «LBank
+error 0» می‌شد — علت نمایش‌ندادن فیوچرز)، `LBankProvider._parse_futures_details`، `wallet_details` در
+`extra_config`. گزارش: `docs/RELEASE_2.5.0_FA.md`. commit/push فقط با دستور صریح.
+
+## وضعیت قبلی ۲.۴.۲ — سبکی رابط و کپی سیگنال
+
+گزارش کاربر پس از 2.4.1: «هنوز خیلی سنگین است و هنگ می‌کند» + «امکان کپی نام و اطلاعات
+سیگنال در جدول یا مودال». علت‌های یافته: (۱) کاروان GIL — محاسبهٔ pandas پویش روی نخ
+پس‌زمینه نخ رابط را پس از هر فراخوانی Qt معطل می‌کرد (پروفایل: ~۹۵٪ زمان هر نماد در
+`compute_timeframe_analysis`)؛ (۲) تایمر ۳۰ ثانیه‌ای پیگیری نتیجه روی نخ رابط
+`outcome_repository.performance()` (تا ۵۰۰۰ ردیف) را اجرا می‌کرد، حتی وقتی صفحه پنهان بود؛
+(۳) پویش‌های پیاپی همان سیگنال را بی‌وقفه ذخیره و پیگیری می‌کردند (رشد پایگاه داده)؛
+(۴) ترمینال معاملات هر ثانیه حتی پنهان رسم می‌شد. اصلاح: `signals/compute_pool.py`
+(`ComputePool` با spawn، ≤۲ کارگر، اولویت پایین، fallback محلی، بستن در بیکاری) فقط در
+`is_bulk_fetch()`؛ `SignalEngine.set_compute_pool`؛ `Application.compute_pool()`
+(`performance.process_pool`، متغیر `CRYPTOAI_NO_PROCESS_POOL` که conftest روشن می‌کند)؛
+`Application._should_store_scanned` (۳۰ دقیقه/۵ واحد)؛ `_refresh_outcome_view` تنبل با
+`run_blocking` و `ShowWatcher`؛ `_terminal_timer_tick`؛ `UiStallWatchdog`؛
+`multiprocessing.freeze_support()` در main.py. کپی: `ui/signal_share.py`، دکمه‌های
+`SignalDetailDialog.copy_symbol/copy_info`، منوی راست‌کلیک و Ctrl+C در `SignalsPage`
+(`copy_notice` → toast). آزمون: `tests/test_v242_lightweight_and_copy.py`. گزارش:
+`docs/RELEASE_2.4.2_FA.md`. 2.4.0، 2.4.1 و 2.4.2 هنوز commit نشده‌اند.
+
+## تحویل قبلی ۲.۴.۱ — سبک‌سازی پویش کل بازار
+
+گزارش کاربر پس از 2.4.0: «بخش سیگنال خوب شد ولی سیستم خیلی سنگین است، هنگ می‌کند
+و کل سیستم را درگیر می‌کند.» علت‌ها: (۱) هر کندلِ پویش (~۴۰۰۰ درخواست برای کل صرافی)
+با ORM در SQLite نوشته می‌شد (دیسک و CPU)؛ (۲) کندل‌های پویش حافظهٔ نهان ۵۰۰تایی را پر
+و تیکر/قیمت داغ را بیرون می‌انداختند؛ (۳) محاسبهٔ هم‌گام اندیکاتورها روی تنها حلقهٔ
+asyncio تا ۴۰۰ms قفل می‌ساخت و با GIL رابط را کند می‌کرد؛ (۴) هر اندیکاتور DataFrame را
+از نو می‌ساخت (~۳۵٪ CPU)؛ (۵) جدول پویش با صدها ردیف و ستون «به اندازهٔ محتوا» هر ۸۰۰ms
+از نو رسم می‌شد. اصلاح: `market.engine.bulk_fetch()` (ContextVar)، `signals.scanner.CpuGovernor`
+(دستی ۰٫۶، خودکار ۰٫۳۵)، انتظار در مکث نرخ، دروازهٔ محاسبه در `SignalEngine`،
+`IndicatorEngine._calculate(frame_holder)`، numpy در `BaseIndicator.calculate`، سقف ۲۰۰ ردیف
+و تازه‌سازی تطبیقی. آزمون: `tests/test_v241_performance.py`. گزارش: `docs/RELEASE_2.4.1_FA.md`.
+2.4.0 و 2.4.1 هنوز commit نشده‌اند.
+
+## تحویل قبلی ۲.۴.۰ — پویش کل بازار و منبع سیگنال‌گیری خودکار
+
+درخواست کاربر: پویش سیگنال‌ها فقط روی تعداد محدودی نماد (پیش‌فرض ۶۰) اجرا می‌شد؛
+تعداد دستی بماند ولی گزینه‌ای برای پویش همهٔ نمادهای صرافی باشد. سیگنال‌گیری
+خودکار باید «چرخش کامل» را روی همهٔ نمادها انجام دهد و منبعش بین سیگنال‌های
+پیداشده و کل بازار قابل‌انتخاب باشد. پیاده‌سازی: `signals/scan_universe.py` (جهان
+پویش، پالایش هوشمند، اولویت نقدشوندگی/نوسان)، `MarketScanner.scan(universe, filters,
+on_signal)`، `Application.scan_market(universe, min_turnover, smart_filter, on_signal)`،
+`AutoScanConfig.source/universe/min_turnover/smart_filter` + `seed_focus`، کنترل‌های
+تازه در `ui/pages/signals_page.py` و نتیجهٔ زنده/پیشرفت در `MainController`. کلیدهای
+تازه: `signals.auto_scan_{source,universe,min_turnover,smart_filter}` و
+`signals.scan_{universe,limit,min_turnover,smart_filter}`. آزمون:
+`tests/test_v240_scan_universe.py`. گزارش: `docs/RELEASE_2.4.0_FA.md`. 2.3.2 با دستور
+کاربر commit/push شد (`80ce0ab`)؛ 2.4.0 هنوز commit نشده است.
+
+## تحویل تاریخی ۲.۳.۲ — اتصال LBank
+
+گزارش کاربر: روی LBank حدود ۲۰ ثانیه آنلاین و بعد آفلاین؛ وب‌سوکت LBank هرگز وصل
+نمی‌شد (صرافی‌های دیگر سالم). علت‌ها: جدول خطای LBank جابه‌جا بود و 10004
+(«Request too frequent») خطای احراز هویت شمرده می‌شد → REST «مرده» و بدون مکث؛
+provider.ping هم خطا را می‌بلعید؛ وب‌سوکت فقط `www.lbkex.net` (نشانی قدیمی) را
+می‌شناخت. اصلاح: `market/providers/lbank/{constants,rest_client,provider,websocket_client}.py`،
+`retry_async(no_retry_on=...)`، آمار عیب‌یابی در `RedundantStream.stats()`؛ تست
+`tests/test_v232_lbank.py`. گزارش: `docs/RELEASE_2.3.2_FA.md`. stubهای Qt اکنون در
+`.cache/qtstub` داخل مخزن (نادیده در snapshot) ساخته می‌شوند. با دستور کاربر commit/push شد (`80ce0ab`).
+
+## تحویل تاریخی ۲.۳.۱ — اتصال پایدار و داشبورد
+
+رگرسیون 2.3.0 (خواندن بدون کش همهٔ تیکرها هر ۲ ثانیه و کش مشترک ۰٫۱ ثانیه‌ای)
+باعث محدودیت نرخ صرافی و «چند ثانیه آنلاین، بعد قطع» می‌شد. اصلاح: کش مشترک،
+مکث سراسری 429/418، آنلاین از REST یا WS، snapshot هر ۳۰ ثانیه. داشبورد مرکز
+فرمان گرفت (`ui/widgets/dashboard_widgets.py`، `summarise_market` در کنترلر).
+گزارش: `docs/RELEASE_2.3.1_FA.md`. Qt در محیط لینوکس بدون libGL با stubهای
+ساخته‌شده در `/home/user/qtstub` (خارج مخزن) اجرا شد. هیچ commit/push انجام نشده.
+
+## نسخهٔ ۲.۳.۰ — معامله، اتصال افزونه و تاریخچه
+
+به درخواست کاربر، ورود/خروج هم‌زمان و پایش اسکن از هم جدا شدند؛ محاسبات
+خالص کارمزد و سر‌به‌سر، محافظ هزینه/ریسک و سقف زیان روزانهٔ پایدار اصلاح شد.
+دو client مستقل از همان صرافی، watchdog، REST تازه و حفظ اشتراک نمودار اضافه شد.
+ورود دستی از فرصت‌ها پس از موفقیت به تاریخچهٔ Open می‌رود؛ جدول کامل‌تر،
+مودال جزئیات و خروج مشترک دارد. انتخاب قبل از تحلیل و چرخش بازار/علاقه‌مندی‌ها
+اصلاح شد. هیچ سود، زیان صفر یا اتصال همیشگی تضمین نمی‌شود.
+
+گزارش دقیق: `docs/RELEASE_2.3.0_FA.md`. آزمون انتخابی **۷۵۸ پاس + ۴ skip**؛
+۵۰ رگرسیون تازه. ۳۳ آزمون قدیمی غیرنمایشی جداگانه نیز پاس شدند. full suite
+هنوز ۳۰ خطای collection کتابخانهٔ Qt دارد؛ native GUI/ویندوز تأیید نشده است.
+بسته: `CryptoAITrader-v2.3.0-2026-09-23.zip`؛ درگاه `tools/serve_downloads.py`.
+هیچ commit/push/Release انجام نشده؛ پس از تست ZIP منتظر دستور صریح کاربر بمان.
+R6 (feed/tick/trading) و R10 (دامنهٔ چرخش) فقط بخشی رفع شدند؛ agentها و
+استقلال آستانهٔ watch هنوز بررسی می‌خواهند. R4/R5/R7/R8/R9 دست‌نخورده‌اند.
+بخش‌های نسخه‌های قدیمی پایین، **تاریخی** هستند.
+
+## نسخهٔ ۲.۲.۲ — ۲۰۲۶/۰۹/۲۳
+
+**رفع سه ایراد بازتولیدشده + صفحهٔ دانلود محلی به درخواست کاربر.**
+
+- کش پیش‌بینی با کلید تایم‌فریم جدید بدون TypeError؛ تست force/TTL/آخرین گزارش.
+- انتقال هر ۲۸ فیلد AutoTradeConfig؛ صفر کارمزد و False حفظ می‌شوند؛ سن مجاز
+  داده در cache متصل هم با ذخیرهٔ config به‌روز می‌شود.
+- بررسی snapshot و برچسب درست حساسیت backup؛ حفظ ciphertext و بازیابی کلید.
+  settings.json قدیمی محافظه‌کارانه حساس فرض می‌شود؛ backup خصوصی است.
+- ۲۰ تست رگرسیون هسته + ۱۴ تست سرور موفق؛ تست اتصال Qt اضافه ولی محیطاً skip.
+- ترکیب با هستهٔ قبلی: ۷۰۸ پاس + ۳ skip، صفر شکست. full collection به علت
+  libGL مسدود است؛ نتیجهٔ تاریخی تست‌های کامل به این مرحله نسبت داده نمی‌شود.
+- درگاه فارسی و واکنش‌گرا؛ فقط ZIP/metadata/checksum/font، بدون فایل دلخواه مخزن.
+- گزارش و دستور اجرای سرور: docs/RELEASE_2.2.2_FA.md.
+- نسخهٔ بسته: CryptoAITrader-v2.2.2-2026-09-23.zip؛ دادهٔ واقعی و .git/.venv ندارد.
+- هیچ commit/push/Release گیت‌هاب انجام نشده؛ منتظر تست و دستور صریح کاربر.
+
+---
+
+## نسخهٔ ۲.۲.۱ — ۲۰۲۶/۰۹/۲۳
+
+**شناخت مخزن و مستندسازی، بدون تغییر منطق نرم‌افزار.**
+
+- تطبیق HEAD با main گیت‌هاب: `a66e61a2d45721aff46d1d08a804012e3c907084`.
+- ZIP اولیهٔ دست‌نخورده: ۴۸۲ فایل؛ CRC و SHA-256 تک‌تک فایل‌ها تأیید شد.
+- ثبت قواعد کار در AGENTS.md و نقشهٔ اتصال اجزا در docs/PROJECT_MEMORY_FA.md.
+- فهرست کامل فایل‌ها/کلاس‌ها/توابع/واردسازی‌ها در docs/CODE_MAP.md؛ نمایهٔ
+  ایستا است، نه ادعای ممیزی خط‌به‌خط یا صحت کامل همهٔ مسیرهای اجرایی.
+- گزارش آزمون و اختلاف مستندات با کد در docs/REVIEW_VALIDATION_FA.md.
+- اجرای هسته: ۶۷۴ پاس + ۲ skip (LightGBM/PyTorch اختیاری)؛ اجرای کامل
+  هنگام جمع‌آوری با ۳۰ خطای محیطی libGL متوقف شد. UI/ویندوز تأیید نشده‌اند.
+- سه اشکال با دادهٔ ساختگی بازتولید شدند و **عمداً اصلاح نشده‌اند**:
+  cache پیش‌بینی، config تنظیم‌های جدید معامله، و manifest پشتیبان رازها.
+- تنها تغییر فایل Python مقدار APP_VERSION است؛ وابستگی‌ها، تست‌ها، UI،
+  منطق مالی، دیتابیس و تنظیمات کاربر تغییر نکردند.
+- بستهٔ پایان مرحله: CryptoAITrader-v2.2.1-review-2026-09-23.zip.
+- commit/push/PR/Release انجام نشده؛ منتظر بررسی و دستور صریح کاربر.
+
+---
+
 ## نسخهٔ ۲.۲.۰ — ۲۰۲۶/۰۹/۲۳
 
 **ترمینال حرفه‌ای — دور دوم بر اساس فهرست مشکلات کاربر.** فقط صفحهٔ
@@ -2914,3 +3142,124 @@ OpenAI پس بدون کلاس تازه. ۸ مدل پیشنهادی از کاتا
 
 **مستندات:** `docs/BUILD_INSTALLER_FA.md`.
 
+
+
+## نسخهٔ 2.5.6 — بازبینی عمیق (2026-09-26)
+- ریشهٔ منفی بودن اسکالپ: جهت بی‌برتری + هزینهٔ رفت‌وبرگشت. امید ریاضی بدون برتری = −کارمزد (`MicroPlan.no_edge_expectancy`).
+- اسکالپ:
+  - دروازهٔ هزینه `scalp.min_cost_multiple`=3 (`score_candidate(min_cost_multiple=...)`).
+  - فیلدهای `cost_percent`/`breakeven_win_rate`.
+  - محافظ `AutoTradeConfig.edge_guard_enabled/edge_guard_min_trades` (حد بالای ۹۵٪ یک‌طرفه < ۰ → رد `negative_edge`؛ `start()` آمار را صفر می‌کند).
+- سیگنال:
+  - اطمینان فنی ≥۷۰ در هر دو دورهٔ بک‌تست ۲۷–۲۹٪ درست بود.
+  - `DecisionConfig.saturation_start=68` پایه را بازتاب می‌دهد و شاهد `exhaustion` را اضافه می‌کند (نه NO_TRADE، تعداد سیگنال ثابت).
+  - `rescore` هم اعمال می‌کند.
+- کشیدگی:
+  - `extension_atr`/`extension_bucket` در intelligence ذخیره می‌شوند.
+  - یادگیرنده: الگوی (جهت، رژیم، ext:سطل) با برگشت به سطوح قبلی.
+  - `BacktestEngine.annotate_extension` برای کش‌های قدیمی.
+- فیلتر ثابت ضدکشیدگی رد شد: اثرش بین ۲۰۱۸ و ۲۰۲۵ عکس بود (بیش‌برازش).
+- ابزارها: `tools/scalp_diagnostics.py`، `tools/signal_diagnostics.py`. گزارش: `docs/RELEASE_2.5.6_FA.md`.
+
+
+
+## نسخهٔ 2.7.0 — موبایل نو، سقف ضرر قابل تنظیم، رفع لاگ ویندوز (2026-10-02)
+- موبایل: ۵ صفحه + نوار پایین (`mobile/main.py`, `mobile/app/{widgets,screens,store,viewmodel}.py`)؛ APK و اسکرین‌شات با `.github/workflows/build-apk.yml` (کاربر از وب اضافه می‌کند؛ توکن ما مجوز workflows ندارد).
+- سقف ضرر روزانه: ۰ = خاموش، پیش‌فرض کاغذی خاموش. پژوهش آفلاین: `research/scalp_lab` + `scalp-research.yml`.
+- لاگ ویندوز پایتون ۳.۱۴:
+  - RR: `signals/risk_engine.py` با `round(rr, 2)` مقایسه می‌کند (گرد کردن ۸ رقمی TP روی کوین ارزان RR=1.498 می‌ساخت). حداقل ۱٫۵ ثابت.
+  - BBANDS: `replace(0, np.nan)`؛ `indicators/base.py` با `pd.to_numeric(errors="coerce")`.
+  - `async_runner._is_websockets_handshake_cleanup_bug`: AttributeError `recv_messages` در `connection_lost` → DEBUG.
+  - `rest_client`: `describe_connect_error` (متن + علت)، `system_proxy()`، تعویض trust_env پس از شکست همهٔ دامنه‌ها، `RestPausedError` و مکث ۵→۳۰ ثانیه، `_mark_reachable` با هر پاسخ.
+- آزمون: `tests/test_v270_runtime_fixes.py` (۱۳). کل: ۲۸۵۸ موفق، ۲ رد شده.
+
+## نسخهٔ 2.6.3 — طوفان تعویض دامنهٔ REST (2026-10-01)
+- لاگ کاربر پس از ۲.۶.۲ (ساعت درست شده بود، ‎+03:30): همهٔ درخواست‌های REST با ConnectError روی هر سه دامنه، هر ~۰٫۳ ثانیه
+  یک «switching»، و ClosedResourceError در ping/کندل؛ WebSocket وصل؛ ۱۰۳۷ نماد stale.
+- علت: `LBankRestClient._rotate_base_url` کلاینت مشترک را فوراً `aclose` می‌کرد و هر شکست هم‌زمان دوباره دامنه را می‌چرخاند.
+  شبیه‌سازی (۳۰ درخواست هم‌زمان، فقط یک دامنه خراب): قدیم ۳۵ تعویض و ۳ شکست؛ جدید ۱ تعویض و ۳۰/۳۰ موفق.
+- اصلاح: چرخش فقط اگر `failed_host == base_url`؛ کلاینت قدیمی در `_retired` و ۳۰ ثانیه بعد بسته می‌شود (و در `close()`)؛
+  `anyio.ClosedResourceError`/`BrokenResourceError` ← NetworkError قابل تکرار بدون تعویض دامنه.
+- لاگ‌ها: «Timeframe crashed» و «Unexpected failure in task» حالا نام کلاس و متن خطا را دارند.
+- آزمون: `tests/test_v262_rest_rotation.py` (۵). گزارش: `docs/RELEASE_2.6.3_FA.md`.
+
+## نسخهٔ 2.6.2 — ساعت ویندوز ~۱۰٫۵ ساعت جلوتر (2026-10-01)
+- لاگ کاربر پس از ۲.۶.۱ هنوز ۱۰۳۸ stale و no_orderbook. مقایسه با زمان واقعی LBank (`fetch_page` روی
+  `api.lbkex.com/v2/timestamp.do`): لاگ `20:44 -07:00` = 03:44 UTC، زمان واقعی ~17:14 UTC ← ساعت محلی ~۱۰٫۴ ساعت جلوتر
+  (ساعت ایران با منطقهٔ Pacific). `MAX_CLOCK_OFFSET_MS` ۶ ساعت بود و نمونه رد می‌شد. مهرهای LBank (حتی `symbol=all` و
+  نمادهای بی‌حجم) همه ~۱ ثانیه تازه‌اند؛ پس REST سالم بود.
+- `MAX_CLOCK_OFFSET_MS` = ۴۸ ساعت؛ `MarketDataEngine._observe_clock` (از دستهٔ کامل، ≥۲۰ مهر) ←
+  `exchange_clock_offset_ms`، `_offset_seconds()` در همهٔ `_ticker_is_fresh`ها و fallback در `refresh_execution_quote`.
+- `MainController._check_clock_skew` (در `log_health`، بیش از ۶۰ ثانیه، یک‌بار برای هر مقدار) ← toast و status با
+  کلیدهای `common.clock_skew_warning` / `clock_ahead` / `clock_behind`.
+- آزمون: `tests/test_v262_clock_skew.py` (۱۱). گزارش: `docs/RELEASE_2.6.2_FA.md`.
+- هشدار: سایر بخش‌های وابسته به ساعت (زمان سیگنال، کندل جاری، پیگیری نتیجهٔ سیگنال) فقط با درست کردن ساعت ویندوز
+  کاملاً درست می‌شوند.
+
+## نسخهٔ 2.6.1 — رفع «اسکالپ معامله باز نمی‌کند» (2026-10-01)
+- علت از لاگ کاربر: ۱۰۳۶/۱۰۴۳ نماد stale و no_orderbook دائمی. (۱) تیک REST مهر ساعت صرافی دارد و تیک WS ندارد
+  (parser خط ۲۴۵ timestamp=0)، پس اختلاف ساعت ویندوز همهٔ REST را کهنه و همهٔ دفترها را رد می‌کرد. (۲) `refresh_execution_quote`
+  با شکست/کهنگی تیکر دفتر سالم را دور می‌ریخت. (۳) `AsyncRunner` کوروتینِ در حال اجرا را close می‌کرد
+  («cannot reuse already awaited coroutine») و نوسازی دفتر ترمینال هر ۵ ثانیه کشته می‌شد. (۴) پیش‌خوانی دو درخواستی بود
+  (PoolTimeout). (۵) `_turnovers` اولترا هر ثانیه منتظر REST بود.
+- `TickEngine.observe_exchange_clock(freshest_ts, received_ms)` (میانهٔ ۷ نمونه، تحمل ۲ ثانیه، سقف ۶ ساعت)،
+  `clock_offset_ms`، `_corrected_exchange_ms`؛ `record_book`: book_ts = زمان دریافت، رد فقط اگر عکس اصلاح‌شده >۳۰ ثانیه.
+  کنترلر `_on_price_update` با هر دستهٔ REST (≥۲۰ نماد) کالیبره می‌کند.
+- `MarketDataEngine.refresh_execution_book` (فقط دفتر)؛ `refresh_execution_quote` دفتر را مستقل ثبت می‌کند.
+- `AutoTrader.set_book_source` + `BOOK_PREFETCH_RETRY_SECONDS=3`؛ `AutoTradeConfig.diagnostic_only` (تنظیم
+  `scalp.diagnostic_only`، کد ممیزی `diagnostic_only`، رویداد `diagnostic_pass`).
+- `AsyncRunner._close_if_unstarted` (روی نخ حلقه، فقط CORO_CREATED)؛ «shielded future» + خطای شبکه → DEBUG.
+- `_refresh_orderbooks` اگر `terminal-orderbook` فعال است رد می‌شود؛ `ultra_tickers` با max_age=5؛ کش گردش اولترا
+  (`TURNOVER_TTL_SECONDS=30`، انتظار اول ۳ ثانیه)؛ استخر httpx ‏۲۰/۱۰.
+- هیچ آستانه‌ای عوض نشده. آزمون: `tests/test_v261_scalp_fix.py` (۳۱). گزارش: `docs/RELEASE_2.6.1_FA.md`.
+
+## نسخهٔ 2.6.0 — سیستم لاگ و تشخیص معاملات (2026-10-01)
+- فقط ثبت؛ هیچ استراتژی/آستانه/فیلتری عوض نشده. پایه برای اصلاح اسکالپ در ۲.۶.۱.
+- `app/logging/categories.py` (۱۲ دسته، `category_for_logger`)، `structured.py` (`setup_structured_logging`، `SafeQueueHandler`
+  put_nowait، `CategoryRouterHandler` ← `data/logs/<دسته>/<دسته>-YYYY-MM-DD[.N].jsonl` ۱۰MB/۱۴ روز/۶۰ فایل، ERROR+ ← errors/،
+  audit ← audit/، `LogBuffer.since(seq)`، `read_log_files`)، `audit.py` (کدهای استاندارد رد + `normalize_reason`/`reason_bucket`،
+  `ScanDiagnostics`/`scan_scope`/`note_scan`، `reject` با حذف تکرار ۳۰ ثانیه، `scan_summary` تجمیعی هر ۱۰ ثانیه)،
+  `audit_store.py` (نوشتن دسته‌ای SQLite در رشتهٔ پس‌زمینه)، `query.py` (`LogFilter`، `timeline_stages`، `export_events`).
+- جدول `audit_events` (`AuditEventRecord`) + `AuditRepository` (`query`/`timeline`/`scan_summaries`/`recent_trade_ids`/`purge`).
+- قلاب‌ها: `TradeRepository.open_trade/close_trade/partial_close` (پس از commit)، `AutoTrader._open_trade_locked`
+  (`audit_id` در extra، `progress["stage"]`، `_audit_reject`/`_audit_accept`/`_audit_exit_decision`)، `_scan_for_entries` (scan_scope)،
+  `score_candidate(on_reject=)`، `scalp_service`/`ultra_scalp`/`confidence_source` ← `note_scan`، کنترلر ← `target_infeasible`.
+- لاگر `audit` وقتی لایهٔ ساختاریافته فعال است propagate=False (کنسول و app.log پر نمی‌شوند).
+- UI: `ui/pages/log_center_page.py` (`LogCenterPage`، `nav.logs` پس از گزارش‌ها، آیکون `logs`)، `localization/*/logs.json`.
+- آزمون: `tests/test_v260_logging.py` (۵۴). گزارش: `docs/RELEASE_2.6.0_FA.md`.
+
+## نسخهٔ 2.5.9 — معاملهٔ دستی، اولامای کارا، APK روی WSL بدون توزیع (2026-10-01)
+- معاملهٔ دستی: `trading/manual_order.py` (`plan_manual_order`، `prefill_from_signal`، `normalize_symbol` ← `BTC/USDT`، اهرم ۱..۱۰۰،
+  اسپات بدون اهرم/شورت، خطا/هشدار با کلید ترجمه `trades.manual.*`) + `ui/dialogs/manual_trade_dialog.py` (`ManualTradeDialog`).
+  ورودی‌ها: `TradesPage.manual_trade_requested` (سربرگ + کنار «بستن معامله»)، `SignalDetailDialog.manual_trade_requested` («ویرایش و باز کردن»).
+  کنترلر: `open_manual_trade_dialog`، `_manual_trade_price` (کش زنده ← تیکر)، `_on_manual_order` (قیمت زندهٔ تازه + اعتبارسنجی دوباره ←
+  `record_paper_trade` با `source=manual`، `extra.market_type/margin`، `signal_id=None`).
+- اولاما: `think:false` برای مدل‌های استدلالی (gpt-oss: "low")، تلاش دوباره پس از پاسخ «فقط فکر»/رد think، stream،
+  `probe_generation` (آزمایش اتصال و `health_check` تولید واقعی می‌خواهند)، `ai/ollama_launcher.py` (یافتن و اجرای `ollama serve`، warm-up)،
+  `_warm_up_local_ai` در کنترلر، `speed_profile.effective_limits` (کف مهلت مدل محلی ۳۰۰/۳۰۰/۱۸۰).
+- APK: `build_apk.bat` با `wsl -e true` + پیشنهاد `wsl --install -d Ubuntu`؛ `build_apk.py` `list_wsl_distros`/`usable_distros`/`wsl -d`؛
+  `run_streaming` حذف NUL + `WSL_UTF8=1`.
+- آزمون: `tests/test_v259_{manual_trade,ollama,wsl}.py` (۳۰+۲۱+۱۵). گزارش: `docs/RELEASE_2.5.9_FA.md`.
+
+## نسخهٔ 2.5.8 — رفع باگ‌های موتور سیگنال (2026-09-26)
+- B1 `mean_reversion`: %B (۰..۱۰۰) با ۰٫۰۵/۰٫۹۵ مقایسه می‌شد ⇒ ۹۴٪ رأی SHORT. ثابت‌های `PERCENT_B_LOW=5`/`PERCENT_B_HIGH=95`.
+- B2 `momentum`: `STOCHASTIC` ← `STOCH`. B3 `volatility_regime`: `BOLLINGER` ← `BBANDS` (هر دو جزء هرگز اجرا نمی‌شدند).
+- B4 `signals/engine.py`: `closed_candles(candles, tf, now)` کندل باز را (بر اساس زمان باز شدن) از تحلیل زنده کنار می‌گذارد؛
+  `analysis['last_price']` قیمت ورود و مرکز `forecast_next(price=)`؛ حذف `[:-1]` تکراری در رژیم/جریان سفارش؛ `market.live=False` دست‌نخورده.
+- B5/B6 `intelligent_decision.structure_sign`: BREAKDOWN هم‌وزن BREAKOUT در `_structure` و `_mtf`.
+- ممیزی: SHORT ۱۸۰۵→۱۱۵۸، LONG ۷۲۳→۱۰۵۷. بک‌تست A/B: معاملات ۲۵۳→۲۶۶، PF کل ۰٫۶۴۳→۰٫۶۵۶؛ walk-forward بدتر
+  (۲۰۱۸: ۰٫۵۱۸→۰٫۴۵۱)، چون سوگیری SHORT قبلی در پنجره‌های نزولی شانسی سود می‌داد. هر دو PF<1؛ لبه ساخته نشد؛ دروازه قفل.
+- آزمون: `tests/test_v258_signal_bug_fixes.py` (۱۶؛ شامل محافظ ارجاع اندیکاتور). گزارش: `docs/RELEASE_2.5.8_FA.md`.
+
+## نسخهٔ 2.5.7 — چرا همهٔ اسکالپ‌ها ضرر بودند (2026-09-26)
+- ریشه: پیش‌تنظیم Ultra (TP ۰٫۵۲٪ حرکت، نگه‌داری ۱۸۰ ثانیه). حرکت معمول ۳ دقیقه ۰٫۰۷ تا ۰٫۱۳٪ است، پس ۹۴ تا ۱۰۰٪ معاملات با timeout و حرکتی کمتر از هزینه (کارمزد ۰٫۱۲ + لغزش ۰٫۰۴ + اسپرد) بسته می‌شدند. حتی با جهت درست و ۰٫۰۹٪ حرکت هم‌جهت، ۸۲٪ زیان بود.
+- باگ‌های اجرایی:
+  - ورود اولترا روی Last بدون دفتر و خروج روی Bid/Ask، یعنی اسپرد پنهان. دروازهٔ اسپرد هم برای فید کل بازار کور بود (spread=0).
+  - خروج سر‌به‌سر دقیقاً روی خالص صفر بود و با پرش تیک همیشه ≤۰ می‌شد.
+- اصلاح:
+  - `reach_ratio`=0.5: σ×√hold ≥ max(0.5×حرکت TP، ۲×هزینه). رد: `target_unreachable`.
+  - `max_spread_stop_fraction`=0.33. رد: `spread_eats_stop`.
+  - اولترا بدون Bid/Ask تازه: `no_orderbook` + خواندن دفتر در پس‌زمینه (بدون تأخیر ورود دیگران).
+  - `break_even_lock`=0.1$.
+  - `edge_stats()['exit_reasons']` در خط وضعیت.
+- شبیه‌سازی بازار ترکیبی (`.cache/ultra_mix.py`): برد ۱۲٪ → ۲۸٪، زیان کل −۵۸۹۹ → −۹۳۷ (۶۰۰۰ نامزد). میانگین هر معامله هنوز ≈ −کارمزد (بدون برتری جهت).

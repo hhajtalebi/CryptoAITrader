@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 from indicators.base import BaseIndicator, IndicatorCategory, IndicatorMetadata
@@ -96,7 +97,9 @@ class BollingerBandsIndicator(BaseIndicator):
         deviation = df["close"].rolling(period, min_periods=period).std(ddof=0)
         upper = middle + std_multiplier * deviation
         lower = middle - std_multiplier * deviation
-        band_range = (upper - lower).replace(0, pd.NA)
+        # np.nan نه pd.NA: pd.NA کل سری را object می‌کرد و تبدیل به float می‌شکست
+        # (بازار کاملاً تخت در ۲۰ کندل ← پهنای باند صفر).
+        band_range = (upper - lower).replace(0, np.nan)
         return {
             "upper": upper,
             "middle": middle,

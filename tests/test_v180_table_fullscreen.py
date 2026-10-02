@@ -25,7 +25,8 @@ PAGE_IMPORTS = [
     ("ui.pages.signals_page", "SignalsPage", 2),
     # v2.0: سه جدول — تاریخچه + پایش فرصت‌ها + موقعیت‌های باز
     ("ui.pages.trades_page", "TradesPage", 3),
-    ("ui.pages.wallet_page", "WalletPage", 1),
+    # v2.5.0: نمای کلی + اسپات + فیوچرز
+    ("ui.pages.wallet_page", "WalletPage", 3),
     ("ui.pages.markets_page", "MarketsPage", 2),
     # سه جدول: پیش‌نمایش گزارش، تفکیک عملکرد و سابقهٔ نتیجه‌ها
     # ۴ جدول از ۱.۹.۱۹: گزارش، عملکرد (۲ جدول) و دفترچهٔ نتیجه

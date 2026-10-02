@@ -48,3 +48,8 @@ installer_output/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# گزارش‌های ربات ساخت و پوشه‌های کاری محلی (نسخهٔ ۲.۵.۳)
+build_logs/
+.cache/
+public/

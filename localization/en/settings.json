@@ -324,5 +324,6 @@
   "speed_profile": "AI speed profile",
   "speed_fast": "Fast",
   "speed_balanced": "Balanced",
-  "speed_deep": "Deep"
+  "speed_deep": "Deep",
+  "ai_warmup_failed": "Local Ollama could not be prepared in the background: {detail}"
 }

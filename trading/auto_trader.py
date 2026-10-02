@@ -32,13 +32,16 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import math
 import time
+from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-from app.logging import get_logger
+from app.logging import audit, get_logger
 
 logger = get_logger(__name__)
 
@@ -46,14 +49,23 @@ logger = get_logger(__name__)
 LIVE_CONFIRMATION_PHRASE = "معامله واقعی را می‌پذیرم"
 
 #: سقف سخت تعداد معامله‌های همزمان. حتی اگر کاربر عدد بزرگ‌تری بگذارد.
-HARD_MAX_CONCURRENT = 10
+#: نسخهٔ ۲.۵.۴: کاربر برای اسکالپ فوق‌سریع تا ۲۰۰ خواست (قبلاً ۱۰).
+HARD_MAX_CONCURRENT = 200
 
 #: سقف سخت اهرم. کاربر صریحاً ۲۰۰ خواست. بالاتر از این دیگر سقف ایمنی نیست:
 #: با اهرم ۲۰۰، حرکت مخالف حدود ۰٫۵٪ کل مارجین را می‌سوزاند.
 HARD_MAX_LEVERAGE = 200.0
 
 #: حالت‌های معتبر موتور (خواستهٔ §۳)
-ENGINE_MODES = ("selected", "scan", "ai")
+ENGINE_MODES = ("selected", "scan", "ai", "ultra")
+
+#: کف‌های حالت فوق‌سریع: پویش هر ۱ ثانیه، نگه‌داری از ۱۰ ثانیه
+ULTRA_MIN_SCAN_INTERVAL = 1.0
+ULTRA_MIN_HOLD_SECONDS = 10
+#: مکث پیش‌خوانی دوبارهٔ دفترِ یک نماد پس از شکست (ثانیه) — نسخهٔ ۲.۶.۱
+BOOK_PREFETCH_RETRY_SECONDS = 3.0
+#: فاصلهٔ کمینهٔ ذخیرهٔ سود/زیان زندهٔ هر معامله در پایگاه داده (ثانیه)
+PERSIST_INTERVAL_SECONDS = 2.0
 
 #: حالت‌های تخصیص سرمایه (خواستهٔ §۱۲)
 ALLOCATION_MODES = ("fixed", "percent", "confidence", "risk", "hybrid", "ai")
@@ -135,7 +147,7 @@ class AutoTradeConfig:
     #: وب‌سوکت خاموش است نجات می‌دهد (خواستهٔ §۵/§۶)
     poll_seconds: float = 5.0
     #: سقف زیان روزانه؛ با رسیدن به آن، موتور خودش می‌ایستد
-    daily_loss_limit: float = 20.0
+    daily_loss_limit: float = 0.0  # ۲.۷.۰: صفر = بدون سقف زیان روزانه
     #: `paper` یا `live`
     mode: str = "paper"
     #: عبارت تأیید معاملهٔ واقعی
@@ -175,6 +187,27 @@ class AutoTradeConfig:
     allocation_percent: float = 5.0
     #: سقف مجموع مارجین باز نسبت به موجودی (درصد)
     max_total_margin_percent: float = 60.0
+    #: نسخهٔ ۲.۵.۶ — محافظ «برتری منفی اندازه‌گیری‌شده»: پس از دست‌کم این
+    #: تعداد معاملهٔ بسته در همین اجرا، اگر حد بالای بازهٔ اطمینان ۹۵٪
+    #: (یک‌طرفه) میانگین سود/زیان هر معامله زیر صفر باشد، ورود تازه متوقف
+    #: می‌شود. این «بدشانسی» نیست؛ آماری معنادار است. شروع دوباره آمار را صفر می‌کند.
+    edge_guard_enabled: bool = True
+    edge_guard_min_trades: int = 50
+    #: نسخهٔ ۲.۵.۷ — سود قفل‌شدهٔ سر‌به‌سر (دلار خالص). قبلاً حد ضرر دقیقاً روی
+    #: «خالص صفر» می‌رفت و با پرش تیک/لغزش، هر خروج سر‌به‌سر کمی **زیان** ثبت
+    #: می‌شد. سقف: نصف آستانهٔ سر‌به‌سر. ۰ = رفتار قدیم.
+    break_even_lock: float = 0.1
+    #: نسخهٔ ۲.۵.۷ — دروازهٔ «دسترس‌پذیری هدف»: نوسان اندازه‌گیری‌شدهٔ نماد در
+    #: مدت نگه‌داری (σ×√ثانیه) باید دست‌کم این نسبت از حرکت لازم تا حد سود
+    #: باشد (و دست‌کم ۲ برابر هزینهٔ رفت‌وبرگشت). بدون آن، تقریباً همهٔ
+    #: معاملات با «پایان زمان» و حرکتی کوچک‌تر از کارمزد بسته می‌شدند —
+    #: حتی با جهت درست. ۰ = غیرفعال. فقط نامزدهای دارای نوسان ثانیه‌ای.
+    reach_ratio: float = 0.5
+    #: نسخهٔ ۲.۵.۷ — اسپرد نباید بیش از این کسر از فاصلهٔ حد ضرر را بخورد
+    max_spread_stop_fraction: float = 0.33
+    #: نسخهٔ ۲.۶.۱ — حالت تشخیصی/اشکال‌زدایی: کل مسیر نامزد→دروازه‌ها→قیمت
+    #: اجرا و ثبت می‌شود ولی هیچ معامله‌ای (کاغذی یا واقعی) باز نمی‌شود.
+    diagnostic_only: bool = False
 
     def validated(self) -> AutoTradeConfig:
         """
@@ -191,19 +224,26 @@ class AutoTradeConfig:
         self.target_profit = max(0.01, float(self.target_profit or 0.01))
         self.max_loss = max(0.01, float(self.max_loss or 0.01))
         self.poll_seconds = max(0.25, float(self.poll_seconds or 5.0))
-        self.max_hold_seconds = max(30, int(self.max_hold_seconds or 900))
         self.fee_rate = max(0.0, float(self.fee_rate or 0.0))
         self.engine_mode = (
             self.engine_mode if self.engine_mode in ENGINE_MODES else "scan"
         )
+        ultra = self.engine_mode == "ultra"
+        self.max_hold_seconds = max(
+            ULTRA_MIN_HOLD_SECONDS if ultra else 30, int(self.max_hold_seconds or 900)
+        )
         self.scan_interval_seconds = max(
-            3.0, float(self.scan_interval_seconds or 15.0)
+            ULTRA_MIN_SCAN_INTERVAL if ultra else 3.0,
+            float(self.scan_interval_seconds or 15.0),
         )
         self.min_liquidity = max(0.0, float(self.min_liquidity or 0.0))
         self.max_spread_percent = max(0.0, float(self.max_spread_percent or 0.0))
         self.stale_after_seconds = max(1.0, float(self.stale_after_seconds or 10.0))
         self.slippage_percent = max(0.0, float(self.slippage_percent or 0.0))
         self.break_even_trigger = max(0.01, float(self.break_even_trigger or 1.0))
+        self.break_even_lock = max(0.0, min(float(self.break_even_lock or 0.0), self.break_even_trigger * 0.5))
+        self.reach_ratio = max(0.0, min(3.0, float(self.reach_ratio or 0.0)))
+        self.max_spread_stop_fraction = max(0.0, min(1.0, float(self.max_spread_stop_fraction or 0.0)))
         self.trailing_activation = max(0.01, float(self.trailing_activation or 1.5))
         self.trailing_offset = max(0.01, float(self.trailing_offset or 0.4))
         self.trend_conflict_policy = (
@@ -288,6 +328,9 @@ class ManagedTrade:
     trailing_active: bool = False
     #: مهر آخرین تیک پردازش‌شده (میلی‌ثانیه)
     last_tick_ms: float = 0.0
+    #: آخرین ذخیرهٔ سود/زیان زنده در پایگاه داده (monotonic) و حد ضرر ذخیره‌شده
+    last_persist: float = 0.0
+    persisted_stop: float = 0.0
 
     def __post_init__(self) -> None:
         """مقدارهای وابسته که باید از روز اول درست باشند."""
@@ -309,6 +352,12 @@ class ManagedTrade:
     def unrealised(self, price: float) -> float:
         """سود یا زیان فعلی به دلار."""
         return (price - self.entry_price) * self.direction_sign * self.quantity
+
+    def net_unrealised(self, price: float) -> float:
+        """برآورد خالص پس از کارمزد ورود و خروج در قیمت فعلی."""
+        rate = float(self.extra.get("fee_rate", 0.0) or 0.0)
+        entry_fee = float(self.extra.get("entry_fee", self.quantity * self.entry_price * rate))
+        return self.unrealised(price) - entry_fee - self.quantity * price * rate
 
     def used_margin(self) -> float:
         """مارجین اشغال‌شده — مارجین واقعی یا برآیندِ config پایه."""
@@ -332,7 +381,7 @@ class ManagedTrade:
         else:
             self.extreme_price = min(self.extreme_price, price)
 
-        profit = (price - self.entry_price) * self.direction_sign * self.quantity
+        profit = self.net_unrealised(price)
 
         # --- سر‌به‌سر: بعد از پوشش هزینه‌ها حد ضرر به ورود می‌رود ---
         if (
@@ -341,8 +390,13 @@ class ManagedTrade:
             and profit >= config.break_even_trigger
         ):
             fees = float(self.extra.get("round_trip_fee", 0.0) or 0.0)
-            cover = fees / self.quantity if self.quantity > 0 else 0.0
-            self.effective_stop = self.entry_price + self.direction_sign * cover
+            rate = float(self.extra.get("fee_rate", 0.0) or 0.0)
+            # نسخهٔ ۲.۵.۷: کمی سود قفل می‌شود تا خروج سر‌به‌سر زیان ثبت نشود
+            lock = max(0.0, min(float(getattr(config, "break_even_lock", 0.0) or 0.0),
+                                config.break_even_trigger * 0.5))
+            cover = (fees + lock) / (self.quantity * (1 - self.direction_sign * rate)) if self.quantity > 0 else 0.0
+            stop = self.entry_price + self.direction_sign * cover
+            self.effective_stop = max(self.effective_stop, stop) if self.is_long else min(self.effective_stop, stop)
             self.break_even_armed = True
             events.append("break_even_armed")
 
@@ -419,8 +473,15 @@ class AutoTrader:
         user_id: int | None = None,
         portfolio_source: Callable[[], dict[str, Any]] | None = None,
         invalidation_source: Callable[[str], str] | None = None,
+        live_gate: Callable[[], tuple[bool, str]] | None = None,
     ) -> None:
         self.config = config.validated()
+        #: نسخهٔ ۲.۵.۵ — دروازهٔ اعتبارسنجی: تابع () → (اجازه، دلیل).
+        #: وقتی وصل است، سفارش واقعی جدید فقط با عبور از دروازه ارسال
+        #: می‌شود؛ در غیر این صورت همان معامله کاغذی ثبت می‌شود. بستن
+        #: موقعیت واقعیِ موجود هرگز مسدود نمی‌شود.
+        self._live_gate = live_gate
+        self.live_gate_reason = ""
         self._price_source = price_source
         self._repo = repository
         self._candidate_source = candidate_source
@@ -432,9 +493,14 @@ class AutoTrader:
         self._invalidation_source = invalidation_source
 
         self._open: dict[int, ManagedTrade] = {}
+        self._entry_lock = asyncio.Lock()
+        self._closing: set[int] = set()
+        self._scan_task: asyncio.Task | None = None
+        self._last_rejections: dict[str, str] = {}
         self._running = False
         self._task: asyncio.Task[None] | None = None
         self._realised_today = 0.0
+        self._pnl_date = datetime.now(UTC).date()
         self._listeners: list[Callable[[str, dict[str, Any]], None]] = []
         self._halted_reason = ""
         self._tick_engine: Any | None = None
@@ -445,6 +511,9 @@ class AutoTrader:
         self._opportunities: list[dict[str, Any]] = []
         #: آخرین شیء نامزد هر نماد (برای ورود دستی از جدول فرصت‌ها)
         self._opportunity_candidates: dict[str, Any] = {}
+        #: آمار دور پویش جاری/آخر — «چرا معامله باز نشد» روی صفحه (۲.۵.۴)
+        self._round_rejections: dict[str, int] = {}
+        self.last_scan: dict[str, Any] = {}
 
     def apply_config(self, config: AutoTradeConfig) -> None:
         """
@@ -454,6 +523,10 @@ class AutoTrader:
         ذخیرهٔ عددهای تازه تا ری‌استارت موتور بی‌اثر می‌ماند.
         """
         self.config = config.validated()
+        if self._tick_engine is not None:
+            # سن مجاز داده در cache متصل هم نگهداری می‌شود؛ ذخیرهٔ تنظیم
+            # نباید فقط config را عوض کند و محافظ STALE روی عدد قدیمی بماند.
+            self._tick_engine.stale_after_ms = self.config.stale_after_seconds * 1000.0
 
     def attach_tick_engine(self, tick_engine: Any) -> None:
         """
@@ -463,6 +536,7 @@ class AutoTrader:
         می‌سنجد؛ هیچ تایمری در میان نیست.
         """
         self._tick_engine = tick_engine
+        tick_engine.stale_after_ms = self.config.stale_after_seconds * 1000.0
         tick_engine.add_listener(self._on_tick)
 
     # ---- وضعیت ------------------------------------------------------
@@ -547,13 +621,15 @@ class AutoTrader:
         """
         try:
             symbol = str(getattr(quote, "symbol", "") or "")
+            if self._is_stale(symbol):
+                return
             managed_trades = [t for t in self._open.values() if t.symbol == symbol]
             for managed in managed_trades:
                 price = self._exit_price_for(managed, quote)
                 if price > 0:
                     managed.mark(price, self.config)
 
-            if not managed_trades or not self._running:
+            if not managed_trades:
                 return
             if symbol in self._tick_check_pending:
                 return  # بررسی همین نماد در صف است؛ تکرار نکن
@@ -566,11 +642,17 @@ class AutoTrader:
 
     def _schedule_tick_check(self, symbol: str) -> None:
         """اجرای بررسی فوری نماد بیرون از مسیر شنونده."""
-        self._tick_check_pending.discard(symbol)
+        async def check():
+            try:
+                await self.check_symbol(symbol)
+            except Exception:
+                logger.exception("Tick exit check failed for %s", symbol)
+            finally:
+                self._tick_check_pending.discard(symbol)
         try:
-            asyncio.ensure_future(self.check_symbol(symbol))
-        except RuntimeError:  # حلقه بسته شده — موتور هم خاموش است
-            pass
+            asyncio.create_task(check())
+        except RuntimeError:
+            self._tick_check_pending.discard(symbol)
 
     def _exit_price_for(self, managed: ManagedTrade, quote: Any) -> float:
         """قیمت خروج واقعی از تیک (Bid/Ask) با لغزش علیه ما."""
@@ -620,7 +702,7 @@ class AutoTrader:
                 "data_age_ms": getattr(quote, "age_ms", None),
             }
         else:
-            entry = float(await self._price_source(symbol) or 0.0)
+            entry = float(await asyncio.wait_for(self._price_source(symbol), timeout=5.0) or 0.0)
         if entry <= 0:
             return 0.0, info
         slip = self.config.slippage_percent / 100.0
@@ -632,12 +714,17 @@ class AutoTrader:
         """قیمت خروج واقعی — Bid برای LONG و Ask برای SHORT + لغزش."""
         if self._tick_engine is not None:
             quote = self._tick_engine.get(managed.symbol)
-            if quote is not None:
+            if quote is not None and not self._is_stale(managed.symbol):
                 price = self._exit_price_for(managed, quote)
                 if price > 0:
                     managed.last_tick_ms = time.time() * 1000.0
                     return price
-        price = float(await self._price_source(managed.symbol) or 0.0)
+        price = float(await asyncio.wait_for(self._price_source(managed.symbol), timeout=5.0) or 0.0)
+        if self._tick_engine is not None:
+            if self._is_stale(managed.symbol):
+                return 0.0
+            quote = self._tick_engine.get(managed.symbol)
+            return self._exit_price_for(managed, quote)
         if price <= 0:
             return 0.0
         slip = self.config.slippage_percent / 100.0
@@ -653,12 +740,126 @@ class AutoTrader:
 
         این آخرین خط دفاع در برابر یک روز بد است.
         """
-        if self._realised_today <= -abs(self.config.daily_loss_limit):
+        today = datetime.now(UTC).date()
+        if today != self._pnl_date:
+            self._pnl_date = today
+            self._realised_today = 0.0
+        total = self._realised_today
+        persisted = getattr(self._repo, "daily_realised_pnl", None)
+        if callable(persisted):
+            # نسخهٔ ۲.۵.۴: این پرس‌وجو برای هر ورود اجرا می‌شد (صدها بار در یک
+            # موج ورود فوق‌سریع). یک ثانیه کش می‌شود و هر بستن آن را باطل می‌کند.
+            clock = time.monotonic()
+            cached = getattr(self, "_daily_cache", None)
+            if cached is not None and clock - cached[0] < 1.0:
+                total = cached[1]
+            else:
+                total = float(persisted(self._user_id))
+                self._daily_cache = (clock, total)
+        # نسخهٔ ۲.۷.۰: صفر یا منفی یعنی «بدون سقف» (درخواست کاربر برای آزمون کاغذی).
+        limit = float(self.config.daily_loss_limit or 0.0)
+        if limit <= 0:
+            return True
+        if total <= -limit:
             self._halted_reason = (
                 f"سقف زیان روزانه ({self.config.daily_loss_limit} دلار) رد شد"
             )
             return False
         return True
+
+    def edge_stats(self) -> dict[str, Any]:
+        """آمار برتری اندازه‌گیری‌شدهٔ همین اجرا (برای نمایش و محافظ)."""
+        pnls = list(getattr(self, "_edge_pnls", None) or [])
+        n = len(pnls)
+        if n == 0:
+            return {"trades": 0, "mean": 0.0, "upper95": None, "win_rate": None,
+                    "exit_reasons": dict(getattr(self, "_exit_reasons", None) or {})}
+        mean = sum(pnls) / n
+        upper = None
+        if n > 1:
+            var = sum((x - mean) ** 2 for x in pnls) / (n - 1)
+            upper = mean + 1.645 * math.sqrt(var / n)
+        return {
+            "trades": n,
+            "mean": mean,
+            "upper95": upper,
+            "win_rate": sum(1 for x in pnls if x > 0) / n * 100.0,
+            "exit_reasons": dict(getattr(self, "_exit_reasons", None) or {}),
+        }
+
+    def _edge_guard_ok(self) -> bool:
+        """
+        آیا برتری اندازه‌گیری‌شده به‌طور معنادار منفی است؟ (نسخهٔ ۲.۵.۶)
+
+        بدون برتری جهت، امید ریاضی هر اسکالپ ≈ −کارمزد رفت‌وبرگشت است؛ ادامهٔ
+        ورود فقط کارمزد می‌سوزاند. محافظ فقط با نمونهٔ کافی و شواهد آماری
+        فعال می‌شود تا یک رشتهٔ بدشانسی موتور را نایستاند.
+        """
+        config = self.config
+        if not bool(getattr(config, "edge_guard_enabled", False)):
+            return True
+        stats = self.edge_stats()
+        minimum = max(20, int(getattr(config, "edge_guard_min_trades", 50) or 50))
+        if stats["trades"] < minimum or stats["upper95"] is None:
+            return True
+        if stats["upper95"] < 0:
+            self._halted_reason = (
+                f"برتری منفی اندازه‌گیری‌شده: میانگین {stats['mean']:+.2f} دلار در "
+                f"{stats['trades']} معامله (حد بالای ۹۵٪: {stats['upper95']:+.2f}). "
+                "ورود تازه متوقف شد؛ تنظیمات را بازبینی و موتور را دوباره شروع کنید."
+            )
+            return False
+        return True
+
+    def _book_ready(self, symbol: str) -> bool:
+        """آیا Bid/Ask تازه و واقعی برای نماد در کش تیک هست؟"""
+        if self._tick_engine is None:
+            return True  # بدون کش تیک، مسیر REST قدیم (قابل مقایسه نیست)
+        quote = self._tick_engine.get(symbol)
+        if quote is None:
+            return False
+        return bool(getattr(quote, "book_fresh", False)) and float(getattr(quote, "spread", 0.0) or 0.0) > 0
+
+    def set_book_source(self, source: Callable[[str], Awaitable[Any]] | None) -> None:
+        """
+        منبع «فقط دفتر سفارش» برای پیش‌خوانی (نسخهٔ ۲.۶.۱).
+
+        یک درخواست به‌جای دو (تیکر + دفتر)؛ فشار REST و PoolTimeout کم
+        می‌شود و شکست تیکر دیگر دفترِ سالم را دور نمی‌ریزد.
+        """
+        self._book_source = source
+
+    def _prefetch_book(self, symbol: str) -> None:
+        """خواندن دفتر در پس‌زمینه (حداکثر ۸ هم‌زمان، هر نماد یک‌بار)."""
+        pending = getattr(self, "_book_prefetch", None)
+        if pending is None:
+            pending = self._book_prefetch = set()
+        source = getattr(self, "_book_source", None) or self._price_source
+        if symbol in pending or len(pending) >= 8 or source is None:
+            return
+        # نسخهٔ ۲.۶.۱: پس از شکست، چند ثانیه همان نماد دوباره خوانده نشود
+        failures = getattr(self, "_book_prefetch_failed", None)
+        if failures is None:
+            failures = self._book_prefetch_failed = {}
+        now = time.monotonic()
+        if now - failures.get(symbol, -1e9) < BOOK_PREFETCH_RETRY_SECONDS:
+            return
+
+        async def fetch() -> None:
+            try:
+                await asyncio.wait_for(source(symbol), timeout=5.0)
+                failures.pop(symbol, None)
+            except Exception:  # noqa: BLE001
+                failures[symbol] = time.monotonic()
+                logger.debug("Book prefetch failed for %s", symbol, exc_info=True)
+            finally:
+                pending.discard(symbol)
+
+        try:
+            pending.add(symbol)
+            asyncio.get_running_loop().create_task(fetch())
+        except RuntimeError:
+            pending.discard(symbol)
 
     def _is_stale(self, symbol: str) -> bool:
         """آیا دادهٔ نماد کهنه است؟ (STALE DATA — خواستهٔ §۶)"""
@@ -667,7 +868,7 @@ class AutoTrader:
         try:
             return bool(self._tick_engine.is_stale(symbol))
         except Exception:  # noqa: BLE001
-            return False
+            return True
 
     def _notify_stale_if_new(self, symbol: str) -> None:
         """اعلام STALE فقط یک‌بار در هر بازهٔ کوتاه — نه هر دور پویش."""
@@ -689,7 +890,7 @@ class AutoTrader:
         کم و تضاد روند هرکدام جدا گزارش می‌شوند تا UI بتواند دلیلِ
         «چرا معامله باز نشد» را صادقانه نشان دهد.
         """
-        symbol = str(getattr(candidate, "symbol", "") or "")
+        symbol = str(getattr(candidate, "symbol", "") or "").strip().upper()
         config = self.config
 
         if self._is_stale(symbol):
@@ -731,6 +932,25 @@ class AutoTrader:
             return self.config.selected_symbol_list
         return None
 
+    def live_execution_allowed(self) -> bool:
+        """
+        آیا سفارش واقعی **جدید** مجاز است؟
+
+        هم پیکربندی live کامل (حالت + عبارت تأیید) لازم است و هم عبور از
+        دروازهٔ اعتبارسنجی (اگر وصل باشد). خطای دروازه = قفل.
+        """
+        if not self.config.is_live:
+            return False
+        gate = self._live_gate
+        if gate is None:
+            return True
+        try:
+            allowed, reason = gate()
+        except Exception as exc:  # noqa: BLE001
+            allowed, reason = False, f"validation gate error: {exc}"
+        self.live_gate_reason = "" if allowed else str(reason)
+        return bool(allowed)
+
     def preflight(self) -> tuple[bool, str]:
         """
         بررسی پیش از شروع — هرگز با پیکربندی مشکوک شروع نکن.
@@ -741,6 +961,8 @@ class AutoTrader:
                 "برای معاملهٔ واقعی باید عبارت تأیید را دقیقاً وارد کنید: "
                 f"«{LIVE_CONFIRMATION_PHRASE}»"
             )
+        if not self._check_daily_limit():
+            return False, self._halted_reason
         if config.max_loss <= 0:
             return False, "حد ضرر باید بزرگ‌تر از صفر باشد"
         if config.target_profit <= 0:
@@ -754,7 +976,9 @@ class AutoTrader:
 
     # ---- عملیات -----------------------------------------------------
 
-    def _resolve_margin(self, candidate: Any, confidence: float) -> float:
+    def _resolve_margin(
+        self, candidate: Any, confidence: float, portfolio: dict[str, Any] | None = None
+    ) -> float:
         """
         مارجین معامله بر پایهٔ حالت تخصیص (خواستهٔ §۱۲).
 
@@ -768,7 +992,8 @@ class AutoTrader:
         mode = config.allocation_mode
         if mode == "fixed":
             return config.margin_per_trade
-        portfolio = self.portfolio()
+        if portfolio is None:
+            portfolio = self.portfolio()
         balance = float(portfolio.get("balance", 0.0) or 0.0)
         used = float(portfolio.get("used_margin", 0.0) or 0.0)
         available = max(0.0, balance - used)
@@ -790,7 +1015,43 @@ class AutoTrader:
             margin = config.margin_per_trade
         return max(0.0, min(margin, available, cap))
 
+    def _count_rejection(self, reason: str) -> None:
+        key = str(reason or "rejected").split(":", 1)[0]
+        rejections = getattr(self, "_round_rejections", None)
+        if rejections is None:
+            rejections = self._round_rejections = {}
+        rejections[key] = rejections.get(key, 0) + 1
+
+    def scan_stats(self) -> dict[str, Any]:
+        """آمار آخرین دور پویش: نامزدها، بازشده‌ها و دلایل رد (پرتکرارترین اول)."""
+        return dict(getattr(self, "last_scan", {}) or {})
+
+    def rejection_reason(self, symbol: str) -> str:
+        return self._last_rejections.get(symbol.upper(), "rejected_by_guards")
+
     async def open_trade(self, candidate: Any) -> ManagedTrade | None:
+        """ظرفیت و ورود تکراری زیر قفل مشترک دستی/خودکار دوباره بررسی می‌شوند."""
+        # Slow quote I/O must not hold the portfolio lock and delay a fresh manual entry.
+        symbol = str(getattr(candidate, "symbol", "") or "").strip().upper()
+        if symbol and self._tick_engine is not None and self._is_stale(symbol):
+            reason = ""
+            try:
+                await asyncio.wait_for(self._price_source(symbol), timeout=5.0)
+                if self._is_stale(symbol):
+                    reason = "stale_data"
+            except Exception:
+                reason = "price_unavailable"
+            if reason:
+                self._last_rejections[symbol] = reason
+                self._count_rejection(reason)
+                self._emit("rejected", {"symbol": symbol, "reason": reason})
+                self._record_opportunity(candidate, decision="skip", reason=reason)
+                self._audit_reject(candidate, symbol, reason, "freshness", "")
+                return None
+        async with self._entry_lock:
+            return await self._open_trade_locked(candidate)
+
+    async def _open_trade_locked(self, candidate: Any) -> ManagedTrade | None:
         """
         باز کردن یک معامله بر پایهٔ نامزد.
 
@@ -798,19 +1059,46 @@ class AutoTrader:
         واقعی نمی‌رود. نامزد رد‌شده هرگز بی‌صدا دور ریخته نمی‌شود —
         رویداد `rejected` با دلیل صریح منتشر می‌شود.
         """
-        symbol = str(getattr(candidate, "symbol", "") or "")
+        symbol = str(getattr(candidate, "symbol", "") or "").strip().upper()
         direction = str(getattr(candidate, "direction", "LONG")).upper()
         side = "long" if direction == "LONG" else "short"
         confidence = float(getattr(candidate, "score", 0.0) or 0.0)
+        # نسخهٔ ۲.۶.۰ (فقط ثبت): مرحلهٔ جاری دروازه‌ها برای نقشهٔ «کدام فیلتر گذشت»
+        progress = {"stage": "precheck"}
+        audit_id = audit.new_correlation_id()
 
         def reject(reason: str) -> None:
+            self._last_rejections[symbol.upper()] = reason
+            self._count_rejection(reason)
             self._emit("rejected", {"symbol": symbol, "reason": reason})
             self._record_opportunity(candidate, decision="skip", reason=reason)
+            self._audit_reject(candidate, symbol, reason, progress["stage"], audit_id)
 
-        if len(self._open) >= self.config.max_concurrent:
+        if not symbol or direction not in {"LONG", "SHORT"} or not math.isfinite(confidence):
+            reject("invalid_candidate")
+            return None
+        observed_at = float(getattr(candidate, "observed_at", 0) or 0)
+        if observed_at and time.time() - observed_at > max(60, 2 * self.config.scan_interval_seconds):
+            reject("stale_candidate")
+            return None
+        if any(t.symbol.upper() == symbol.upper() for t in self._open.values()):
+            reject("symbol_already_open")
+            return None
+        lookup = getattr(self._repo, "open_trades", None)
+        if callable(lookup) and any(str(r.get("symbol", "")).upper() == symbol.upper() for r in lookup(self._user_id)):
+            reject("symbol_already_open")
+            return None
+        # یک عکس پرتفوی برای کل این ورود (هر عکس پرس‌وجوی پایگاه داده است).
+        # داخل قفل ورود است؛ بستن هم‌زمان فقط مارجین آزاد می‌کند، پس محافظه‌کارانه است.
+        portfolio = self.portfolio()
+        if len(self._open) >= self.config.max_concurrent or int(portfolio.get("open_count", 0)) >= self.config.max_concurrent:
             reject("max_concurrent_reached")
             return None
         if not self._check_daily_limit():
+            reject("daily_loss_limit")
+            return None
+        if not self._edge_guard_ok():
+            reject("negative_edge")
             return None
 
         allowed = self._allowed_symbols()
@@ -818,22 +1106,43 @@ class AutoTrader:
             reject("symbol_not_selected")
             return None
 
+        progress["stage"] = "market_guards"
         ok, reason = self._check_entry_guards(candidate, side)
         if not ok:
             reject(reason)
             return None
+        progress["stage"] = "orderbook"
+        if self.config.engine_mode == "ultra" and not self._book_ready(symbol):
+            # نسخهٔ ۲.۵.۷: فید کل بازار Bid/Ask ندارد. قبلاً ورود روی «آخرین
+            # معامله» ثبت می‌شد و خروج بعداً روی Bid/Ask (پس از رسیدن دفتر) —
+            # اسپرد پنهان همان لحظه از دست می‌رفت و دروازهٔ اسپرد کور بود.
+            # حالا دفتر در پس‌زمینه خوانده می‌شود (بدون تأخیر ورود دیگران) و
+            # همین نامزد در پویش بعدی (۱ ثانیه) با Bid/Ask واقعی بررسی می‌شود.
+            self._prefetch_book(symbol)
+            reject("no_orderbook")
+            return None
 
-        margin = self._resolve_margin(candidate, confidence)
-        if margin < 1.0:
+        progress["stage"] = "sizing"
+        margin = self._resolve_margin(candidate, confidence, portfolio)
+        # نسخهٔ ۲.۵.۵: کیفیت سیگنال اندازه را تعدیل می‌کند (STRONG 1.0 /
+        # NORMAL 0.75 / WEAK 0.5). نامزد بدون این فیلد (اسکالپ/اولترا) → ۱٫۰.
+        size_multiplier = float(getattr(candidate, "size_multiplier", 1.0) or 1.0)
+        size_multiplier = max(0.25, min(1.0, size_multiplier))
+        margin *= size_multiplier
+        if not math.isfinite(margin) or margin < 1.0:
             reject("no_available_margin")
             return None
 
+        progress["stage"] = "pricing"
         entry, execution = await self._price_for_entry(symbol, side)
-        if entry <= 0:
+        if not math.isfinite(entry) or entry <= 0:
             reject("no_price")
             return None
 
         config = self.config
+        if not math.isfinite(config.fee_rate) or not 0 <= config.fee_rate < 1:
+            reject("invalid_fee_rate")
+            return None
         # نامزد AI می‌تواند اهرم و سطوح خودش را بیاورد (TP/SL از چندک‌ها)
         leverage = float(getattr(candidate, "leverage", 0.0) or 0.0) or config.leverage
         leverage = max(1.0, min(leverage, HARD_MAX_LEVERAGE))
@@ -842,6 +1151,7 @@ class AutoTrader:
 
         from trading.micro_plan import plan_levels
 
+        progress["stage"] = "risk_levels"
         plan = plan_levels(
             margin,
             leverage,
@@ -849,24 +1159,104 @@ class AutoTrader:
             config.max_loss,
             config.fee_rate,
         )
+        if plan.round_trip_fee >= config.max_loss:
+            reject("fees_exceed_loss_budget")
+            return None
         quantity = plan.notional / entry
         sign = 1.0 if side == "long" else -1.0
+        # سطح‌های بودجه: همان قیمتی که سود/زیان **خالص** (پس از کارمزد ورود
+        # و خروج) دقیقاً برابر عدد دلاری کاربر می‌شود.
+        budget_target = (entry * sign + (config.target_profit + plan.entry_fee) / quantity) / (sign - config.fee_rate)
+        budget_stop = (entry * sign + (plan.entry_fee - config.max_loss) / quantity) / (sign - config.fee_rate)
+        # نسخهٔ ۲.۵.۴: سیگنال‌های پراطمینان حد ضرر نوسانی (۱ تا ۵٪ دورتر) دارند.
+        # با اهرم بالا، زیانِ آن حد چند برابر بودجهٔ دلاری کاربر می‌شد و
+        # **همهٔ** نامزدها با risk_exceeds_loss_budget رد می‌شدند — معاملهٔ
+        # خودکار هیچ‌وقت باز نمی‌شد. حالا: حد ضرر سیگنال اگر در بودجه جا شود
+        # همان، وگرنه به حد بودجه نزدیک می‌شود؛ هدف سیگنال فقط اگر نزدیک‌تر از
+        # هدف دلاری باشد (کاربر: «به محض رسیدن به سود خالص X ببند»).
+        stop_source = "budget"
+        target_source = "budget"
+        target = budget_target
+        stop = budget_stop
         if candidate_tp > 0:
-            target = candidate_tp
-        else:
-            target = entry + sign * (plan.gross_target / quantity)
+            if (candidate_tp - entry) * sign <= 0:
+                reject("invalid_risk_levels")
+                return None
+            if (candidate_tp - entry) * sign < (budget_target - entry) * sign:
+                target, target_source = candidate_tp, "signal"
         if candidate_sl > 0:
-            stop = candidate_sl
-        else:
-            stop = entry - sign * (plan.stop_distance / quantity)
+            if (entry - candidate_sl) * sign <= 0:
+                reject("invalid_risk_levels")
+                return None
+            if (entry - candidate_sl) * sign <= (entry - budget_stop) * sign:
+                stop, stop_source = candidate_sl, "signal"
 
-        if config.is_live:
+        # نسخهٔ ۲.۵.۷ — B: اسپرد نسبت به فاصلهٔ حد ضرر
+        stop_move = abs(entry - stop) / entry * 100.0 if entry > 0 else 0.0
+        spread_now = float(execution.get("spread_percent", 0.0) or 0.0)
+        if (
+            config.max_spread_stop_fraction > 0
+            and spread_now > 0
+            and stop_move > 0
+            and spread_now > stop_move * config.max_spread_stop_fraction
+        ):
+            reject(f"spread_eats_stop:{spread_now:.3f}%")
+            return None
+        # نسخهٔ ۲.۵.۷ — C: آیا هدف در مدت نگه‌داری اصلاً دست‌یافتنی است؟
+        vol_ps = float(getattr(candidate, "volatility_per_second", 0.0) or 0.0)
+        if config.reach_ratio > 0 and vol_ps > 0 and entry > 0:
+            reach = vol_ps * math.sqrt(max(1, config.max_hold_seconds))
+            target_move = abs(target - entry) / entry * 100.0
+            cost_move = config.fee_rate * 200.0 + spread_now + config.slippage_percent * 2.0
+            need = max(config.reach_ratio * target_move, 2.0 * cost_move)
+            if reach < need:
+                reject(f"target_unreachable:{reach:.3f}%<{need:.3f}%")
+                return None
+        net_reward = (target - entry) * sign * quantity - plan.entry_fee - quantity * target * config.fee_rate
+        net_risk = -(stop - entry) * sign * quantity + plan.entry_fee + quantity * stop * config.fee_rate
+        if not all(math.isfinite(v) and v > 0 for v in (target, stop, quantity)) or (target - entry) * sign <= 0 or (entry - stop) * sign <= 0:
+            reject("invalid_risk_levels")
+            return None
+        if net_risk > config.max_loss + 1e-8:
+            reject("risk_exceeds_loss_budget")
+            return None
+        if net_reward <= 0 or net_reward + 1e-8 < net_risk * min(1.0, config.target_profit / config.max_loss):
+            reject("poor_net_reward_risk")
+            return None
+        balance = float(portfolio.get("balance", 0) or 0)
+        used = float(portfolio.get("used_margin", 0) or 0)
+        if balance > 0 and (used + margin > balance * config.max_total_margin_percent / 100 or margin > balance - used):
+            reject("no_available_margin")
+            return None
+        # Revalidate freshness/spread after awaited I/O.
+        progress["stage"] = "revalidation"
+        ok, reason = self._check_entry_guards(candidate, side)
+        if not ok:
+            reject(reason)
+            return None
+        if getattr(config, "diagnostic_only", False):
+            # نسخهٔ ۲.۶.۱: همهٔ دروازه‌ها گذشتند؛ در حالت تشخیصی فقط ثبت می‌شود
+            progress["stage"] = "diagnostic"
+            reject("diagnostic_only")
+            self._emit("diagnostic_pass", {
+                "symbol": symbol, "direction": direction, "entry": entry,
+                "stop": stop, "target": target, "spread_percent": spread_now,
+            })
+            return None
+        if config.mode == "live" and not config.is_live:
+            raise LiveTradingNotEnabledError("تأیید معامله واقعی کامل نیست")
+        # نسخهٔ ۲.۵.۵: دروازهٔ اعتبارسنجی — قفل یعنی همین ورود کاغذی ثبت شود
+        live_now = self.live_execution_allowed()
+        if live_now:
             if self._gateway is None:
                 raise LiveTradingNotEnabledError("درگاه سفارش واقعی تنظیم نشده است")
             await self._gateway.open_position(
                 symbol=symbol, side=side, quantity=quantity, leverage=leverage
             )
 
+        progress["stage"] = "passed"
+        self._audit_accept(candidate, symbol, direction, audit_id, entry=entry, execution=execution,
+                           stop=stop, target=target, quantity=quantity, margin=margin, leverage=leverage)
         record = self._repo.open_trade(
             symbol=symbol,
             side=side,
@@ -877,7 +1267,7 @@ class AutoTrader:
             take_profit=target,
             leverage=leverage,
             fee=plan.entry_fee,
-            mode="live" if config.is_live else "paper",
+            mode="live" if live_now else "paper",
             note="معاملهٔ خودکار اسکلپ",
             extra={
                 "auto": True,
@@ -886,11 +1276,20 @@ class AutoTrader:
                 "target_profit": config.target_profit,
                 "max_loss": config.max_loss,
                 "round_trip_fee": plan.round_trip_fee,
+                "entry_fee": plan.entry_fee,
                 "gross_target": plan.gross_target,
                 "fee_rate": config.fee_rate,
                 "engine_mode": config.engine_mode,
                 "allocation_mode": config.allocation_mode,
                 "execution": execution,
+                "stop_source": stop_source,
+                "target_source": target_source,
+                "size_multiplier": size_multiplier,
+                "quality": str(getattr(candidate, "quality", "") or ""),
+                # عکس لحظه‌ای تصمیم هوشمند برای یادگیری از نتیجه
+                "intelligence": dict(getattr(candidate, "intelligence", None) or {}),
+                # نسخهٔ ۲.۶.۰: پیوند سیگنال/نامزد/اعتبارسنجی به خط زمانی این معامله
+                "audit_id": audit_id,
             },
         )
 
@@ -904,12 +1303,18 @@ class AutoTrader:
             target_price=target,
             stop_price=stop,
             opened_at=datetime.now(UTC),
-            mode="live" if config.is_live else "paper",
+            # همان حالتی که واقعاً اجرا شد (دروازهٔ قفل → paper). بستن بر
+            # همین اساس تصمیم می‌گیرد؛ پس هرگز نباید با پیکربندی فرق کند.
+            mode="live" if live_now else "paper",
             margin=margin,
+            extra={"round_trip_fee": plan.round_trip_fee, "entry_fee": plan.entry_fee,
+                   "fee_rate": config.fee_rate},
             entry_bid=float(execution.get("bid", 0.0) or 0.0),
             entry_ask=float(execution.get("ask", 0.0) or 0.0),
         )
         self._open[managed.trade_id] = managed
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(self._loop())
         logger.info(
             "Auto-trade opened %s %s @ %.6f target=%.6f stop=%.6f margin=%.2f lev=%g",
             side, symbol, entry, target, stop, margin, leverage,
@@ -919,12 +1324,24 @@ class AutoTrader:
         return managed
 
     async def close_trade(self, managed: ManagedTrade, reason: str) -> dict[str, Any] | None:
+        """فقط یک خروج در جریان برای هر موقعیت؛ تیک/دکمه/تایمر هم‌زمان مجاز نیست."""
+        if managed.trade_id not in self._open or managed.trade_id in self._closing:
+            return None
+        self._closing.add(managed.trade_id)
+        try:
+            return await self._close_trade_once(managed, reason)
+        finally:
+            self._closing.discard(managed.trade_id)
+
+    async def _close_trade_once(self, managed: ManagedTrade, reason: str) -> dict[str, Any] | None:
         """بستن یک معامله و ثبت نتیجه."""
         price = await self._price_for_exit(managed)
         if price <= 0:
             return None
 
-        if managed.mode == "live" and self._gateway is not None:
+        if managed.mode == "live":
+            if self._gateway is None:
+                raise LiveTradingNotEnabledError("درگاه سفارش واقعی تنظیم نشده است")
             await self._gateway.close_position(
                 symbol=managed.symbol, side=managed.side, quantity=managed.quantity
             )
@@ -932,9 +1349,10 @@ class AutoTrader:
         from trading.micro_plan import exit_fee_from_notional
 
         exit_fee = exit_fee_from_notional(
-            managed.quantity * managed.entry_price,
-            self.config.fee_rate,
+            managed.quantity * price,
+            float(managed.extra.get("fee_rate", self.config.fee_rate)),
         )
+        self._audit_exit_decision(managed, reason, price)
         record = self._repo.close_trade(
             managed.trade_id,
             exit_price=price,
@@ -945,13 +1363,22 @@ class AutoTrader:
 
         if record:
             self._realised_today += float(record.get("pnl") or 0.0)
+            pnls = getattr(self, "_edge_pnls", None)
+            if pnls is None:
+                pnls = self._edge_pnls = deque(maxlen=500)
+            pnls.append(float(record.get("pnl") or 0.0))
+            exits = getattr(self, "_exit_reasons", None)
+            if exits is None:
+                exits = self._exit_reasons = {}
+            exits[reason] = exits.get(reason, 0) + 1
+        self._daily_cache = None
         logger.info(
             "Auto-trade closed %s reason=%s pnl=%s",
             managed.symbol, reason, (record or {}).get("pnl"),
         )
         self._emit("closed", {"trade": managed, "record": record, "reason": reason})
 
-        if not self._check_daily_limit():
+        if not self._check_daily_limit() or not self._edge_guard_ok():
             await self.stop()
             self._emit("halted", {"reason": self._halted_reason})
         return record
@@ -959,18 +1386,38 @@ class AutoTrader:
     async def check_open_trades(self) -> None:
         """پایش fallback همهٔ معامله‌های باز — وقتی تیک نمی‌آید."""
         now = datetime.now(UTC)
-        for managed in list(self._open.values()):
+        async def check(managed):
             try:
-                price = await self._price_source(managed.symbol)
+                price = await self._price_for_exit(managed)
             except Exception:  # noqa: BLE001
                 logger.exception("Price check failed for %s", managed.symbol)
-                continue
+                return
             if price <= 0:
-                continue
+                return
             managed.mark(price, self.config)
             reason = managed.should_close(price, now, self.config.max_hold_seconds)
             if reason:
                 await self.close_trade(managed, reason)
+                return
+            # نسخهٔ ۲.۵.۴: با ۲۰۰ معامله و پایش نیم‌ثانیه‌ای، نوشتن هر دور
+            # صدها نوشتن SQLite در ثانیه روی نخ شبکه بود. حالا هر معامله حداکثر
+            # هر ۲ ثانیه، و تغییر حد ضرر همیشه فوراً.
+            clock = time.monotonic()
+            stop_moved = abs(managed.effective_stop - managed.persisted_stop) > 1e-12
+            if not stop_moved and clock - managed.last_persist < PERSIST_INTERVAL_SECONDS:
+                return
+            managed.last_persist = clock
+            update = getattr(self._repo, "update_live_pnl", None)
+            if callable(update):
+                net = managed.net_unrealised(price)
+                update(managed.trade_id, price=price, pnl=net,
+                       pnl_percent=net / managed.margin * 100 if managed.margin else 0)
+            protection = getattr(self._repo, "update_protection", None)
+            if callable(protection) and stop_moved:
+                protection(managed.trade_id, stop_loss=managed.effective_stop)
+                managed.persisted_stop = managed.effective_stop
+
+        await asyncio.gather(*(check(t) for t in list(self._open.values())))
 
     async def check_signal_invalidation(self) -> None:
         """
@@ -980,6 +1427,9 @@ class AutoTrader:
         دلیل ورود دیگر وجود ندارد — ماندن قمار است، معامله نیست.
         """
         if not self.config.signal_invalidation or self._invalidation_source is None:
+            return
+        if self.config.engine_mode == "ultra":
+            # معاملهٔ فوق‌سریع از سیگنال پیش‌بینی نیامده؛ فقط هدف/حد ضرر/زمان.
             return
         for managed in list(self._open.values()):
             try:
@@ -1003,6 +1453,147 @@ class AutoTrader:
 
     # ---- پویش و ثبت فرصت‌ها ------------------------------------------
 
+    # ------------------------------------------------------------------
+    # ممیزی (نسخهٔ ۲.۶.۰) — فقط ثبت؛ هیچ تصمیمی این‌جا گرفته نمی‌شود
+    # ------------------------------------------------------------------
+    #: ترتیب مراحل دروازهٔ ورود (برای نقشهٔ pass/fail/not_run)
+    AUDIT_STAGES: tuple[str, ...] = (
+        "precheck", "market_guards", "orderbook", "sizing", "pricing", "risk_levels", "revalidation",
+    )
+
+    @classmethod
+    def _audit_filter_map(cls, failed_stage: str) -> dict[str, str]:
+        result: dict[str, str] = {}
+        state = "pass"
+        for stage in cls.AUDIT_STAGES:
+            if stage == failed_stage:
+                result[stage] = "fail"
+                state = "not_run"
+            else:
+                result[stage] = state
+        return result
+
+    def _audit_snapshot(self, candidate: Any, symbol: str) -> dict[str, Any]:
+        """عکس بازار/سیگنال نامزد — فقط getattr و حافظه (بدون I/O)."""
+        try:
+            def num(name: str) -> float | None:
+                value = getattr(candidate, name, None)
+                try:
+                    number = float(value)
+                except (TypeError, ValueError):
+                    return None
+                return number if math.isfinite(number) else None
+
+            snapshot: dict[str, Any] = {
+                "price": num("entry_price") or num("last_price") or num("price"),
+                "liquidity_24h": num("turnover_24h"),
+                "volatility_per_second": num("volatility_per_second"),
+                "technical_confidence": num("score"),
+                "probability": num("probability"),
+                "expected_move_percent": num("expected_move_percent"),
+                "risk_reward": num("risk_reward"),
+                "mtf": str(getattr(candidate, "mtf", "") or "") or None,
+                "orderflow": getattr(candidate, "orderflow", None) or getattr(candidate, "order_flow", None),
+                "strategy": str(getattr(candidate, "strategy", "") or getattr(candidate, "source", "") or "") or None,
+                "quality": str(getattr(candidate, "quality", "") or "") or None,
+                "prediction": str(getattr(candidate, "prediction", "") or "") or None,
+                "take_profit": num("take_profit"),
+                "stop_loss": num("stop_loss"),
+            }
+            intelligence = getattr(candidate, "intelligence", None)
+            if isinstance(intelligence, dict) and intelligence:
+                for key in ("final_confidence", "prediction_probability", "mtf_alignment", "regime_score", "quality"):
+                    if intelligence.get(key) is not None:
+                        snapshot[f"ai_{key}"] = intelligence.get(key)
+            ladder = getattr(candidate, "trend_ladder", None)
+            if ladder is not None:
+                summary = getattr(ladder, "summary", None)
+                snapshot["trend"] = summary() if callable(summary) else str(ladder)
+            tick_engine = getattr(self, "_tick_engine", None)
+            quote = tick_engine.get(symbol) if tick_engine is not None else None
+            if quote is not None:
+                snapshot["bid"] = float(getattr(quote, "bid", 0.0) or 0.0) or None
+                snapshot["ask"] = float(getattr(quote, "ask", 0.0) or 0.0) or None
+                snapshot["last"] = float(getattr(quote, "last", 0.0) or getattr(quote, "price", 0.0) or 0.0) or None
+                snapshot["spread_percent"] = float(getattr(quote, "spread_percent", 0.0) or 0.0) or None
+            config = self.config
+            spread = float(snapshot.get("spread_percent") or 0.0)
+            snapshot["round_trip_cost_percent"] = round(
+                config.fee_rate * 200.0 + spread + config.slippage_percent * 2.0, 5
+            )
+            return {k: v for k, v in snapshot.items() if v is not None}
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def _audit_reject(self, candidate: Any, symbol: str, reason: str, stage: str, audit_id: str) -> None:
+        try:
+            scan = audit.current_scan()
+            if scan is not None:
+                scan.reject(reason)
+            direction = str(getattr(candidate, "direction", "") or "").upper()
+            audit.reject(
+                symbol, reason, stage=stage, engine_mode=self.config.engine_mode,
+                correlation_id=audit_id or None, scan_id=scan.scan_id if scan is not None else None,
+                filters=self._audit_filter_map(stage), direction=direction or None,
+                decision="skip", **self._audit_snapshot(candidate, symbol),
+            )
+        except Exception:  # noqa: BLE001 - لاگ هرگز ورود را متوقف نمی‌کند
+            pass
+
+    def _audit_accept(self, candidate: Any, symbol: str, direction: str, audit_id: str, **plan: Any) -> None:
+        """سیگنال → نامزد → اعتبارسنجی برای نامزدی که از همهٔ دروازه‌ها گذشت."""
+        try:
+            scan = audit.current_scan()
+            scan_id = None
+            if scan is not None:
+                scan.final_candidates += 1
+                scan_id = scan.scan_id
+            snapshot = self._audit_snapshot(candidate, symbol)
+            mode = self.config.engine_mode
+            intelligence = getattr(candidate, "intelligence", None)
+            audit.emit(
+                "signal", f"Signal {direction} {symbol} ({mode})", category=audit.LogCategory.SIGNALS,
+                symbol=symbol, correlation_id=audit_id, scan_id=scan_id, direction=direction,
+                source=snapshot.get("strategy") or mode,
+                technical_confidence=snapshot.get("technical_confidence"),
+                intelligence=dict(intelligence) if isinstance(intelligence, dict) and intelligence else None,
+            )
+            audit.candidate(symbol, direction, engine_mode=mode, correlation_id=audit_id, scan_id=scan_id,
+                            **snapshot)
+            execution = dict(plan.pop("execution", None) or {})
+            audit.emit(
+                "validation", f"All entry gates passed {symbol}", category=audit.domain_category(mode),
+                symbol=symbol, correlation_id=audit_id, scan_id=scan_id,
+                filters={stage: "pass" for stage in self.AUDIT_STAGES}, decision="enter",
+                bid=execution.get("bid"), ask=execution.get("ask"),
+                spread_percent=execution.get("spread_percent"), **plan,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _audit_exit_decision(self, managed: ManagedTrade, reason: str, price: float) -> None:
+        """وضعیت بازار و سیگنال لحظهٔ تصمیم خروج (گام Monitoring خط زمانی)."""
+        try:
+            fields: dict[str, Any] = {"exit_reason": reason, "decision_price": price,
+                                      "target": managed.target_price, "stop": managed.stop_price}
+            tick_engine = getattr(self, "_tick_engine", None)
+            quote = tick_engine.get(managed.symbol) if tick_engine is not None else None
+            if quote is not None:
+                fields["bid"] = float(getattr(quote, "bid", 0.0) or 0.0) or None
+                fields["ask"] = float(getattr(quote, "ask", 0.0) or 0.0) or None
+                fields["spread_percent"] = float(getattr(quote, "spread_percent", 0.0) or 0.0) or None
+            source = getattr(self, "_invalidation_source", None)
+            if source is not None and self.config.engine_mode != "ultra":
+                try:
+                    fields["signal_direction_at_exit"] = str(source(managed.symbol) or "").upper() or None
+                except Exception:  # noqa: BLE001
+                    pass
+            fields["trade_direction"] = "LONG" if managed.is_long else "SHORT"
+            audit.timeline(managed.trade_id, "exit_decision", f"Exit decision #{managed.trade_id}: {reason}",
+                           symbol=managed.symbol, **fields)
+        except Exception:  # noqa: BLE001
+            pass
+
     def _record_opportunity(
         self, candidate: Any, *, decision: str, reason: str
     ) -> None:
@@ -1015,7 +1606,7 @@ class AutoTrader:
         نامزدِ رد‌شده نگه داشته می‌شود تا کاربر بتواند از جدول، ورود
         دستی بخواهد؛ همهٔ دروازه‌ها دوباره سنجیده می‌شوند.
         """
-        symbol = str(getattr(candidate, "symbol", "") or "")
+        symbol = str(getattr(candidate, "symbol", "") or "").strip().upper()
         if not symbol:
             return
         ladder = getattr(candidate, "trend_ladder", None)
@@ -1123,17 +1714,72 @@ class AutoTrader:
         if self._candidate_source is None:
             return
         allowed = self._allowed_symbols()
-        candidates = await self._candidate_source()
-        held = {trade.symbol for trade in self._open.values()}
-        for candidate in candidates:
-            if len(self._open) >= self.config.max_concurrent:
-                break
-            # هرگز دو معامله روی یک نماد.
-            if getattr(candidate, "symbol", "") in held:
-                continue
-            if allowed is not None and getattr(candidate, "symbol", "") not in allowed:
-                continue
-            await self.open_trade(candidate)
+        started = time.monotonic()
+        self._round_rejections = {}
+        # نسخهٔ ۲.۶.۰: منبع نامزد و دروازه‌ها در همین شیء می‌شمارند (فقط ثبت)
+        # خرابی لایهٔ ممیزی هرگز پویش را متوقف نمی‌کند.
+        try:
+            diagnostics = audit.ScanDiagnostics(engine=str(getattr(self.config, "engine_mode", "") or ""))
+            scope = audit.scan_scope(diagnostics)
+        except Exception:  # noqa: BLE001
+            diagnostics, scope = None, contextlib.nullcontext()
+
+        def note(reason: str, count: int = 1) -> None:
+            if diagnostics is not None:
+                try:
+                    diagnostics.reject(reason, count)
+                except Exception:  # noqa: BLE001
+                    pass
+
+        with scope:
+            candidates = await self._candidate_source()
+            source_seconds = time.monotonic() - started
+            if diagnostics is not None:
+                diagnostics.source_candidates = len(candidates)
+            held = {trade.symbol for trade in self._open.values()}
+            opened = 0
+            for index, candidate in enumerate(candidates):
+                if len(self._open) >= self.config.max_concurrent:
+                    note("max_concurrent", len(candidates) - index)
+                    break
+                # هرگز دو معامله روی یک نماد.
+                if getattr(candidate, "symbol", "") in held:
+                    note("symbol_already_open")
+                    continue
+                if allowed is not None and getattr(candidate, "symbol", "") not in allowed:
+                    note("symbol_not_selected")
+                    continue
+                if await self.open_trade(candidate) is not None:
+                    opened += 1
+        if diagnostics is not None:
+            try:
+                diagnostics.opened_trades = opened
+                diagnostics.seconds = time.monotonic() - started
+                audit.scan_summary(diagnostics)
+                audit.performance("scan_source", source_seconds, engine=diagnostics.engine,
+                                  candidates=len(candidates), slow_seconds=2.0)
+            except Exception:  # noqa: BLE001
+                pass
+        rejections = sorted(self._round_rejections.items(), key=lambda item: -item[1])
+        self.last_scan = {
+            "at": time.time(),
+            "candidates": len(candidates),
+            "opened": opened,
+            "open": len(self._open),
+            "rejections": rejections,
+            "seconds": round(time.monotonic() - started, 3),
+        }
+        if candidates and not opened:
+            logger.info("Auto-trade scan: %d candidates, none opened; rejections=%s",
+                        len(candidates), rejections[:5])
+
+    async def _run_scan(self) -> None:
+        try:
+            await self._scan_for_entries()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Candidate scan failed")
 
     async def _loop(self) -> None:
         """
@@ -1143,20 +1789,22 @@ class AutoTrader:
         انجام می‌شود. این حلقه حداکثر هر `poll_seconds` بیدار می‌شود
         و ورودها هر `scan_interval_seconds` بررسی می‌شوند.
         """
-        while self._running:
+        while self._running or self._open:
             try:
                 await self.check_open_trades()
                 await self.check_signal_invalidation()
 
                 now = time.monotonic()
                 if (
-                    self._candidate_source is not None
+                    self._running
+                    and (self._scan_task is None or self._scan_task.done())
+                    and self._candidate_source is not None
                     and len(self._open) < self.config.max_concurrent
                     and self._check_daily_limit()
                     and now - self._last_scan_monotonic >= self.config.scan_interval_seconds
                 ):
                     self._last_scan_monotonic = now
-                    await self._scan_for_entries()
+                    self._scan_task = asyncio.create_task(self._run_scan())
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001
@@ -1174,13 +1822,26 @@ class AutoTrader:
         self._running = True
         self._halted_reason = ""
         self._last_scan_monotonic = 0.0
-        self._task = asyncio.create_task(self._loop())
+        self._edge_pnls = deque(maxlen=500)  # آمار برتری هر اجرا از صفر
+        self._exit_reasons = {}
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(self._loop())
+        live_now = self.live_execution_allowed()
         logger.info(
             "Auto-trader started (mode=%s engine=%s)",
-            "live" if self.config.is_live else "paper",
+            "live" if live_now else "paper",
             self.config.engine_mode,
         )
-        self._emit("started", {"mode": "live" if self.config.is_live else "paper"})
+        if self.config.is_live and not live_now:
+            # نسخهٔ ۲.۵.۵: حالت live تأیید شده ولی دروازهٔ اعتبارسنجی قفل است
+            logger.warning("Live execution locked by validation gate: %s", self.live_gate_reason)
+            self._emit("started", {"mode": "paper", "live_locked": True,
+                                   "live_gate_reason": self.live_gate_reason})
+            return True, (
+                "شروع شد — اجرای واقعی تا عبور از دروازهٔ اعتبارسنجی قفل است؛ "
+                "معاملات به‌صورت کاغذی ثبت می‌شوند"
+            )
+        self._emit("started", {"mode": "live" if live_now else "paper"})
         return True, "شروع شد"
 
     async def stop(self) -> None:
@@ -1191,12 +1852,16 @@ class AutoTrader:
         بازار می‌تواند زیان را قفل کند. کاربر خودش تصمیم می‌گیرد.
         """
         self._running = False
-        if self._task is not None:
-            self._task.cancel()
-            try:
-                await self._task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
+        current = asyncio.current_task()
+        if self._scan_task is not None and self._scan_task is not current:
+            if not self._scan_task.done():
+                self._scan_task.cancel()
+                await asyncio.gather(self._scan_task, return_exceptions=True)
+            self._scan_task = None
+        # Stopping automatic entries must not abandon protective exits.
+        # Do not cancel a parent monitor from its own per-position child task.
+        # With no positions the loop exits at its next wake-up.
+        if self._task is not None and self._task.done():
             self._task = None
         logger.info("Auto-trader stopped (%d open trades left)", len(self._open))
         self._emit("stopped", {"open": len(self._open)})

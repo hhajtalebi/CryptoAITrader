@@ -26,6 +26,7 @@ from typing import Any
 from PySide6.QtCore import QDate, Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
+    QHeaderView,
     QCheckBox,
     QComboBox,
     QDateEdit,
@@ -48,7 +49,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from trading.auto_trader import HARD_MAX_LEVERAGE
+from trading.auto_trader import HARD_MAX_CONCURRENT, HARD_MAX_LEVERAGE
 
 from localization import Translator
 from ui.charts import PriceChart
@@ -79,6 +80,7 @@ AUTO_ENGINE_MODES = (
     ("selected", "trades.auto.mode_selected"),
     ("scan", "trades.auto.mode_scan"),
     ("ai", "trades.auto.mode_ai"),
+    ("ultra", "trades.auto.mode_ultra"),
 )
 
 #: ستون‌های جدول فرصت‌ها — ترمینال حرفه‌ای (v2.1)
@@ -95,6 +97,32 @@ POSITION_COLUMNS = (
     "margin", "notional", "leverage", "tp", "sl", "pnl", "pnl_percent",
     "duration", "data_age", "exit_reason", "status", "action",
 )
+
+#: ستون‌های جدول تاریخچهٔ معاملات — بازسازی v2.5.0.
+#: عنوان‌ها از همین فهرست ساخته می‌شوند (`trades.history_cols.<name>`) تا
+#: عنوان و محتوای ستون هرگز از هم جدا نیفتند؛ پیش‌تر عنوان‌ها فقط هنگام
+#: تغییر زبان نشانده می‌شدند و جدول با سرستون «۱، ۲، ۳…» باز می‌شد.
+HISTORY_COLUMNS = (
+    "opened", "symbol", "side", "status", "entry", "price", "quantity",
+    "leverage", "margin", "sl", "targets", "pnl", "pnl_percent", "fee",
+    "closed", "action",
+)
+
+#: کلید متن هر ستون در ردیف آماده‌شدهٔ کنترلر
+HISTORY_TEXT_KEYS = {
+    "opened": "date_text",
+    "entry": "entry_text",
+    "price": "exit_text",
+    "quantity": "quantity_text",
+    "leverage": "leverage_text",
+    "margin": "margin_text",
+    "sl": "sl_text",
+    "targets": "targets_text",
+    "pnl": "pnl_text",
+    "pnl_percent": "pnl_percent_text",
+    "fee": "fee_text",
+    "closed": "closed_text",
+}
 
 #: کارت‌های اطلاعاتی بالای ترمینال (v2.1 — مرجع UI)
 INFO_CARDS = (
@@ -169,6 +197,8 @@ class TradesPage(BasePage):
     ai_opinion_requested = Signal(str)
     #: پیام کوتاه برای اعلان شناور (مثل نتیجهٔ عکس‌لحظه‌ای)
     notice_requested = Signal(str)
+    #: v2.5.9: باز کردن پنجرهٔ معاملهٔ دستی (نماد، مبلغ، اسپات/فیوچرز، اهرم، TP/SL)
+    manual_trade_requested = Signal()
 
     def __init__(self, translator: Translator, parent: Any = None) -> None:
         self._rows: list[dict[str, Any]] = []
@@ -204,6 +234,12 @@ class TradesPage(BasePage):
         self.export_button = make_button(self.tr_.tr("trades.export_csv"))
         self.export_button.clicked.connect(self.export_requested)
         self.header.add_action(self.export_button)
+
+        # v2.5.9: معاملهٔ دستی — همیشه در سربرگ، از هر دو زبانه در دسترس
+        self.manual_trade_button = make_button("＋ " + self.tr_.tr("trades.manual.button"), primary=True)
+        self.manual_trade_button.setObjectName("manualTradeButton")
+        self.manual_trade_button.clicked.connect(self.manual_trade_requested)
+        self.header.add_action(self.manual_trade_button)
 
         self.clear_button = make_button(self.tr_.tr("trades.clear_history"))
         self.clear_button.clicked.connect(self.clear_requested)
@@ -378,6 +414,10 @@ class TradesPage(BasePage):
         self.auto_automatic_button = make_button(self.tr_.tr("trades.auto.automatic"))
         self.auto_automatic_button.clicked.connect(self._emit_automatic_profile)
         top.addWidget(self.auto_automatic_button)
+        self.auto_ultra_button = make_button("⚡ " + self.tr_.tr("trades.auto.ultra_preset"))
+        self.auto_ultra_button.setToolTip(self.tr_.tr("trades.auto.ultra_preset_hint"))
+        self.auto_ultra_button.clicked.connect(self._emit_ultra_profile)
+        top.addWidget(self.auto_ultra_button)
         layout.addLayout(top)
 
         # --- نوار حالت‌ها (خواستهٔ §۳) ---
@@ -462,7 +502,7 @@ class TradesPage(BasePage):
 
         self.auto_liquidity_input = _spin(0.0, 100_000_000.0, 100_000.0, 0)
         self.auto_spread_input = _spin(0.0, 5.0, 0.01)
-        self.auto_scan_interval_input = _spin(3.0, 3600.0, 1.0)
+        self.auto_scan_interval_input = _spin(1.0, 3600.0, 1.0)
         self.auto_stale_input = _spin(1.0, 300.0, 1.0)
         self.auto_slippage_input = _spin(0.0, 1.0, 0.01)
         self.auto_trailing_check = QCheckBox()
@@ -991,10 +1031,18 @@ class TradesPage(BasePage):
         layout.addWidget(self._build_filters())
         layout.addWidget(self._build_metrics())
 
-        self.table = QTableWidget(0, 10, self)
-        configure_table(self.table, stretch_column=1)
+        self.table = QTableWidget(0, len(HISTORY_COLUMNS), self)
+        configure_table(self.table, stretch_column=HISTORY_COLUMNS.index("closed"))
         harden_table(self.table, min_row_height=30, min_table_height=220)
+        # ستون اهداف هرگز بریده نشود (TP1 · TP2 · TP3 با علامت ✓)
+        for name in ("targets", "symbol", "opened"):
+            self.table.horizontalHeader().setSectionResizeMode(
+                HISTORY_COLUMNS.index(name), QHeaderView.ResizeMode.ResizeToContents
+            )
+        # عنوان‌ها همین حالا نشانده می‌شوند، نه فقط هنگام تغییر زبان
+        self._retranslate_headers()
         self.table.cellDoubleClicked.connect(self._on_row_activated)
+        self.table.cellClicked.connect(self._on_history_cell_clicked)
         layout.addWidget(self.table, 1)
 
         actions_row = QHBoxLayout()
@@ -1003,6 +1051,10 @@ class TradesPage(BasePage):
         self.close_hint = QLabel(self.tr_.tr("trades.close_hint"))
         self.close_hint.setProperty("role", "faint")
         self.close_hint.setWordWrap(True)
+        # v2.5.9: «باز کردن معامله» کنار «بستن معامله» در تاریخچه
+        self.history_open_trade_button = make_button("＋ " + self.tr_.tr("trades.manual.button"))
+        self.history_open_trade_button.clicked.connect(self.manual_trade_requested)
+        actions_row.addWidget(self.history_open_trade_button)
         actions_row.addWidget(self.close_trade_button)
         actions_row.addWidget(self.close_hint, 1)
         layout.addLayout(actions_row)
@@ -1084,8 +1136,23 @@ class TradesPage(BasePage):
         self.auto_confirm_input.setPlaceholderText(self.tr_.tr("trades.auto.confirm_placeholder"))
 
         self.auto_concurrent_input = QSpinBox()
-        self.auto_concurrent_input.setRange(1, 10)
+        self.auto_concurrent_input.setRange(1, int(HARD_MAX_CONCURRENT))
         self.auto_concurrent_input.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        # نسخهٔ ۲.۵.۴: بیشترین زمان باز ماندن هر معامله (ثانیه)
+        self.auto_hold_input = QSpinBox()
+        self.auto_hold_input.setRange(10, 86_400)
+        self.auto_hold_input.setSingleStep(10)
+        self.auto_hold_input.setSuffix(" s")
+        self.auto_hold_input.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        # نسخهٔ ۲.۷.۰: سقف زیان روزانه (دلار)؛ صفر = خاموش
+        self.auto_daily_limit_input = QDoubleSpinBox()
+        self.auto_daily_limit_input.setRange(0.0, 1_000_000.0)
+        self.auto_daily_limit_input.setSingleStep(5.0)
+        self.auto_daily_limit_input.setDecimals(2)
+        self.auto_daily_limit_input.setSpecialValueText(self.tr_.tr("trades.auto.daily_limit_off"))
+        self.auto_daily_limit_input.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self.auto_confidence_input = QSpinBox()
         self.auto_confidence_input.setRange(50, 99)
@@ -1102,6 +1169,8 @@ class TradesPage(BasePage):
             ("trades.auto.max_loss", self.auto_loss_input),
             ("trades.auto.leverage", self.auto_leverage_input),
             ("trades.auto.concurrent", self.auto_concurrent_input),
+            ("trades.auto.max_hold", self.auto_hold_input),
+            ("trades.auto.daily_limit", self.auto_daily_limit_input),
             ("trades.auto.min_confidence", self.auto_confidence_input),
             ("trades.auto.source", self.auto_source_combo),
             ("trades.auto.poll", self.auto_poll_input),
@@ -1138,6 +1207,8 @@ class TradesPage(BasePage):
         self.auto_loss_input.setValue(float(values.get("scalp.max_loss", 3.0)))
         self.auto_leverage_input.setValue(int(values.get("scalp.leverage", 10)))
         self.auto_concurrent_input.setValue(int(values.get("scalp.max_concurrent", 3)))
+        self.auto_hold_input.setValue(int(float(values.get("scalp.max_hold_seconds", 900) or 900)))
+        self._set_spin(self.auto_daily_limit_input, values, "scalp.daily_loss_limit", 0.0)
         self.auto_confidence_input.setValue(int(values.get("scalp.min_confidence", 75)))
         index = self.auto_source_combo.findData(
             str(values.get("scalp.candidate_source", "confidence"))
@@ -1204,6 +1275,8 @@ class TradesPage(BasePage):
             "scalp.max_loss": self.auto_loss_input.value(),
             "scalp.leverage": self.auto_leverage_input.value(),
             "scalp.max_concurrent": self.auto_concurrent_input.value(),
+            "scalp.max_hold_seconds": self.auto_hold_input.value(),
+            "scalp.daily_loss_limit": self.auto_daily_limit_input.value(),
             "scalp.min_confidence": self.auto_confidence_input.value(),
             "scalp.candidate_source": self.auto_source_combo.currentData(),
             "scalp.poll_seconds": self.auto_poll_input.value(),
@@ -1249,6 +1322,50 @@ class TradesPage(BasePage):
         payload["scalp.max_hold_seconds"] = 90
         payload["scalp.taker_fee_rate"] = 0.0006
         payload["scalp.settings_mode"] = "automatic"
+        self.auto_settings_changed.emit(payload)
+
+    #: پیش‌تنظیم اسکالپ فوق‌سریع (همه در تنظیم دستی قابل تغییرند)
+    ULTRA_PRESET = {
+        "scalp.engine_mode": "ultra",
+        "scalp.margin_per_trade": 10.0,
+        "scalp.leverage": 50,
+        "scalp.target_profit": 2.0,
+        "scalp.max_loss": 2.0,
+        "scalp.max_concurrent": 100,
+        "scalp.max_hold_seconds": 180,
+        "scalp.poll_seconds": 0.5,
+        "scalp.scan_interval_seconds": 1.0,
+        "scalp.max_total_margin_percent": 100.0,
+        "scalp.allocation_mode": "fixed",
+        "scalp.taker_fee_rate": 0.0006,
+    }
+
+    def _emit_ultra_profile(self) -> None:
+        """
+        اسکالپ فوق‌سریع: ۱۰ دلار × اهرم ۵۰، بستن در سود خالص ۲ دلار، تا ۱۰۰ هم‌زمان.
+
+        مثل «خودکار»، حالت سفارش (کاغذی/واقعی) و عبارت تأیید دست نمی‌خورند.
+        """
+        preset = dict(self.ULTRA_PRESET)
+        self.auto_margin_input.setValue(preset["scalp.margin_per_trade"])
+        self.auto_leverage_input.setValue(int(preset["scalp.leverage"]))
+        self.auto_target_input.setValue(preset["scalp.target_profit"])
+        self.auto_loss_input.setValue(preset["scalp.max_loss"])
+        self.auto_concurrent_input.setValue(int(preset["scalp.max_concurrent"]))
+        self.auto_hold_input.setValue(int(preset["scalp.max_hold_seconds"]))
+        self.auto_poll_input.setValue(preset["scalp.poll_seconds"])
+        self.auto_scan_interval_input.setValue(preset["scalp.scan_interval_seconds"])
+        self.auto_max_margin_input.setValue(preset["scalp.max_total_margin_percent"])
+        index = self.auto_engine_mode_combo.findData("ultra")
+        if index >= 0:
+            self.auto_engine_mode_combo.blockSignals(True)
+            self.auto_engine_mode_combo.setCurrentIndex(index)
+            self.auto_engine_mode_combo.blockSignals(False)
+        payload = self.collect_auto_settings()
+        payload.update(preset)
+        payload.pop("scalp.mode", None)
+        payload.pop("scalp.live_confirmation", None)
+        payload["scalp.settings_mode"] = "ultra"
         self.auto_settings_changed.emit(payload)
 
     def _on_auto_toggle(self) -> None:
@@ -1801,6 +1918,9 @@ class TradesPage(BasePage):
         self.auto_ws_label.setText(
             "WS: " + self.tr_.tr("common.online" if connected else "common.offline")
         )
+        connections = status.get("connections") or {}
+        if connections.get("connections"):
+            self.auto_ws_label.setText(self.auto_ws_label.text() + f" ({connections.get('connected', 0)}/{connections['connections']})")
         set_role(self.auto_ws_label, "chip_up" if connected else "chip_warn")
 
         latency = status.get("avg_total_latency_ms")
@@ -1940,13 +2060,8 @@ class TradesPage(BasePage):
         dialog.exec()
 
     def _on_position_activated(self, row: int, _column: int) -> None:
-        """دوبار کلیک روی موقعیت باز آن را می‌بندد."""
-        data = self._position_row_from_table(row)
-        if data:
-            try:
-                self.close_position_requested.emit(int(data["id"]))
-            except (KeyError, TypeError, ValueError):
-                self.close_position_blocked.emit()
+        """دوبار کلیک جزئیات را نشان می‌دهد؛ خروج فقط با دکمهٔ صریح."""
+        self._on_position_cell_clicked(row, 0)
 
     def _set_columns(self, table: QTableWidget, columns: tuple[str, ...], prefix: str) -> None:
         """عنوان‌دهی ستون‌های یک جدول از کلیدهای ترجمه."""
@@ -2050,55 +2165,59 @@ class TradesPage(BasePage):
         (`*_text`) تا این صفحه درگیر قالب‌بندی عدد و تاریخ نشود؛ آن کار
         وظیفهٔ کنترلر است که به تنظیمات محلی دسترسی دارد.
         """
+        selected = self.trade_row(self.table.currentRow())
+        selected_id = selected.get("id") if selected else None
         self._rows = list(rows or [])
         self._page, self._pages = page, pages
 
         self.table.setSortingEnabled(False)
-        self.table.setRowCount(len(self._rows))
+        # v2.5.0: اگر همان معاملات با همان ترتیب باشند (تیک زندهٔ قیمت)،
+        # فقط متن خانه‌ها عوض می‌شود — دکمه‌ها از نو ساخته نمی‌شوند تا
+        # جدول هر ثانیه چشمک نزند و کلیک روی «بستن» گم نشود.
+        new_ids = [row.get("id") for row in self._rows]
+        in_place = new_ids == getattr(self, "_row_ids", None) and self.table.rowCount() == len(self._rows)
+        self._row_ids = new_ids
+        if not in_place:
+            self.table.setRowCount(len(self._rows))
+        action_column = HISTORY_COLUMNS.index("action")
 
         for index, row in enumerate(self._rows):
-            symbol = QTableWidgetItem(str(row.get("symbol", "")))
-            symbol.setTextAlignment(
-                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
-            )
-
-            side_key = str(row.get("side", "")).lower()
-            side_item = self._cell(self.tr_.tr(f"trades.sides.{side_key}", side_key))
             status_key = str(row.get("status", "")).lower()
-            status_item = self._cell(
-                self.tr_.tr(f"trades.statuses.{status_key}", status_key)
-            )
-
-            pnl_value = row.get("pnl")
-            pnl_item = self._cell(row.get("pnl_text", ""))
-            percent_item = self._cell(row.get("pnl_percent_text", ""))
-
-            if self._theme is not None and isinstance(pnl_value, (int, float)):
-                colors = self._theme.colors
-                tint = QColor(colors.success if pnl_value >= 0 else colors.danger)
-                pnl_item.setForeground(tint)
-                percent_item.setForeground(tint)
-            if self._theme is not None:
-                colors = self._theme.colors
-                side_item.setForeground(
-                    QColor(colors.success if side_key == "long" else colors.danger)
-                )
-
-            cells = [
-                self._cell(row.get("date_text", "")),
-                symbol,
-                side_item,
-                status_item,
-                self._cell(row.get("quantity_text", "")),
-                self._cell(row.get("entry_text", "")),
-                self._cell(row.get("exit_text", "")),
-                self._cell(row.get("leverage_text", "")),
-                pnl_item,
-                percent_item,
-            ]
-            for column, item in enumerate(cells):
+            for column, name in enumerate(HISTORY_COLUMNS):
+                if name == "action":
+                    continue
+                item = self._history_item(name, row)
+                current = self.table.item(index, column)
+                if (
+                    in_place
+                    and current is not None
+                    and current.text() == item.text()
+                    and current.foreground().color() == item.foreground().color()
+                ):
+                    continue
                 self.table.setItem(index, column, item)
 
+            has_button = self.table.cellWidget(index, action_column) is not None
+            if status_key == "open":
+                if not (in_place and has_button):
+                    button = make_button(self.tr_.tr("trades.close_trade"))
+                    button.clicked.connect(
+                        lambda _checked=False, tid=int(row["id"]): self.close_requested.emit(tid)
+                    )
+                    self.table.setCellWidget(index, action_column, button)
+                if self.table.item(index, action_column) is None:
+                    self.table.setItem(index, action_column, self._cell(""))
+            else:
+                if has_button:
+                    self.table.removeCellWidget(index, action_column)
+                self.table.setItem(index, action_column, self._cell(""))
+
+        selected_index = next((i for i, row in enumerate(self._rows) if row.get("id") == selected_id), -1)
+        if selected_index >= 0:
+            self.table.selectRow(selected_index)
+        else:
+            self.table.setCurrentCell(-1, -1)
+            self.table.clearSelection()
         has_rows = bool(self._rows)
         self.table.setVisible(has_rows)
         self.empty_state.setVisible(not has_rows)
@@ -2109,6 +2228,41 @@ class TradesPage(BasePage):
             pages=pages,
             text=page_text or self.tr_.tr("trades.page_info", page=page, pages=pages),
         )
+
+    def _history_item(self, name: str, row: dict[str, Any]) -> QTableWidgetItem:
+        """یک خانهٔ جدول تاریخچه با رنگ و چینش مناسب ستون (v2.5.0)."""
+        colors = self._theme.colors if self._theme is not None else None
+        if name == "symbol":
+            item = QTableWidgetItem(str(row.get("symbol", "")))
+            item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            item.setToolTip(self.tr_.tr("trades.history_cols.symbol_tip"))
+            return item
+        if name == "side":
+            side_key = str(row.get("side", "")).lower()
+            item = self._cell(self.tr_.tr(f"trades.sides.{side_key}", side_key))
+            if colors is not None:
+                item.setForeground(QColor(colors.success if side_key == "long" else colors.danger))
+            return item
+        if name == "status":
+            status_key = str(row.get("status", "")).lower()
+            text = self.tr_.tr(f"trades.statuses.{status_key}", status_key)
+            if row.get("stage_text"):
+                text = f"{text} · {row.get('stage_text')}"
+            return self._cell(text)
+        text = str(row.get(HISTORY_TEXT_KEYS.get(name, ""), "") or "—")
+        if name == "targets" and text != "—":
+            # جداسازی چپ‌به‌راست تا «TP1 … ✓» در چیدمان فارسی وارونه نشود
+            text = f"\u2066{text}\u2069"
+        item = self._cell(text)
+        if name in ("pnl", "pnl_percent") and colors is not None:
+            value = row.get("pnl")
+            if isinstance(value, (int, float)):
+                item.setForeground(QColor(colors.success if value >= 0 else colors.danger))
+        if name == "targets" and row.get("targets_tip"):
+            item.setToolTip(str(row.get("targets_tip")))
+        if name == "price" and str(row.get("status", "")).lower() == "open":
+            item.setToolTip(self.tr_.tr("trades.history_cols.price_live_tip"))
+        return item
 
     def set_metrics(self, values: dict[str, str]) -> None:
         """به‌روزرسانی نوار معیارها با متن‌های آمادهٔ نمایش."""
@@ -2182,6 +2336,10 @@ class TradesPage(BasePage):
         self.refresh_button.setText(self.tr_.tr("common.refresh"))
         self.export_button.setText(self.tr_.tr("trades.export_csv"))
         self.clear_button.setText(self.tr_.tr("trades.clear_history"))
+        for button in (getattr(self, "manual_trade_button", None),
+                       getattr(self, "history_open_trade_button", None)):
+            if button is not None:
+                button.setText("＋ " + self.tr_.tr("trades.manual.button"))
         self.notice.setText(self.tr_.tr("trades.paper_notice"))
         self.from_label.setText(self.tr_.tr("trades.from_date"))
         self.to_label.setText(self.tr_.tr("trades.to_date"))
@@ -2251,20 +2409,9 @@ class TradesPage(BasePage):
             combo.blockSignals(False)
 
     def _retranslate_headers(self) -> None:
-        """عنوان ستون‌های جدول تاریخچه."""
+        """عنوان ستون‌های جدول تاریخچه — از `HISTORY_COLUMNS` (v2.5.0)."""
         self.table.setHorizontalHeaderLabels(
-            [
-                self.tr_.tr("trades.date"),
-                self.tr_.tr("trades.symbol"),
-                self.tr_.tr("trades.side"),
-                self.tr_.tr("trades.status"),
-                self.tr_.tr("trades.quantity"),
-                self.tr_.tr("trades.entry"),
-                self.tr_.tr("trades.exit"),
-                self.tr_.tr("trades.leverage"),
-                self.tr_.tr("trades.pnl"),
-                self.tr_.tr("trades.pnl_percent"),
-            ]
+            [self.tr_.tr(f"trades.history_cols.{name}") for name in HISTORY_COLUMNS]
         )
 
     def _emit_filters(self) -> None:
@@ -2299,11 +2446,32 @@ class TradesPage(BasePage):
             return
         self.close_requested.emit(int(data.get("id", 0)))
 
+    def show_open_history(self) -> None:
+        """پس از ورود موفق، تاریخچهٔ باز بدون فیلتر پنهان‌کننده نمایش داده شود."""
+        self._page = 1
+        for combo, data in ((self.symbol_combo, "all"), (self.side_combo, "all"), (self.status_combo, "open")):
+            combo.blockSignals(True)
+            combo.setCurrentIndex(max(0, combo.findData(data)))
+            combo.blockSignals(False)
+        for widget, date in ((self.from_date, QDate.currentDate().addDays(-30)), (self.to_date, QDate.currentDate())):
+            widget.blockSignals(True)
+            widget.setDate(date)
+            widget.blockSignals(False)
+        self.tabs.setCurrentIndex(1)
+
+    def _on_history_cell_clicked(self, row: int, column: int) -> None:
+        if column == 1:
+            self._on_row_activated(row, column)
+
     def _on_row_activated(self, row: int, _column: int) -> None:
-        """دوبار کلیک روی معاملهٔ باز آن را می‌بندد."""
+        """کلیک نماد/دوبار کلیک ردیف، مودال جزئیات؛ نه خروج ناخواسته."""
         data = self.trade_row(row)
-        if data and str(data.get("status")) == "open":
-            self.close_requested.emit(int(data.get("id", 0)))
+        if not data:
+            return
+        from ui.dialogs.trading_dialogs import PositionDetailDialog
+        dialog = PositionDetailDialog(self.tr_, dict(data), self)
+        dialog.close_trade_requested.connect(self.close_requested.emit)
+        dialog.exec()
 
     @staticmethod
     def _cell(text: str) -> QTableWidgetItem:
@@ -2333,6 +2501,7 @@ __all__ = [
     "AUTO_ENGINE_MODES",
     "AUTO_TIMEFRAMES",
     "DASHBOARD_CELLS",
+    "HISTORY_COLUMNS",
     "INFO_CARDS",
     "OPPORTUNITY_COLUMNS",
     "PAGE_SIZE",

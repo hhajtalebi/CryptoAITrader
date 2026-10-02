@@ -7,8 +7,15 @@
 
 from __future__ import annotations
 
+import os as _os_qt
 import random
 from pathlib import Path
+
+# نسخهٔ ۲.۵.۳: آزمون‌ها همیشه بی‌پنجره اجرا شوند (پیش از هر import از Qt).
+# بدون این، اجرای آزمون‌ها روی ویندوز — از جمله داخل ربات ساخت — صدها
+# پنجرهٔ واقعی از بخش‌های مختلف برنامه باز می‌کرد. با QT_QPA_PLATFORM
+# صریح (مثلاً windows) می‌توان عمداً پنجره‌ها را دید.
+_os_qt.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 
@@ -227,3 +234,10 @@ def destroy_window(window, app=None) -> None:
     if target is not None:
         target.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         target.processEvents()
+
+
+# نسخهٔ ۲.۴.۲: آزمون‌ها استخر فرایند محاسبه را بالا نمی‌آورند (سرعت و
+# پایداری)؛ آزمون‌های مخصوص استخر آن را مستقیم می‌سازند.
+import os as _os  # noqa: E402
+
+_os.environ.setdefault("CRYPTOAI_NO_PROCESS_POOL", "1")

@@ -18,9 +18,11 @@ import hashlib
 import hmac
 import random
 import string
+import asyncio
 import time
 from typing import Any
 
+import anyio
 import httpx
 
 from app.exceptions import (
@@ -36,12 +38,93 @@ from market.providers.lbank.constants import (
     LBANK_CONTRACT_URL,
     LBANK_ERROR_MESSAGES,
     LBANK_REST_URL,
+    LBANK_REST_URLS,
+    RATE_LIMIT_ERROR_CODES,
+    RATE_LIMIT_RETRY_AFTER,
+    REGION_BLOCKED_ERROR_CODES,
     RETRYABLE_ERROR_CODES,
 )
-from app.exceptions.errors import TransientExchangeError
+from app.exceptions.errors import AccessBlockedError, TransientExchangeError
 from market.rate_limiter import AsyncRateLimiter, retry_async
 
 logger = get_logger(__name__)
+
+
+#: کدهای خطای API قرارداد (مستندات رسمی contract.html) — با کدهای اسپات فرق دارند
+CONTRACT_RATE_LIMIT_ERROR_CODES = frozenset({10012, 183})
+CONTRACT_AUTH_ERROR_CODES = frozenset({10003, 10007, 10008, 10009, 10010, 176, 177})
+CONTRACT_RETRYABLE_ERROR_CODES = frozenset({10004})
+
+
+# v2.5.1: سرآیندهای معمول مرورگر برای دامنهٔ پشت Cloudflare (قرارداد)
+BROWSER_HEADERS: dict[str, str] = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+# کدهای رایج صفحهٔ خطای Cloudflare و معنی کوتاه‌شان
+CLOUDFLARE_REASONS: dict[str, str] = {
+    "1006": "your IP address is banned",
+    "1007": "your IP address is banned",
+    "1008": "your IP address is banned",
+    "1009": "access from your country/region is blocked",
+    "1010": "browser signature blocked",
+    "1012": "access denied",
+    "1020": "access denied by firewall rule",
+}
+
+
+def _cloudflare_code(body: str) -> str:
+    """کد چهاررقمی خطای Cloudflare از متن/HTML صفحهٔ رد درخواست."""
+    import re
+
+    for pattern in (r"error code:?\s*(1\d{3})", r"Error\s*(1\d{3})", r"cf-error-code[^0-9]{0,20}(1\d{3})"):
+        match = re.search(pattern, body or "", flags=re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return ""
+
+
+REST_PAUSE_MIN = 5.0
+REST_PAUSE_MAX = 30.0
+
+
+class RestPausedError(NetworkError):
+    """REST موقتاً متوقف است چون همهٔ دامنه‌ها در دسترس نبودند (بدون تلاش مجدد)."""
+
+
+def system_proxy() -> str:
+    """پراکسی سیستم که httpx با trust_env به کار می‌برد ('' اگر نیست)."""
+    try:
+        import urllib.request  # noqa: PLC0415
+
+        proxies = urllib.request.getproxies()
+    except Exception:  # noqa: BLE001
+        return ""
+    return str(proxies.get("https") or proxies.get("all") or proxies.get("http") or "")
+
+
+def describe_connect_error(exc: BaseException) -> str:
+    """
+    علت واقعی خطای اتصال، کوتاه و خوانا.
+
+    httpx خطای TLS، DNS، پراکسی و ردشدن اتصال را همه زیر «ConnectError»
+    می‌گذارد؛ بدون متن خطا تشخیص علت (فیلتر، VPN، گواهی) ممکن نیست.
+    """
+    parts: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen and len(parts) < 3:
+        seen.add(id(current))
+        text = str(current).strip()
+        name = current.__class__.__name__
+        parts.append(f"{name}: {text}" if text and text not in " ".join(parts) else name)
+        current = current.__cause__ or current.__context__
+    return " <- ".join(parts)[:240]
 
 
 class LBankRestClient:
@@ -63,6 +146,23 @@ class LBankRestClient:
         rate_limit_per_second: float = 8.0,
     ) -> None:
         self._base_url = base_url.rstrip("/")
+        # دامنه‌های جایگزین فقط وقتی به کار می‌آیند که نشانی پیش‌فرض استفاده شده
+        # باشد؛ نشانی سفارشی کاربر هرگز بی‌اجازه عوض نمی‌شود.
+        if self._base_url == LBANK_REST_URL.rstrip("/"):
+            self._base_urls: tuple[str, ...] = tuple(u.rstrip("/") for u in LBANK_REST_URLS)
+        else:
+            self._base_urls = (self._base_url,)
+        self._base_index = 0
+        # نسخهٔ ۲.۷.۰: مدار قطع. وقتی همهٔ دامنه‌ها پشت سر هم شکست بخورند،
+        # (۱) اگر پراکسی سیستم تنظیم است، حالت دیگر (مستقیم/پراکسی) امتحان
+        # می‌شود؛ (۲) اگر هر دو حالت شکست خورد، REST چند ثانیه مکث می‌کند به‌جای
+        # صدها تلاش بی‌ثمر در ثانیه (لاگ پر از ConnectError، بار بی‌دلیل).
+        self._trust_env = True
+        self._cycle_failures = 0
+        self._mode_toggled = False
+        self._paused_until = 0.0
+        self._pause_seconds = REST_PAUSE_MIN
+        self._last_connect_error = ""
         self._api_key = api_key or ""
         self._api_secret = api_secret or ""
         self._timeout = timeout
@@ -71,6 +171,9 @@ class LBankRestClient:
         self._client: httpx.AsyncClient | None = None
         # کلاینت دامنهٔ قراردادها؛ جداست چون base_url متفاوتی دارد
         self._contract_http: httpx.AsyncClient | None = None
+        # نسخهٔ ۲.۶.۲: کلاینت‌های کنارگذاشته پس از تعویض دامنه. فوراً بسته
+        # نمی‌شوند چون درخواست‌های هم‌زمانِ دیگر هنوز رویشان در راه‌اند.
+        self._retired: list[httpx.AsyncClient] = []
 
     # ------------------------------------------------------------------
     # چرخه عمر
@@ -82,9 +185,11 @@ class LBankRestClient:
                 base_url=self._base_url,
                 timeout=httpx.Timeout(self._timeout),
                 headers={"User-Agent": "CryptoAITrader/1.0", "Accept": "application/json"},
-                limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+                limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+                trust_env=self._trust_env,
             )
-            logger.debug("LBank REST client opened for %s", self._base_url)
+            logger.debug("LBank REST client opened for %s (system proxy: %s)",
+                         self._base_url, "on" if self._trust_env else "off")
 
     async def close(self) -> None:
         """بستن کلاینت HTTP و آزادسازی اتصال‌ها."""
@@ -92,6 +197,15 @@ class LBankRestClient:
             await self._client.aclose()
             logger.debug("LBank REST client closed")
         self._client = None
+        for task in list(getattr(self, "_close_tasks", ()) or ()):
+            task.cancel()
+        retired, self._retired = self._retired, []
+        for old in retired:
+            if not old.is_closed:
+                try:
+                    await old.aclose()
+                except Exception:  # noqa: BLE001
+                    pass
         if self._contract_http is not None and not self._contract_http.is_closed:
             await self._contract_http.aclose()
         self._contract_http = None
@@ -125,15 +239,34 @@ class LBankRestClient:
         """
 
         async def _do_request() -> Any:
+            remaining = self._paused_until - time.monotonic()
+            if remaining > 0:
+                raise RestPausedError(
+                    f"LBank REST paused for {remaining:.0f}s (all hosts unreachable): {endpoint}"
+                )
             await self._rate_limiter.acquire()
             await self.open()
-            assert self._client is not None
+            client, host = self._client, self._base_url
+            assert client is not None
             try:
-                response = await self._client.get(endpoint, params=params or {})
+                response = await client.get(endpoint, params=params or {})
+            except httpx.ConnectTimeout as exc:
+                await self._rotate_base_url(exc, failed_host=host)
+                raise TimeoutErrorApp(f"Connect timed out: {endpoint}") from exc
             except httpx.TimeoutException as exc:
                 raise TimeoutErrorApp(f"Request timed out: {endpoint}") from exc
+            except httpx.ConnectError as exc:
+                await self._rotate_base_url(exc, failed_host=host)
+                raise NetworkError(f"Could not connect while calling {endpoint}") from exc
             except httpx.HTTPError as exc:
                 raise NetworkError(f"Network error while calling {endpoint}") from exc
+            except (anyio.ClosedResourceError, anyio.BrokenResourceError, RuntimeError) as exc:
+                # کلاینت زیر پای درخواست بسته شد؛ خطای گذرای شبکه است و
+                # دامنه را عوض نمی‌کند (نسخهٔ ۲.۶.۲).
+                if isinstance(exc, RuntimeError) and "closed" not in str(exc).lower():
+                    raise
+                raise NetworkError(f"Connection closed while calling {endpoint}") from exc
+            self._mark_reachable()
             return self._handle_response(response, endpoint)
 
         return await retry_async(
@@ -141,7 +274,104 @@ class LBankRestClient:
             max_attempts=self._max_retries,
             retry_on=(NetworkError, TransientExchangeError),
             operation_name=f"GET {endpoint}",
+            no_retry_on=(RateLimitError, AccessBlockedError, RestPausedError),
         )
+
+    def _mark_reachable(self) -> None:
+        """پاسخ گرفتیم (حتی خطای HTTP): شبکه برقرار است؛ شمارنده‌های قطعی صفر."""
+        if self._cycle_failures or self._mode_toggled or self._pause_seconds != REST_PAUSE_MIN:
+            if self._mode_toggled:
+                logger.info("LBank REST reachable again via %s (system proxy: %s)",
+                            self._base_url, "on" if self._trust_env else "off")
+            self._cycle_failures = 0
+            self._mode_toggled = False
+            self._pause_seconds = REST_PAUSE_MIN
+
+    @property
+    def paused(self) -> bool:
+        return self._paused_until > time.monotonic()
+
+    @property
+    def base_url(self) -> str:
+        """دامنهٔ REST فعلی (برای عیب‌یابی)."""
+        return self._base_url
+
+    async def _rotate_base_url(self, exc: BaseException, *, failed_host: str | None = None) -> None:
+        """
+        رفتن به دامنهٔ REST بعدی پس از خطای اتصال (DNS/TCP/TLS).
+
+        اگر یک دامنه در شبکهٔ کاربر فیلتر یا از دسترس خارج باشد، تلاش بعدی
+        با دامنهٔ جایگزین انجام می‌شود. خطای HTTP یا محدودیت نرخ دامنه را
+        عوض نمی‌کند، چون سرور در دسترس بوده است.
+        """
+        if len(self._base_urls) < 2:
+            return
+        if failed_host is not None and failed_host != self._base_url:
+            # نسخهٔ ۲.۶.۲: درخواست‌های هم‌زمانی که روی دامنهٔ قبلی شکست
+            # خورده‌اند، دامنهٔ تازه‌انتخاب‌شده را دوباره عوض نکنند. قبلاً
+            # N خطای هم‌زمان N بار دامنه را می‌چرخاند و هر بار کلاینت مشترک
+            # را زیر پای بقیه می‌بست ← طوفان بی‌پایان ConnectError/ClosedResourceError.
+            return
+        previous = self._base_url
+        self._base_index = (self._base_index + 1) % len(self._base_urls)
+        self._base_url = self._base_urls[self._base_index]
+        client, self._client = self._client, None
+        if client is not None and not client.is_closed:
+            self._retire(client)
+        detail = describe_connect_error(exc)
+        self._last_connect_error = detail
+        self._cycle_failures += 1
+        logger.warning(
+            "LBank REST host %s unreachable (%s); switching to %s",
+            previous, detail, self._base_url,
+        )
+        if self._cycle_failures >= len(self._base_urls):
+            self._on_all_hosts_failed(detail)
+
+    def _on_all_hosts_failed(self, detail: str) -> None:
+        """همهٔ دامنه‌ها پشت سر هم شکست خوردند."""
+        self._cycle_failures = 0
+        proxy = system_proxy()
+        if proxy and not self._mode_toggled:
+            self._trust_env = not self._trust_env
+            self._mode_toggled = True
+            tried = "directly" if self._trust_env else f"via system proxy {proxy}"
+            now = f"via system proxy {proxy}" if self._trust_env else "directly (bypassing the system proxy)"
+            logger.warning("All LBank REST hosts failed %s (last: %s); retrying %s", tried, detail, now)
+            return
+        self._mode_toggled = False
+        if proxy:
+            self._trust_env = not self._trust_env  # دور بعد از حالت دیگر شروع کن
+        self._paused_until = time.monotonic() + self._pause_seconds
+        logger.error(
+            "All LBank REST hosts unreachable%s (last: %s); pausing REST for %.0fs — "
+            "check internet/VPN/proxy; stored candles are used meanwhile",
+            " with and without system proxy " + proxy if proxy else "",
+            detail, self._pause_seconds,
+        )
+        self._pause_seconds = min(self._pause_seconds * 2, REST_PAUSE_MAX)
+
+    def _retire(self, client: httpx.AsyncClient, delay: float = 30.0) -> None:
+        """بستن کلاینت قدیمی با تأخیر تا درخواست‌های در راهِ آن تمام شوند."""
+        self._retired.append(client)
+
+        async def _close_later() -> None:
+            await asyncio.sleep(delay)
+            if client in self._retired:
+                self._retired.remove(client)
+            if not client.is_closed:
+                try:
+                    await client.aclose()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        try:
+            task = asyncio.get_running_loop().create_task(_close_later())
+            self._close_tasks = getattr(self, "_close_tasks", set())
+            self._close_tasks.add(task)
+            task.add_done_callback(self._close_tasks.discard)
+        except RuntimeError:
+            pass  # بدون حلقه: در close() بسته می‌شود
 
     # ------------------------------------------------------------------
     # درخواست خصوصی (امضاشده)
@@ -164,37 +394,49 @@ class LBankRestClient:
                 "API credentials are not configured", details={"endpoint": endpoint}
             )
 
+        timestamp = str(int(time.time() * 1000))
+        echostr = self._random_echostr()
         payload: dict[str, Any] = dict(params or {})
         payload.update(
             {
                 "api_key": self._api_key,
                 "signature_method": "HmacSHA256",
-                "timestamp": str(int(time.time() * 1000)),
-                "echostr": self._random_echostr(),
+                "timestamp": timestamp,
+                "echostr": echostr,
             }
         )
         payload["sign"] = self._build_signature(payload)
+        # v2.5.1: مستند رسمی («Request Format») و کتابخانهٔ رسمی LBank
+        # (lbank-connector-python) سه مقدار timestamp/signature_method/echostr
+        # را در **سرآیند** می‌فرستند. قبلاً فقط در بدنه بودند و سرور امضا را
+        # با سرآیند خالی می‌سنجید — درخواست خصوصی (موجودی) شکست می‌خورد و
+        # کیف پول هیچ دارایی‌ای نشان نمی‌داد. هر دو جا فرستاده می‌شود.
+        headers = self.signed_headers(timestamp, echostr, content_type="application/x-www-form-urlencoded")
 
         async def _do_request() -> Any:
             await self._rate_limiter.acquire()
             await self.open()
-            assert self._client is not None
+            client = self._client
+            assert client is not None
             try:
-                response = await self._client.post(
+                response = await client.post(
                     endpoint,
                     data=payload,
-                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    headers=headers,
                 )
             except httpx.TimeoutException as exc:
                 raise TimeoutErrorApp(f"Signed request timed out: {endpoint}") from exc
             except httpx.HTTPError as exc:
                 raise NetworkError(f"Network error while calling {endpoint}") from exc
+            except (anyio.ClosedResourceError, anyio.BrokenResourceError) as exc:
+                raise NetworkError(f"Connection closed while calling {endpoint}") from exc
             return self._handle_response(response, endpoint)
 
         return await retry_async(
             _do_request,
             max_attempts=self._max_retries,
             retry_on=(NetworkError,),
+            no_retry_on=(RateLimitError, AccessBlockedError),
             operation_name=f"POST {endpoint}",
         )
 
@@ -229,12 +471,7 @@ class LBankRestClient:
         )
         payload["sign"] = self._build_signature(payload)
 
-        headers = {
-            "Content-Type": "application/json",
-            "timestamp": timestamp,
-            "signature_method": "HmacSHA256",
-            "echostr": echostr,
-        }
+        headers = self.signed_headers(timestamp, echostr, content_type="application/json")
 
         async def _do_request() -> Any:
             await self._rate_limiter.acquire()
@@ -245,12 +482,13 @@ class LBankRestClient:
                 raise TimeoutErrorApp(f"Contract request timed out: {endpoint}") from exc
             except httpx.HTTPError as exc:
                 raise NetworkError(f"Network error while calling {endpoint}") from exc
-            return self._handle_response(response, endpoint)
+            return self._handle_response(response, endpoint, contract=True)
 
         return await retry_async(
             _do_request,
             max_attempts=self._max_retries,
             retry_on=(NetworkError,),
+            no_retry_on=(RateLimitError, AccessBlockedError),
             operation_name=f"POST {endpoint}",
         )
 
@@ -260,9 +498,22 @@ class LBankRestClient:
             self._contract_http = httpx.AsyncClient(
                 base_url=LBANK_CONTRACT_URL,
                 timeout=self._timeout,
-                headers={"User-Agent": "CryptoAITrader/1.5"},
+                # v2.5.1: دامنهٔ قرارداد پشت Cloudflare است و «بررسی امضای مرورگر»
+                # آن عامل کاربر ناآشنا («CryptoAITrader/1.5») را با 403 (کد 1010)
+                # رد می‌کند؛ سرآیندهای معمول مرورگر فرستاده می‌شود.
+                headers=dict(BROWSER_HEADERS),
             )
         return self._contract_http
+
+    @staticmethod
+    def signed_headers(timestamp: str, echostr: str, *, content_type: str) -> dict[str, str]:
+        """سرآیندهای امضای LBank (اسپات و قرارداد، v2.5.1)."""
+        return {
+            "Content-Type": content_type,
+            "timestamp": str(timestamp),
+            "signature_method": "HmacSHA256",
+            "echostr": str(echostr),
+        }
 
     def _build_signature(self, payload: dict[str, Any]) -> str:
         """
@@ -290,21 +541,91 @@ class LBankRestClient:
     # ------------------------------------------------------------------
     # تفسیر پاسخ
     # ------------------------------------------------------------------
-    def _handle_response(self, response: httpx.Response, endpoint: str) -> Any:
+    @staticmethod
+    def _retry_after_seconds(response: httpx.Response) -> float | None:
+        """خواندن سرآیند Retry-After (ثانیه) در صورت وجود."""
+        raw = response.headers.get("Retry-After") if response.headers is not None else None
+        if not raw:
+            return None
+        try:
+            value = float(str(raw).strip())
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    @staticmethod
+    def _classify_forbidden(response: httpx.Response, endpoint: str) -> Exception | None:
+        """
+        تشخیص علت 401/403 (v2.5.1).
+
+        اگر بدنه JSON صرافی با کد خطا باشد ← None (مسیر عادی کدهای LBank).
+        صفحهٔ Cloudflare ← `AccessBlockedError` با کد و معنی (1015 ← محدودیت نرخ).
+        هیچ کلید یا امضایی در متن خطا نمی‌آید؛ فقط کد، معنی و Ray ID.
+        """
+        status = response.status_code
+        try:
+            body = response.text or ""
+        except Exception:  # noqa: BLE001 - بدنهٔ خراب فقط یعنی تشخیص کمتر
+            body = ""
+        try:
+            payload = response.json()
+        except Exception:  # noqa: BLE001
+            payload = None
+        if isinstance(payload, dict) and any(
+            key in payload for key in ("error_code", "result", "success", "msg")
+        ):
+            return None
+        headers = getattr(response, "headers", {}) or {}
+        server = str(headers.get("server", "") or "").lower()
+        ray = str(headers.get("cf-ray", "") or "")
+        cloudflare = "cloudflare" in server or bool(ray) or "cloudflare" in body.lower()
+        code = _cloudflare_code(body) if cloudflare else ""
+        if code == "1015":
+            return RateLimitError(
+                "LBank rate limit exceeded (Cloudflare 1015)",
+                details={"endpoint": endpoint, "status": status, "cf_code": code},
+            )
+        reason = CLOUDFLARE_REASONS.get(code, "") if code else ""
+        if cloudflare:
+            label = f"Cloudflare {code}" if code else "Cloudflare"
+            text = f"HTTP {status} blocked by {label}" + (f" — {reason}" if reason else "")
+        else:
+            reason = "access forbidden (IP whitelist / region / firewall)"
+            text = f"HTTP {status} — {reason}"
+        details: dict[str, Any] = {"endpoint": endpoint, "status": status,
+                                   "cloudflare": cloudflare, "cf_code": code, "reason": reason}
+        if ray:
+            details["cf_ray"] = ray[:40]
+        return AccessBlockedError(f"{text} while calling {endpoint}", details=details)
+
+    def _handle_response(
+        self, response: httpx.Response, endpoint: str, *, contract: bool = False
+    ) -> Any:
         """
         بررسی پوشش پاسخ LBank و استخراج بخش data.
 
         قالب پاسخ:
             {"result": "true"|true, "data": ..., "error_code": 0, "msg": "Success"}
         """
-        if response.status_code == 429:
-            raise RateLimitError("LBank rate limit exceeded", details={"endpoint": endpoint})
+        if response.status_code in (429, 418):
+            # 418 یعنی IP موقتاً مسدود شده؛ هر دو باید مکث سراسری بسازند و
+            # هرگز فوراً تکرار نشوند.
+            details: dict[str, Any] = {"endpoint": endpoint, "status": response.status_code}
+            retry_after = self._retry_after_seconds(response)
+            if retry_after is not None:
+                details["retry_after"] = retry_after
+            raise RateLimitError("LBank rate limit exceeded", details=details)
         if response.status_code >= 500:
             raise ExchangeError(
                 f"LBank server error ({response.status_code})",
                 details={"endpoint": endpoint, "status": response.status_code},
             )
-        if response.status_code >= 400:
+        if response.status_code in (401, 403):
+            blocked = self._classify_forbidden(response, endpoint)
+            if blocked is not None:
+                raise blocked
+            # بدنهٔ JSON صرافی (مثلاً کد خطای کلید) — همان مسیر عادی پایین
+        elif response.status_code >= 400:
             raise NetworkError(
                 f"HTTP {response.status_code} while calling {endpoint}",
                 details={"status": response.status_code},
@@ -321,14 +642,46 @@ class LBankRestClient:
 
         result = payload.get("result")
         is_success = result in (True, "true", "True")
-        error_code = int(payload.get("error_code") or 0)
+        try:
+            error_code = int(payload.get("error_code") or 0)
+        except (TypeError, ValueError):
+            error_code = -1
 
         if is_success and error_code == 0:
             return payload.get("data")
 
+        if contract:
+            # v2.5.0: پاسخ API قراردادها `{"data":…,"error_code":0,"msg":"",
+            # "result":"","success":true}` است — `result` رشتهٔ خالی است و
+            # موفقیت در `success` می‌آید. قبلاً همین پاسخ موفق «LBank error 0»
+            # حساب می‌شد و موجودی فیوچرز همیشه خالی نمایش داده می‌شد.
+            success = payload.get("success")
+            if error_code == 0 and (
+                success in (True, "true", "True") or (success is None and result in ("", None))
+            ):
+                return payload.get("data")
+            if error_code in CONTRACT_RATE_LIMIT_ERROR_CODES:
+                details = {"endpoint": endpoint, "error_code": error_code,
+                           "message": str(payload.get("msg") or "too frequent"),
+                           "retry_after": RATE_LIMIT_RETRY_AFTER}
+                raise RateLimitError("LBank contract rate limit", details=details)
+            if error_code in CONTRACT_AUTH_ERROR_CODES:
+                details = {"endpoint": endpoint, "error_code": error_code,
+                           "message": str(payload.get("msg") or "auth")}
+                raise AuthenticationError("LBank contract authentication failed", details=details)
+            if error_code in CONTRACT_RETRYABLE_ERROR_CODES:
+                details = {"endpoint": endpoint, "error_code": error_code,
+                           "message": str(payload.get("msg") or "timeout")}
+                raise TransientExchangeError("LBank contract transient error", details=details)
+
         message = LBANK_ERROR_MESSAGES.get(error_code, str(payload.get("msg", "Unknown error")))
         details = {"endpoint": endpoint, "error_code": error_code, "message": message}
 
+        if error_code in RATE_LIMIT_ERROR_CODES:
+            details["retry_after"] = RATE_LIMIT_RETRY_AFTER
+            raise RateLimitError(f"LBank rate limit: {message}", details=details)
+        if error_code in REGION_BLOCKED_ERROR_CODES:
+            raise ExchangeError(f"LBank unavailable in this region: {message}", details=details)
         if error_code in AUTH_ERROR_CODES:
             raise AuthenticationError(f"LBank authentication failed: {message}", details=details)
         if error_code in RETRYABLE_ERROR_CODES:

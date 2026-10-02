@@ -17,12 +17,18 @@ from __future__ import annotations
 from typing import Any
 
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
+    QCheckBox,
     QFrame,
+    QLineEdit,
+    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QScrollArea,
     QStackedWidget,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -49,6 +55,82 @@ RANGE_KEYS = ("7d", "30d", "90d", "1y")
 #: شمار نقاط نمودار برای هر بازه — بازهٔ بلندتر، نقاط بیشتر
 RANGE_POINTS = {"7d": 7, "30d": 30, "90d": 45, "1y": 52}
 
+#: زبانه‌های کیف پول (v2.5.0 — خواستهٔ کاربر: نمای کلی | اسپات | فیوچرز)
+WALLET_TABS = ("overview", "spot", "futures")
+
+#: ستون‌های جدول اسپات
+SPOT_COLUMNS = ("asset", "free", "locked", "total", "price", "value", "share", "change")
+
+#: ستون‌های جدول فیوچرز
+FUTURES_COLUMNS = (
+    "asset", "equity", "wallet", "available", "margin", "frozen", "unrealized", "value",
+)
+
+#: خانه‌های نوار خلاصهٔ هر زبانه — ترتیب نمایش
+SPOT_METRICS = ("value", "available_usdt", "locked_value", "assets")
+FUTURES_METRICS = ("equity", "wallet", "available", "used_margin", "unrealized", "margin_ratio")
+PAPER_METRICS = ("balance", "equity", "available", "realized", "unrealized", "used_margin", "start")
+
+
+#: عدد درشت نوار خلاصه — QSS سراسری فونت QLabel را بازنویسی می‌کند
+_METRIC_STYLE = "font-size: 16px; font-weight: 700;"
+
+
+class MetricStrip(QFrame):
+    """
+    نوار فشردهٔ «برچسب / عدد» به سبک ترمینال صرافی (v2.5.0).
+
+    هر خانه یک برچسب کم‌رنگ و یک عدد درشت دارد؛ رنگ عدد می‌تواند سبز/قرمز
+    شود (برای سود/زیان). اعداد چپ‌به‌راست می‌مانند تا در چیدمان فارسی
+    علامت‌ها جابه‌جا نشوند.
+    """
+
+    def __init__(self, keys: tuple[str, ...], columns: int = 0, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        set_role(self, "card")
+        self._keys = tuple(keys)
+        grid = QGridLayout(self)
+        grid.setContentsMargins(16, 12, 16, 12)
+        grid.setHorizontalSpacing(22)
+        grid.setVerticalSpacing(4)
+        per_row = columns or len(self._keys)
+        self.labels: dict[str, QLabel] = {}
+        self.values: dict[str, QLabel] = {}
+        for index, key in enumerate(self._keys):
+            row, column = divmod(index, per_row)
+            label = QLabel("", self)
+            set_role(label, "muted")
+            value = QLabel("—", self)
+            set_role(value, "metric_small")
+            font = value.font()
+            font.setBold(True)
+            font.setPointSizeF(max(font.pointSizeF(), 9.0) * 1.25)
+            value.setFont(font)
+            value.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+            value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            value.setStyleSheet(_METRIC_STYLE)
+            grid.addWidget(label, row * 2, column)
+            grid.addWidget(value, row * 2 + 1, column)
+            self.labels[key] = label
+            self.values[key] = value
+        for column in range(per_row):
+            grid.setColumnStretch(column, 1)
+
+    def set_labels(self, labels: dict[str, str]) -> None:
+        for key, text in labels.items():
+            if key in self.labels:
+                self.labels[key].setText(text)
+
+    def set_values(self, values: dict[str, Any], colors: dict[str, str] | None = None) -> None:
+        for key, label in self.values.items():
+            label.setText(str(values.get(key, "—") or "—"))
+            color = (colors or {}).get(key, "")
+            label.setStyleSheet(_METRIC_STYLE + (f" color: {color};" if color else ""))
+
+    def value_text(self, key: str) -> str:
+        label = self.values.get(key)
+        return label.text() if label is not None else ""
+
 
 class WalletPage(BasePage):
     """دارایی‌ها و عملکرد حساب کاربر."""
@@ -64,9 +146,19 @@ class WalletPage(BasePage):
     range_changed = Signal(str)
     #: کاربر روی یک دارایی کلیک کرد (نماد)
     asset_activated = Signal(str)
+    #: کاربر «همگام‌سازی موجودی کاغذی با کیف پول» را زد (v2.5.0)
+    paper_sync_requested = Signal()
+    #: کلید «تازه‌سازی خودکار موجودی» (v2.5.1)
+    auto_sync_toggled = Signal(bool)
 
     def __init__(self, translator: Translator, parent: Any = None) -> None:
         self._assets: list[dict[str, Any]] = []
+        self._spot_rows: list[dict[str, Any]] = []
+        self._futures_rows: list[dict[str, Any]] = []
+        self._spot_all: list[dict[str, Any]] = []
+        self._spot_summary: dict[str, Any] = {}
+        self._report_lines: list[tuple[str, str]] = []
+        self._report_hint = ""
         self._theme: Any = None
         super().__init__(translator, parent)
 
@@ -87,6 +179,13 @@ class WalletPage(BasePage):
         set_role(self.sync_label, "faint")
         self.header.add_action(self.sync_label)
 
+        # v2.5.1: موجودی بدون فشار دکمه هر ۶۰ ثانیه از صرافی خوانده می‌شود
+        self.auto_sync_checkbox = QCheckBox(self.tr_.tr("wallet.auto_sync"))
+        self.auto_sync_checkbox.setChecked(True)
+        self.auto_sync_checkbox.setToolTip(self.tr_.tr("wallet.auto_sync_tip"))
+        self.auto_sync_checkbox.toggled.connect(self.auto_sync_toggled)
+        self.header.add_action(self.auto_sync_checkbox)
+
         # پشتهٔ محتوا: حالت عادی یا حالت «حساب متصل نیست»
         self.stack = QStackedWidget(self)
         self.layout_root().addWidget(self.stack, 1)
@@ -94,12 +193,105 @@ class WalletPage(BasePage):
         self.stack.addWidget(self._build_content())
         self.stack.addWidget(self._build_empty())
         self.stack.setCurrentIndex(1)
+        self._retranslate_headers()
 
     def _build_content(self) -> QWidget:
-        """نمای اصلی صفحه."""
+        """
+        نمای اصلی: سه زبانه — نمای کلی | اسپات | فیوچرز (v2.5.0).
+
+        زبانهٔ «نمای کلی» همان چیدمان قبلی است به‌علاوهٔ پنل حساب کاغذی؛
+        اسپات و فیوچرز هر کدام نوار خلاصه و جدول جزئیات خودشان را دارند.
+        """
+        holder = QWidget(self)
+        holder_layout = QVBoxLayout(holder)
+        holder_layout.setContentsMargins(0, 0, 0, 0)
+        holder_layout.setSpacing(8)
+        holder_layout.addWidget(self._build_status_panel())
+
+        self.tabs = QTabWidget(self)
+        self.tabs.setDocumentMode(True)
+        # هر زبانه درون ناحیهٔ پیمایش است تا در نمایشگر لپ‌تاپ فشرده نشود
+        self.tabs.addTab(self._scrollable(self._build_overview()), "")
+        self.tabs.addTab(self._scrollable(self._build_spot_tab()), "")
+        self.tabs.addTab(self._scrollable(self._build_futures_tab()), "")
+        self._retranslate_tabs()
+        holder_layout.addWidget(self.tabs, 1)
+        return holder
+
+    def _build_status_panel(self) -> QWidget:
+        """
+        نوار وضعیت همگام‌سازی (v2.5.1).
+
+        برای هر بخش (اسپات/فیوچرز) یک سطر ✓/✗ با تعداد دارایی یا علت دقیق
+        شکست و یک راهنمای رفع مشکل. قبلاً خطا فقط یک لحظه در نوار وضعیت
+        پایین می‌آمد و کاربر فقط «کیف پول خالی» می‌دید.
+        """
+        self.status_panel = QFrame(self)
+        set_role(self.status_panel, "card")
+        layout = QVBoxLayout(self.status_panel)
+        layout.setContentsMargins(14, 8, 14, 8)
+        layout.setSpacing(2)
+        self.status_lines = QLabel("")
+        self.status_lines.setWordWrap(True)
+        self.status_lines.setTextFormat(Qt.TextFormat.RichText)
+        self.status_lines.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.status_hint = QLabel("")
+        self.status_hint.setWordWrap(True)
+        set_role(self.status_hint, "faint")
+        layout.addWidget(self.status_lines)
+        layout.addWidget(self.status_hint)
+        self.status_panel.setVisible(False)
+        return self.status_panel
+
+    def set_sync_report(self, lines: list[tuple[str, str]], hint: str = "") -> None:
+        """
+        نمایش گزارش همگام‌سازی.
+
+        `lines`: فهرست (سطح، متن) با سطح `ok` | `warn` | `error`.
+        """
+        self._report_lines = [(str(level), str(text)) for level, text in (lines or [])]
+        self._report_hint = str(hint or "")
+        self._render_report()
+
+    def report_text(self) -> str:
+        """متن ساده گزارش (برای آزمون و کپی)."""
+        return "\n".join(text for _level, text in self._report_lines)
+
+    def _render_report(self) -> None:
+        import html as _html
+
+        colors = self._theme.colors if self._theme is not None else None
+        palette = {
+            "ok": getattr(colors, "success", "#26d07c"),
+            "warn": getattr(colors, "warning", "#f5a524"),
+            "error": getattr(colors, "danger", "#ff5c5c"),
+        }
+        icons = {"ok": "✓", "warn": "!", "error": "✗"}
+        parts = [
+            f'<span style="color:{palette.get(level, palette["warn"])}; font-weight:700">'
+            f'{icons.get(level, "•")}</span>&nbsp;{_html.escape(text)}'
+            for level, text in self._report_lines
+        ]
+        self.status_lines.setText("<br>".join(parts))
+        self.status_hint.setText(self._report_hint)
+        self.status_hint.setVisible(bool(self._report_hint))
+        self.status_panel.setVisible(bool(parts or self._report_hint))
+
+    @staticmethod
+    def _scrollable(content: QWidget) -> QWidget:
+        """پیچیدن محتوای یک زبانه در QScrollArea بی‌قاب."""
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        area.setFrameShape(QFrame.Shape.NoFrame)
+        area.setWidget(content)
+        content.setMinimumHeight(max(content.minimumSizeHint().height(), 560))
+        return area
+
+    def _build_overview(self) -> QWidget:
+        """زبانهٔ نمای کلی."""
         page = QWidget(self)
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setContentsMargins(0, 8, 0, 0)
         layout.setSpacing(12)
 
         # --- کارت‌های آمار ---
@@ -108,9 +300,33 @@ class WalletPage(BasePage):
         self.total_card = StatCard(icon="◎")
         self.available_card = StatCard(icon="◍")
         self.pnl_card = StatCard(icon="◈")
-        for card in (self.total_card, self.available_card, self.pnl_card):
+        self.paper_card = StatCard(icon="◇")
+        for card in (self.total_card, self.available_card, self.pnl_card, self.paper_card):
             cards.addWidget(card)
         layout.addLayout(cards)
+
+        # --- پنل حساب کاغذی (موجودی جعلی = کیف پول واقعی) ---
+        paper = QFrame(page)
+        set_role(paper, "card")
+        paper_layout = QVBoxLayout(paper)
+        paper_layout.setContentsMargins(16, 12, 16, 12)
+        paper_layout.setSpacing(8)
+        paper_header = QHBoxLayout()
+        self.paper_title = QLabel("")
+        set_role(self.paper_title, "section")
+        self.paper_source_label = QLabel("")
+        set_role(self.paper_source_label, "faint")
+        self.paper_source_label.setWordWrap(True)
+        self.paper_sync_button = make_button("")
+        self.paper_sync_button.clicked.connect(self.paper_sync_requested)
+        paper_header.addWidget(self.paper_title)
+        paper_header.addWidget(self.paper_source_label, 1)
+        paper_header.addWidget(self.paper_sync_button)
+        paper_layout.addLayout(paper_header)
+        self.paper_strip = MetricStrip(PAPER_METRICS, parent=paper)
+        self.paper_strip.setProperty("role", "")
+        paper_layout.addWidget(self.paper_strip)
+        layout.addWidget(paper)
 
         # --- نمودار رشد + دونات سهم دارایی ---
         charts = QHBoxLayout()
@@ -173,7 +389,75 @@ class WalletPage(BasePage):
         assets_layout.addWidget(self.assets_table)
         layout.addWidget(assets, 1)
 
-        self._retranslate_headers()
+        return page
+
+    def _build_spot_tab(self) -> QWidget:
+        """زبانهٔ اسپات: خلاصه + جدول آزاد/قفل/کل/ارزش."""
+        page = QWidget(self)
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 8, 0, 0)
+        layout.setSpacing(12)
+        self.spot_strip = MetricStrip(SPOT_METRICS, parent=page)
+        layout.addWidget(self.spot_strip)
+
+        card = QFrame(page)
+        set_role(card, "card")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(16, 14, 16, 14)
+        card_layout.setSpacing(8)
+        self.spot_title = QLabel("")
+        set_role(self.spot_title, "section")
+        spot_head = QHBoxLayout()
+        spot_head.addWidget(self.spot_title)
+        spot_head.addStretch(1)
+        # v2.5.1: جست‌وجوی دارایی و پنهان‌کردن موجودی‌های خُرد (مثل صرافی‌ها)
+        self.spot_search = QLineEdit()
+        self.spot_search.setClearButtonEnabled(True)
+        self.spot_search.setMaximumWidth(220)
+        self.spot_search.textChanged.connect(lambda _t: self._apply_spot_filter())
+        self.hide_small_checkbox = QCheckBox("")
+        self.hide_small_checkbox.toggled.connect(lambda _c: self._apply_spot_filter())
+        spot_head.addWidget(self.spot_search)
+        spot_head.addWidget(self.hide_small_checkbox)
+        card_layout.addLayout(spot_head)
+        self.spot_table = QTableWidget(0, len(SPOT_COLUMNS), card)
+        configure_table(self.spot_table, stretch_column=0)
+        self.spot_table.cellClicked.connect(lambda row, _c: self._emit_row_asset(self._spot_rows, row))
+        card_layout.addWidget(self.spot_table)
+        self.spot_empty = QLabel("")
+        set_role(self.spot_empty, "faint")
+        self.spot_empty.setWordWrap(True)
+        self.spot_empty.setVisible(False)
+        card_layout.addWidget(self.spot_empty)
+        layout.addWidget(card, 1)
+        return page
+
+    def _build_futures_tab(self) -> QWidget:
+        """زبانهٔ فیوچرز: equity/مارجین/سود شناور + جدول هر دارایی."""
+        page = QWidget(self)
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 8, 0, 0)
+        layout.setSpacing(12)
+        self.futures_strip = MetricStrip(FUTURES_METRICS, parent=page)
+        layout.addWidget(self.futures_strip)
+
+        card = QFrame(page)
+        set_role(card, "card")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(16, 14, 16, 14)
+        card_layout.setSpacing(8)
+        self.futures_title = QLabel("")
+        set_role(self.futures_title, "section")
+        card_layout.addWidget(self.futures_title)
+        self.futures_table = QTableWidget(0, len(FUTURES_COLUMNS), card)
+        configure_table(self.futures_table, stretch_column=0)
+        card_layout.addWidget(self.futures_table)
+        self.futures_note = QLabel("")
+        set_role(self.futures_note, "faint")
+        self.futures_note.setWordWrap(True)
+        self.futures_note.setVisible(False)
+        card_layout.addWidget(self.futures_note)
+        layout.addWidget(card, 1)
         return page
 
     def _build_empty(self) -> QWidget:
@@ -296,6 +580,89 @@ class WalletPage(BasePage):
         self.share_chart.set_segments(segments, center_label=str(len(self._assets)))
         self._render_legend(segments)
 
+    def set_paper(self, values: dict[str, Any], *, source_text: str = "",
+                  colors: dict[str, str] | None = None, card_value: str = "",
+                  card_caption: str = "") -> None:
+        """پنل حساب کاغذی (v2.5.0) و کارت چهارم نمای کلی."""
+        self.paper_strip.set_values(values, colors)
+        self.paper_source_label.setText(source_text)
+        self.paper_card.set_data(
+            title=self.tr_.tr("wallet.paper.card_title"),
+            value=card_value or str(values.get("equity", "—")),
+            caption=card_caption,
+        )
+
+    def set_spot(self, rows: list[dict[str, Any]], summary: dict[str, Any]) -> None:
+        """
+        زبانهٔ اسپات.
+
+        هر ردیف: `asset` و متن‌های `free_text, locked_text, total_text,
+        price_text, value_text, share_text, change_text` (+ `change` عددی).
+        """
+        self._spot_all = list(rows or [])
+        self._spot_summary = dict(summary or {})
+        self.spot_strip.set_values(summary)
+        self._apply_spot_filter()
+
+    #: آستانهٔ «موجودی خُرد» به تتر
+    SMALL_BALANCE_USDT = 1.0
+
+    def _apply_spot_filter(self) -> None:
+        """فیلتر جست‌وجو و موجودی خُرد روی جدول اسپات (v2.5.1)."""
+        needle = self.spot_search.text().strip().upper()
+        hide_small = self.hide_small_checkbox.isChecked()
+        rows = []
+        for row in self._spot_all:
+            if needle and needle not in str(row.get("asset", "")).upper():
+                continue
+            value = row.get("value")
+            if hide_small and isinstance(value, (int, float)) and value < self.SMALL_BALANCE_USDT:
+                continue
+            rows.append(row)
+        self._spot_rows = rows
+        self._fill_table(self.spot_table, SPOT_COLUMNS, self._spot_rows)
+        self.spot_empty.setText(self.tr_.tr("wallet.spot_tab.empty"))
+        self.spot_empty.setVisible(not self._spot_all)
+
+    def set_futures(self, rows: list[dict[str, Any]], summary: dict[str, Any],
+                    *, note: str = "", colors: dict[str, str] | None = None) -> None:
+        """
+        زبانهٔ فیوچرز.
+
+        هر ردیف: `asset` و متن‌های `equity_text, wallet_text, available_text,
+        margin_text, frozen_text, unrealized_text, value_text` (+ `unrealized`).
+        """
+        self._futures_rows = list(rows or [])
+        self.futures_strip.set_values(summary, colors)
+        self._fill_table(self.futures_table, FUTURES_COLUMNS, self._futures_rows)
+        self.futures_note.setText(note)
+        self.futures_note.setVisible(bool(note))
+
+    def _fill_table(self, table: QTableWidget, columns: tuple[str, ...],
+                    rows: list[dict[str, Any]]) -> None:
+        """پرکردن یک جدول جزئیات با رنگ سبز/قرمز برای ستون‌های تغییر/سود."""
+        table.setSortingEnabled(False)
+        table.setRowCount(len(rows))
+        colors = self._theme.colors if self._theme is not None else None
+        for row_index, row in enumerate(rows):
+            for column, name in enumerate(columns):
+                if name == "asset":
+                    item = QTableWidgetItem(str(row.get("asset", "")))
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
+                else:
+                    item = self._cell(row.get(f"{name}_text", "—") or "—")
+                    signed = row.get(name) if name in ("change", "unrealized") else None
+                    if colors is not None and isinstance(signed, (int, float)) and signed != 0:
+                        item.setForeground(QColor(colors.success if signed > 0 else colors.danger))
+                table.setItem(row_index, column, item)
+
+    def _emit_row_asset(self, rows: list[dict[str, Any]], index: int) -> None:
+        if 0 <= index < len(rows):
+            self.asset_activated.emit(str(rows[index].get("asset", "")))
+
     def set_growth(self, values: list[float], labels: list[str] | None = None) -> None:
         """تنظیم منحنی رشد سرمایه."""
         self.growth_chart.set_series(values, labels=labels or [])
@@ -318,13 +685,19 @@ class WalletPage(BasePage):
     def apply_theme(self, theme: Any) -> None:
         """انتقال پوسته به اجزای نقاشی‌شده که QSS نمی‌گیرند."""
         self._theme = theme
-        for card in (self.total_card, self.available_card, self.pnl_card):
+        for card in (self.total_card, self.available_card, self.pnl_card, self.paper_card):
             card.apply_theme(theme)
         self.growth_chart.apply_theme(theme)
         self.share_chart.apply_theme(theme)
         # رنگ ستون تغییر با پوستهٔ تازه بازسازی می‌شود
         if self._assets:
             self.set_assets(self._assets)
+        if self._spot_rows:
+            self._fill_table(self.spot_table, SPOT_COLUMNS, self._spot_rows)
+        if self._futures_rows:
+            self._fill_table(self.futures_table, FUTURES_COLUMNS, self._futures_rows)
+        if self._report_lines:
+            self._render_report()
 
     def retranslate(self) -> None:
         """بازسازی متن‌ها پس از تغییر زبان."""
@@ -343,6 +716,7 @@ class WalletPage(BasePage):
             action=self.tr_.tr("wallet.connect_account"),
         )
         self._retranslate_headers()
+        self._retranslate_tabs()
 
     # ------------------------------------------------------------------
     # داخلی
@@ -359,6 +733,31 @@ class WalletPage(BasePage):
                 self.tr_.tr("wallet.wallet_type"),
             ]
         )
+        self.spot_table.setHorizontalHeaderLabels(
+            [self.tr_.tr(f"wallet.spot_tab.col_{name}") for name in SPOT_COLUMNS]
+        )
+        self.futures_table.setHorizontalHeaderLabels(
+            [self.tr_.tr(f"wallet.futures_tab.col_{name}") for name in FUTURES_COLUMNS]
+        )
+
+    def _retranslate_tabs(self) -> None:
+        """عنوان زبانه‌ها، نوارهای خلاصه و پنل کاغذی."""
+        for index, key in enumerate(WALLET_TABS):
+            self.tabs.setTabText(index, self.tr_.tr(f"wallet.tabs.{key}"))
+        self.spot_strip.set_labels({k: self.tr_.tr(f"wallet.spot_tab.m_{k}") for k in SPOT_METRICS})
+        self.futures_strip.set_labels(
+            {k: self.tr_.tr(f"wallet.futures_tab.m_{k}") for k in FUTURES_METRICS}
+        )
+        self.paper_strip.set_labels({k: self.tr_.tr(f"wallet.paper.m_{k}") for k in PAPER_METRICS})
+        self.paper_title.setText(self.tr_.tr("wallet.paper.title"))
+        self.paper_sync_button.setText(self.tr_.tr("wallet.paper.sync"))
+        self.paper_sync_button.setToolTip(self.tr_.tr("wallet.paper.sync_tip"))
+        self.spot_title.setText(self.tr_.tr("wallet.spot_tab.title"))
+        self.spot_search.setPlaceholderText(self.tr_.tr("wallet.spot_tab.search"))
+        self.hide_small_checkbox.setText(self.tr_.tr("wallet.spot_tab.hide_small"))
+        self.auto_sync_checkbox.setText(self.tr_.tr("wallet.auto_sync"))
+        self.auto_sync_checkbox.setToolTip(self.tr_.tr("wallet.auto_sync_tip"))
+        self.futures_title.setText(self.tr_.tr("wallet.futures_tab.title"))
 
     def _render_legend(self, segments: list[tuple[str, float, str]]) -> None:
         """ساخت راهنمای رنگ دونات."""
@@ -402,4 +801,11 @@ class WalletPage(BasePage):
             self.asset_activated.emit(str(data.get("asset", "")))
 
 
-__all__ = ["RANGE_KEYS", "WalletPage"]
+__all__ = [
+    "FUTURES_COLUMNS",
+    "MetricStrip",
+    "RANGE_KEYS",
+    "SPOT_COLUMNS",
+    "WALLET_TABS",
+    "WalletPage",
+]

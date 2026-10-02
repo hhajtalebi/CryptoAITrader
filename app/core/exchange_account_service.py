@@ -271,21 +271,34 @@ class ExchangeAccountService:
             provider = provider_factory(
                 account["exchange"], creds["api_key"], creds["api_secret"]
             )
-            balances = await provider.get_account_balance()
+            # v2.5.1: شکست اسپات دیگر کل همگام‌سازی را نمی‌برد؛ اگر فیوچرز
+            # جواب بدهد همان نمایش داده می‌شود و علت شکست اسپات در گزارش
+            # کیف پول می‌آید. فقط وقتی هر دو شکست بخورند خطا بالا می‌رود.
+            spot_error: Exception | None = None
+            try:
+                balances = await provider.get_account_balance()
+            except Exception as exc:  # noqa: BLE001
+                spot_error = exc
+                balances = {}
 
             # موجودی فیوچرز جداست؛ بدون این، کاربری که سرمایه‌اش را به کیف
             # پول قراردادها منتقل کرده، کیف پول را تقریباً خالی می‌بیند.
             futures: dict[str, float] = {}
+            futures_ok = False
             fetch_futures = getattr(provider, "get_futures_balance", None)
             if callable(fetch_futures):
                 try:
                     futures = await fetch_futures() or {}
+                    report_now = getattr(provider, "last_sync_report", None) or {}
+                    futures_ok = bool((report_now.get("futures") or {}).get("ok", bool(futures)))
                 except Exception as exc:  # noqa: BLE001 - نبود فیوچرز خطا نیست
                     logger.info(
                         "Futures balance skipped for account id=%s: %s",
                         account_id,
                         exc.__class__.__name__,
                     )
+            if spot_error is not None and not futures_ok:
+                raise spot_error
 
             spot_only: dict[str, float] = dict(balances or {})
             combined: dict[str, float] = dict(balances or {})
@@ -306,18 +319,61 @@ class ExchangeAccountService:
                         total += float(amount) * float(price)
                     except (TypeError, ValueError):
                         continue
+            # v2.5.0: جزئیات هر کیف پول (آزاد/قفل/مارجین/سود شناور) و ارزش
+            # تتری هر بخش جدا نگه داشته می‌شود تا زبانه‌های اسپات و فیوچرز
+            # کیف پول اعداد دقیق نشان دهند.
+            spot_details = _clean_details(getattr(provider, "last_spot_details", None))
+            futures_details = _clean_details(getattr(provider, "last_futures_details", None))
+            spot_value = 0.0
+            futures_value = 0.0
+            prices: dict[str, float] = {}
+            if price_lookup is not None:
+                for asset in set(spot_only) | set(futures):
+                    try:
+                        price = price_lookup(asset)
+                        if inspect.isawaitable(price):
+                            price = await price
+                        prices[asset] = float(price)
+                    except (TypeError, ValueError):
+                        continue
+                    except Exception:  # noqa: BLE001 - قیمت یک دارایی نباید همه را ببرد
+                        continue
+                spot_value = sum(float(a) * prices.get(k, 0.0) for k, a in spot_only.items())
+                futures_value = sum(float(a) * prices.get(k, 0.0) for k, a in futures.items())
             self._repository.update_balances(
                 account_id,
                 balances=balances or {},
                 total_value_usdt=total,
                 spot=spot_only,
                 futures=futures,
+                details={
+                    "spot": spot_details,
+                    "futures": futures_details,
+                    "spot_value_usdt": spot_value,
+                    "futures_value_usdt": futures_value,
+                    "prices": prices,
+                    "report": _clean_report(
+                        getattr(provider, "last_sync_report", None),
+                        spot_error, creds,
+                    ),
+                },
             )
+            # وضعیت حساب: اسپات شکست خورده ولی فیوچرز آمده ← هشدار نه خطا
+            if spot_error is not None:
+                self._repository.set_status(
+                    account_id, status="connected",
+                    error=_sanitize(str(spot_error), creds["api_key"], creds["api_secret"]),
+                    synced=True,
+                )
             return {
                 "balances": balances or {},
                 "total_value_usdt": total,
                 "spot": dict(spot_only),
                 "futures": dict(futures),
+                "spot_details": spot_details,
+                "futures_details": futures_details,
+                "spot_value_usdt": spot_value,
+                "futures_value_usdt": futures_value,
             }
         except Exception as exc:  # noqa: BLE001
             clean = _sanitize(str(exc), creds["api_key"], creds["api_secret"])
@@ -356,3 +412,53 @@ class ExchangeAccountService:
 
 
 __all__ = ["SECRET_NAMESPACE", "ExchangeAccountService"]
+
+
+def _clean_details(raw: Any) -> dict[str, dict[str, float]]:
+    """جزئیات موجودی قابل ذخیره در JSON (فقط اعداد، کلید حروف بزرگ)."""
+    if not isinstance(raw, dict):
+        return {}
+    cleaned: dict[str, dict[str, float]] = {}
+    for asset, info in raw.items():
+        if not isinstance(info, dict):
+            continue
+        row: dict[str, float] = {}
+        for key, value in info.items():
+            try:
+                row[str(key)] = float(value or 0.0)
+            except (TypeError, ValueError):
+                continue
+        cleaned[str(asset).upper()] = row
+    return cleaned
+
+
+def _clean_report(raw: Any, spot_error: Exception | None, creds: dict[str, str]) -> dict[str, Any]:
+    """
+    گزارش هر بخش همگام‌سازی برای نمایش در کیف پول (v2.5.1).
+
+    فقط ok/endpoint/assets/error/fields ذخیره می‌شود و متن خطا از کلید و
+    رمز پاک می‌گردد.
+    """
+    report: dict[str, Any] = {}
+    source = raw if isinstance(raw, dict) else {}
+    for section in ("spot", "futures"):
+        info = source.get(section)
+        if not isinstance(info, dict):
+            continue
+        report[section] = {
+            "ok": bool(info.get("ok")),
+            "endpoint": str(info.get("endpoint") or "")[:80],
+            "assets": int(info.get("assets") or 0),
+            "error": _sanitize(str(info.get("error") or ""), creds.get("api_key", ""),
+                               creds.get("api_secret", ""))[:240],
+            "fields": [str(f)[:40] for f in (info.get("fields") or [])][:40],
+            "note": str(info.get("note") or "")[:40],
+        }
+    if spot_error is not None and not (report.get("spot") or {}).get("error"):
+        report["spot"] = {
+            "ok": False, "endpoint": "", "assets": 0, "fields": [], "note": "",
+            "error": _sanitize(str(spot_error), creds.get("api_key", ""),
+                               creds.get("api_secret", ""))[:240],
+        }
+    return report
+

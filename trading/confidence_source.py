@@ -17,10 +17,12 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
+from trading.universe import RotatingUniverse
 from typing import Any
 
-from app.logging import get_logger
+from app.logging import audit, get_logger
 
 logger = get_logger(__name__)
 
@@ -46,6 +48,14 @@ class ConfidenceCandidate:
     score: float
     timeframe: str = ""
     reasons: list[str] = field(default_factory=list)
+    take_profit: float = 0.0
+    stop_loss: float = 0.0
+    turnover_24h: float | None = None
+    observed_at: float = field(default_factory=time.time)
+    #: نسخهٔ ۲.۵.۵ — کیفیت و ضریب اندازه از لایهٔ تصمیم هوشمند
+    quality: str = ""
+    size_multiplier: float = 1.0
+    intelligence: dict = field(default_factory=dict)
 
     @property
     def confidence(self) -> float:
@@ -57,7 +67,7 @@ class ConfidenceCandidateSource:
     """
     پویش بازار و تبدیل سیگنال‌های پراطمینان به نامزد معامله.
 
-    این کلاس حالت نگه نمی‌دارد جز تنظیم‌ها، تا هر دور پویش عدد تازهٔ
+    این کلاس فقط مکان چرخش نمادها را نگه می‌دارد؛ هر دور پویش عدد تازهٔ
     کاربر را بخواند؛ اگر کاربر وسط کار حد اطمینان را عوض کند، دور بعد
     اثر می‌کند بدون نیاز به ری‌استارت.
     """
@@ -65,6 +75,7 @@ class ConfidenceCandidateSource:
     def __init__(self, app: Any) -> None:
         """نگه‌داشتن ارجاع برنامه برای دسترسی به تنظیم‌ها و موتور پویش."""
         self._app = app
+        self._universe = RotatingUniverse()
 
     # ------------------------------------------------------------------
     # تنظیم‌ها
@@ -87,7 +98,7 @@ class ConfidenceCandidateSource:
     # ------------------------------------------------------------------
     # پویش
     # ------------------------------------------------------------------
-    async def scan(self) -> list[ConfidenceCandidate]:
+    async def scan(self, *, symbols: list[str] | None = None) -> list[ConfidenceCandidate]:
         """
         یک دور پویش کامل و برگرداندن نامزدهای واجد شرایط.
 
@@ -95,9 +106,23 @@ class ConfidenceCandidateSource:
         هم‌زمان پر شد، بهترین‌ها زودتر باز شوند.
         """
         threshold = self.min_confidence
+        tickers = []
+        if symbols is not None and not symbols:
+            return []
         try:
+            market = getattr(self._app, "market", None)
+            if market is not None:
+                tickers = await market.get_all_tickers()
+                settings_get = getattr(self._app.settings, "get", lambda key, default: default)
+                raw = str(settings_get("scalp.selected_symbols", "") or "")
+                favorites = [s.strip().upper() for s in raw.replace(";", ",").split(",") if s.strip()]
+                symbols = self._universe.select(tickers, selected=symbols, favorites=favorites,
+                                               limit=self.scan_symbols,
+                                               min_turnover=float(settings_get("scalp.min_liquidity", 2_000_000) or 0))
+                if not symbols:
+                    return []
             result = await self._app.scan_market(
-                symbols=None,
+                symbols=symbols,
                 limit=self.scan_symbols,
                 min_confidence=threshold,
                 include_wait=False,
@@ -110,9 +135,25 @@ class ConfidenceCandidateSource:
         for signal in getattr(result, "signals", []) or []:
             candidate = self._to_candidate(signal, threshold)
             if candidate is not None:
+                ticker = next((t for t in tickers if t.symbol == candidate.symbol), None)
+                if ticker is not None:
+                    candidate.turnover_24h = float(ticker.turnover_24h or 0)
                 candidates.append(candidate)
 
         candidates.sort(key=lambda item: item.score, reverse=True)
+        # نسخهٔ ۲.۶.۰ (فقط ثبت): پویش فقط سیگنال‌های بالای حد اطمینان را برمی‌گرداند،
+        # پس بقیهٔ نمادهای سالم «زیر حد اطمینان یا بدون جهت» شمرده می‌شوند.
+        try:
+            signal_count = len(getattr(result, "signals", []) or [])
+            scanned = int(getattr(result, "scanned", 0) or 0) or len(symbols or [])
+            failed = int(getattr(result, "failed", 0) or 0)
+            raw = max(0, scanned - failed)
+            audit.note_scan(scanned=scanned, raw=raw, reasons={
+                "data_error": failed,
+                "low_confidence": max(0, raw - signal_count) + max(0, signal_count - len(candidates)),
+            })
+        except Exception:  # noqa: BLE001
+            pass
         logger.info(
             "Confidence scan: %d signals, %d above %d%%",
             len(getattr(result, "signals", []) or []),
@@ -135,8 +176,12 @@ class ConfidenceCandidateSource:
             return None
 
         confidence = float(getattr(signal, "confidence", 0) or 0)
-        if confidence < threshold:
+        # نسخهٔ ۲.۵.۵: صلاحیت با اطمینان فنی؛ final فقط اندازه را تعدیل می‌کند
+        from signals.intelligent_decision import eligibility_confidence
+
+        if eligibility_confidence(signal) < threshold:
             return None
+        intel = dict(getattr(signal, "intelligence", None) or {})
 
         # `TradingSignal` قیمت ورود را به‌صورت **بازه** نگه می‌دارد
         # (`entry_min`/`entry_max`) و فیلدی به نام `entry_price` ندارد.
@@ -163,4 +208,10 @@ class ConfidenceCandidateSource:
             score=confidence,
             timeframe=primary or (timeframes[0] if timeframes else ""),
             reasons=[reason] if reason else [],
+            stop_loss=float(getattr(signal, "stop_loss", 0) or 0),
+            take_profit=next((float(p) for p in (getattr(signal, "take_profits", []) or [])
+                              if (float(p) - price) * (1 if direction == "LONG" else -1) > 0), 0.0),
+            quality=str(intel.get("quality") or ""),
+            size_multiplier=float(intel.get("size_multiplier") or 1.0),
+            intelligence=intel,
         )

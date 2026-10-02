@@ -507,6 +507,37 @@ class ApplicationLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True, nullable=False)
 
 
+class AuditEventRecord(Base):
+    """
+    رویدادهای ممیزی معامله/اسکالپ (نسخهٔ ۲.۶.۰).
+
+    سیگنال، نامزد، رد (با کد استاندارد)، ورود، بستن جزئی، خروج و خلاصهٔ پویش.
+    `correlation_id` گام‌های پیش از ورود را به `trade_id` وصل می‌کند تا خط
+    زمانی هر معامله بازیابی شود. از رشتهٔ پس‌زمینه و دسته‌ای نوشته می‌شود.
+    """
+
+    __tablename__ = "audit_events"
+    __table_args__ = (
+        Index("ix_audit_trade_time", "trade_id", "created_at"),
+        Index("ix_audit_event_time", "event", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True, nullable=False)
+    epoch: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    level: Mapped[str] = mapped_column(String(10), default="INFO", nullable=False)
+    category: Mapped[str] = mapped_column(String(20), default="", index=True, nullable=False)
+    event: Mapped[str] = mapped_column(String(30), default="", nullable=False)
+    symbol: Mapped[str] = mapped_column(String(40), default="", index=True, nullable=False)
+    trade_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reason_code: Mapped[str] = mapped_column(String(40), default="", index=True, nullable=False)
+    scan_id: Mapped[str] = mapped_column(String(40), default="", index=True, nullable=False)
+    correlation_id: Mapped[str] = mapped_column(String(40), default="", index=True, nullable=False)
+    module: Mapped[str] = mapped_column(String(120), default="", nullable=False)
+    message: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    context: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+
+
 # ---------------------------------------------------------------------------
 # کاربران و نشست‌ها
 # ---------------------------------------------------------------------------

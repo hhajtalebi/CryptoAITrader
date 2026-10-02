@@ -1,5 +1,7 @@
-﻿@echo off
+@echo off
 chcp 65001 >nul 2>&1
+set "PYTHONUTF8=1"
+set "PYTHONIOENCODING=utf-8"
 REM ======================================================================
 REM   ربات ساخت APK - Crypto AI Trader Mobile
 REM
@@ -12,6 +14,9 @@ REM     مدير اجرا كنيد:   wsl --install -d Ubuntu
 REM
 REM   اولين ساخت 40 تا 90 دقيقه طول مي كشد (دانلود NDK و SDK).
 REM   ساخت هاي بعدي چند دقيقه اند.
+REM
+REM   نسخه 2.5.3: ساخت روي فايل سيستم لينوكس (~/cryptoaitrader-apk)،
+REM   خروجي زنده و گزارش كامل در build_logs. اين فايل عمدا بدون BOM است.
 REM ======================================================================
 setlocal EnableDelayedExpansion
 cd /d "%~dp0.."
@@ -23,7 +28,11 @@ echo ======================================================================
 echo.
 
 set "PY_CMD="
-py -3 --version >nul 2>&1 && set "PY_CMD=py -3"
+REM  نسخه 2.5.3: پايتون محيط مجازي پروژه (numpy/pandas/pytest دارد) مقدم است.
+if exist ".venv\Scripts\python.exe" set "PY_CMD=.venv\Scripts\python.exe"
+if not defined PY_CMD (
+    py -3 --version >nul 2>&1 && set "PY_CMD=py -3"
+)
 if not defined PY_CMD (
     python --version >nul 2>&1 && set "PY_CMD=python"
 )
@@ -46,17 +55,23 @@ if errorlevel 1 (
     echo   بعد از آن، يك بار داخل WSL اين ها را نصب كنيد:
     echo.
     echo       sudo apt update
-    echo       sudo apt install -y python3-pip openjdk-17-jdk zip unzip autoconf libtool pkg-config zlib1g-dev libncurses-dev cmake libffi-dev libssl-dev git
-    echo       pip3 install --user buildozer cython
+    echo       sudo apt install -y python3-pip python3-venv openjdk-17-jdk zip unzip autoconf libtool pkg-config zlib1g-dev libncurses-dev cmake libffi-dev libssl-dev git build-essential lld
+    echo.
+    echo   buildozer را خود ربات داخل WSL نصب مي كند.
     echo.
     goto :fail
 )
+REM  نسخه 2.5.9: wsl --status حتي بدون هيچ توزيع لينوكسي موفق است.
+wsl -e true >nul 2>&1
+if errorlevel 1 goto :no_distro
 echo       WSL موجود است.
 
 echo [2/2] اجراي ربات ساخت APK ...
 echo.
 %PY_CMD% tools\build_apk.py %*
 set "RESULT=%ERRORLEVEL%"
+REM  نسخه 2.7.0: ربات پايتون هم نبود توزيع لينوكسي را تشخيص مي دهد - كد 3.
+if "%RESULT%"=="3" goto :no_distro
 
 echo.
 if "%RESULT%"=="0" (
@@ -73,6 +88,35 @@ if "%RESULT%"=="0" (
 echo.
 pause
 endlocal & exit /b %RESULT%
+
+:no_distro
+echo.
+echo [خطا] WSL نصب است ولي هيچ توزيع لينوكسي - Ubuntu - روي آن نصب نيست.
+echo.
+echo   buildozer فقط داخل لينوكس كار مي كند. نصب Ubuntu يك بار لازم است
+echo   و چند دقيقه طول مي كشد، اينترنت لازم دارد.
+echo.
+choice /c YN /n /m "   الان Ubuntu نصب شود؟  Y = بله  /  N = خير : "
+if errorlevel 2 goto :no_distro_manual
+echo.
+echo   در حال نصب Ubuntu ...
+wsl --install -d Ubuntu
+echo.
+echo   پس از پايان نصب، پنجره Ubuntu يك نام كاربري و رمز مي خواهد؛ آن را بسازيد.
+echo   اگر ويندوز ري استارت خواست، ري استارت كنيد.
+echo   سپس همين فايل را دوباره اجرا كنيد. ربات ابزارهاي لازم را بررسي مي كند
+echo   و فرمان دقيق نصب آن ها را نشان مي دهد.
+goto :fail
+
+:no_distro_manual
+echo.
+echo   دستي در PowerShell يا CMD اجرا كنيد:
+echo.
+echo       wsl --install -d Ubuntu
+echo.
+echo   سپس پنجره Ubuntu را يك بار باز كنيد، نام كاربري و رمز بسازيد و
+echo   اين فايل را دوباره اجرا كنيد.
+goto :fail
 
 :fail
 echo.

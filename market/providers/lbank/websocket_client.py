@@ -20,8 +20,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 import random
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -33,10 +35,41 @@ from app.core.constants import ConnectionStatus
 from app.exceptions import TimeframeError
 from app.logging import get_logger
 from market.timeframes import normalize_timeframe
-from market.providers.lbank.constants import LBANK_TIMEFRAME_MAP, LBANK_WS_URL
+from market.providers.lbank.constants import LBANK_TIMEFRAME_MAP, LBANK_WS_URL, LBANK_WS_URLS
 from market.providers.lbank.parser import LBankParser
 
 logger = get_logger(__name__)
+
+# نسخهٔ ۲.۳.۲: کلاینت هم ping می‌فرستد (مستندات LBank مجاز می‌داند) تا اتصال
+# بیکار در NAT/پراکسی کاربر بسته نشود و قطع نیمه‌باز زودتر کشف شود.
+CLIENT_PING_INTERVAL = 20.0
+# اگر این مدت هیچ فریمی (حتی ping/pong) نرسد، اتصال مرده فرض می‌شود.
+RECV_TIMEOUT = 60.0
+# فاصلهٔ ارسال پیام‌های اشتراک؛ انفجار صدها پیام در یک لحظه ممکن است سرور را
+# به بستن اتصال وادارد.
+SUBSCRIBE_PACING = 0.02
+CONNECT_TIMEOUT = 15.0
+WS_USER_AGENT = "Mozilla/5.0 (compatible; CryptoAITrader)"
+
+
+def _connect_supports(name: str) -> bool:
+    """آیا نسخهٔ نصب‌شدهٔ websockets این آرگومان connect را می‌پذیرد؟"""
+    try:
+        return name in inspect.signature(websockets.connect).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_proxy_error(exc: BaseException) -> bool:
+    """
+    خطای ناشی از پراکسی سیستم (مثلاً پراکسی SOCKS بدون python-socks).
+
+    websockets 15 به‌طور پیش‌فرض پراکسی سیستم عامل را به کار می‌برد؛ اگر آن
+    پراکسی قابل استفاده نباشد، اتصال مستقیم امتحان می‌شود.
+    """
+    name = exc.__class__.__name__.lower()
+    text = str(exc).lower()
+    return "proxy" in name or "python-socks" in text or "proxy" in text
 
 # نگاشت تایم‌فریم داخلی به نام بازه در پروتکل WebSocket صرافی
 WS_KBAR_MAP: dict[str, str] = {
@@ -110,15 +143,29 @@ class LBankWebSocketClient:
 
     def __init__(
         self,
-        url: str = LBANK_WS_URL,
+        url: str | None = None,
         *,
+        urls: tuple[str, ...] | list[str] | None = None,
         on_ticker: Callable[[Any], None] | None = None,
         on_candle: Callable[[str, str, Any], None] | None = None,
         on_orderbook: Callable[[Any], None] | None = None,
         on_status_change: Callable[[ConnectionStatus], None] | None = None,
         max_reconnect_delay: float = 60.0,
     ) -> None:
-        self._url = url
+        # ترتیب: فهرست صریح ← نشانی صریح ← فهرست پیش‌فرض (رسمی + قدیمی).
+        if urls:
+            candidates = tuple(dict.fromkeys(str(u) for u in urls if u))
+        elif url:
+            candidates = (url,)
+        else:
+            candidates = tuple(LBANK_WS_URLS) or (LBANK_WS_URL,)
+        self._urls: tuple[str, ...] = candidates
+        self._url_index = 0
+        self._url = self._urls[0]
+        self._use_proxy = True
+        self._last_error = ""
+        self._last_message_at = 0.0
+        self._ping_task: asyncio.Task[None] | None = None
         self._on_ticker = on_ticker
         self._on_candle = on_candle
         self._on_orderbook = on_orderbook
@@ -150,6 +197,42 @@ class LBankWebSocketClient:
     def reconnect_count(self) -> int:
         """تعداد دفعات اتصال مجدد (برای نمایش در بخش عیب‌یابی)."""
         return self._reconnect_count
+
+    @property
+    def current_url(self) -> str:
+        """نشانی‌ای که اکنون (یا در تلاش بعدی) استفاده می‌شود."""
+        return self._url
+
+    @property
+    def urls(self) -> tuple[str, ...]:
+        """همهٔ نشانی‌های جایگزین به ترتیب تلاش."""
+        return self._urls
+
+    @property
+    def last_error(self) -> str:
+        """آخرین علت شکست اتصال (برای عیب‌یابی و گزارش کاربر)."""
+        return self._last_error
+
+    def _advance_url(self) -> None:
+        """رفتن به نشانی جایگزین بعدی پس از شکست."""
+        if len(self._urls) < 2:
+            return
+        self._url_index = (self._url_index + 1) % len(self._urls)
+        self._url = self._urls[self._url_index]
+
+    def _connect_kwargs(self) -> dict[str, Any]:
+        """آرگومان‌های connect سازگار با نسخهٔ نصب‌شدهٔ websockets."""
+        kwargs: dict[str, Any] = {
+            "open_timeout": CONNECT_TIMEOUT,
+            "ping_interval": None,  # ping پروتکلی LBank در سطح JSON است
+            "close_timeout": 5,
+            "max_size": 4 * 1024 * 1024,
+        }
+        if _connect_supports("user_agent_header"):
+            kwargs["user_agent_header"] = WS_USER_AGENT
+        if not self._use_proxy and _connect_supports("proxy"):
+            kwargs["proxy"] = None
+        return kwargs
 
     def _set_status(self, status: ConnectionStatus) -> None:
         """تغییر وضعیت و اطلاع‌رسانی به شنونده."""
@@ -193,60 +276,107 @@ class LBankWebSocketClient:
         """
         حلقه اصلی: اتصال، دریافت پیام و در صورت قطع، تلاش مجدد.
 
-        تأخیر تلاش مجدد به‌صورت نمایی افزایش می‌یابد و با نویز تصادفی همراه
-        است تا در قطعی سراسری، همه کلاینت‌ها هم‌زمان به سرور هجوم نبرند.
+        نسخهٔ ۲.۳.۲: اگر دست‌دادن شکست بخورد یا سرور پیش از ارسال هیچ داده‌ای
+        اتصال را ببندد، نشانی بعدی فهرست (دامنهٔ رسمی/قدیمی) امتحان می‌شود. در
+        دور اول عبور از فهرست، تأخیر کوتاه است تا کاربر منتظر نماند؛ پس از آن
+        تأخیر نمایی همراه با نویز تصادفی است.
         """
         attempt = 0
         while self._running:
+            received_any = False
+            url = self._url
             try:
                 self._set_status(
                     ConnectionStatus.RECONNECTING if attempt else ConnectionStatus.CONNECTING
                 )
-                async with websockets.connect(
-                    self._url, open_timeout=20, ping_interval=None, close_timeout=5
-                ) as connection:
+                async with websockets.connect(url, **self._connect_kwargs()) as connection:
                     self._connection = connection
-                    attempt = 0
+                    self._last_message_at = time.monotonic()
                     self._set_status(ConnectionStatus.CONNECTED)
+                    logger.info("LBank WebSocket connected to %s", url)
+                    self._ping_task = asyncio.create_task(
+                        self._client_ping_loop(connection), name="lbank-ws-ping"
+                    )
                     await self._resubscribe_all()
-                    await self._receive_loop(connection)
+                    received_any = await self._receive_loop(connection)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - هر خطایی باید به تلاش مجدد منجر شود
-                logger.warning("WebSocket connection error: %s: %s", exc.__class__.__name__, exc)
+                self._last_error = f"{exc.__class__.__name__}: {exc}"[:300]
+                logger.warning("LBank WebSocket error on %s: %s", url, self._last_error)
+                if self._use_proxy and _is_proxy_error(exc) and _connect_supports("proxy"):
+                    # پراکسی سیستم قابل استفاده نیست؛ اتصال مستقیم امتحان شود.
+                    self._use_proxy = False
+                    logger.warning("System proxy unusable for LBank WebSocket; retrying direct")
             finally:
+                await self._stop_ping_task()
                 self._connection = None
-
             if not self._running:
                 break
-
             self._set_status(ConnectionStatus.DISCONNECTED)
-            attempt += 1
+            if received_any:
+                # دامنه سالم بود و داده داد؛ همان را نگه می‌داریم.
+                attempt = 1
+            else:
+                attempt += 1
+                self._advance_url()
             self._reconnect_count += 1
-            delay = min(self._max_reconnect_delay, 2 ** min(attempt, 6))
-            delay += random.uniform(0, delay * 0.3)
-            logger.info("Reconnecting to LBank WebSocket in %.1fs (attempt %d)", delay, attempt)
+            if attempt <= len(self._urls):
+                delay = 1.0 + random.uniform(0, 0.5)
+            else:
+                step = attempt - len(self._urls)
+                delay = min(self._max_reconnect_delay, 2 ** min(step, 6))
+                delay += random.uniform(0, delay * 0.3)
+            logger.info(
+                "Reconnecting to LBank WebSocket via %s in %.1fs (attempt %d)", self._url, delay, attempt
+            )
             await asyncio.sleep(delay)
 
-    async def _receive_loop(self, connection: Any) -> None:
+    async def _stop_ping_task(self) -> None:
+        task, self._ping_task = self._ping_task, None
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+
+    async def _client_ping_loop(self, connection: Any) -> None:
+        """ارسال ping دوره‌ای کلاینت؛ خطای ارسال فقط حلقه را پایان می‌دهد."""
+        counter = 0
+        while self._running:
+            await asyncio.sleep(CLIENT_PING_INTERVAL)
+            counter += 1
+            try:
+                await connection.send(json.dumps({"action": "ping", "ping": f"cat-{counter}"}))
+            except Exception:  # noqa: BLE001 - حلقهٔ دریافت، قطع را تشخیص می‌دهد
+                return
+
+    async def _receive_loop(self, connection: Any) -> bool:
         """
         دریافت و پردازش پیام‌ها تا زمان قطع اتصال.
 
-        اگر ۹۰ ثانیه هیچ پیامی نرسد، اتصال «مرده» فرض شده و بسته می‌شود تا
-        چرخه اتصال مجدد آغاز گردد (پیشگیری از اتصال زامبی).
+        اگر RECV_TIMEOUT ثانیه هیچ فریمی (حتی pong پاسخ ping کلاینت) نرسد،
+        اتصال «مرده» فرض شده و بسته می‌شود تا چرخه اتصال مجدد آغاز گردد.
+        خروجی: آیا روی این اتصال دست‌کم یک پیام رسید؟
         """
+        received_any = False
         while self._running:
             try:
-                raw = await asyncio.wait_for(connection.recv(), timeout=90)
+                raw = await asyncio.wait_for(connection.recv(), timeout=RECV_TIMEOUT)
             except asyncio.TimeoutError:
-                logger.warning("No WebSocket data for 90s; forcing reconnect")
-                await connection.close()
-                return
-            except ConnectionClosed:
-                logger.info("WebSocket connection closed by server")
-                return
-
+                logger.warning("No LBank WebSocket data for %.0fs; forcing reconnect", RECV_TIMEOUT)
+                self._last_error = "silent connection"
+                with contextlib.suppress(Exception):
+                    await connection.close()
+                return received_any
+            except ConnectionClosed as exc:
+                code = getattr(getattr(exc, "rcvd", None), "code", None)
+                self._last_error = f"closed by server (code={code})"
+                logger.info("LBank WebSocket closed by server (code=%s)", code)
+                return received_any
+            received_any = True
+            self._last_message_at = time.monotonic()
             await self._handle_message(raw, connection)
+        return received_any
 
     async def _handle_message(self, raw: str | bytes, connection: Any) -> None:
         """تجزیه یک پیام دریافتی و فراخوانی شنونده مناسب."""
@@ -259,10 +389,13 @@ class LBankWebSocketClient:
             return
 
         # پاسخ به ping سرور، شرط لازم برای باز ماندن اتصال است
-        if message.get("action") == "ping":
+        action = message.get("action")
+        if action == "ping":
             with contextlib.suppress(Exception):
                 await connection.send(json.dumps({"action": "pong", "pong": message.get("ping")}))
             return
+        if action == "pong":
+            return  # پاسخ ping کلاینت؛ فقط نشانهٔ زنده بودن است
 
         message_type = message.get("type")
         if message_type == "tick":
@@ -310,8 +443,12 @@ class LBankWebSocketClient:
         if not self._subscriptions or self._connection is None:
             return
         for subscription in list(self._subscriptions):
+            connection = self._connection
+            if connection is None:
+                return
             with contextlib.suppress(Exception):
-                await self._connection.send(json.dumps(subscription.to_message()))
+                await connection.send(json.dumps(subscription.to_message()))
+            await asyncio.sleep(SUBSCRIBE_PACING)
         logger.info("Resubscribed to %d WebSocket channels", len(self._subscriptions))
 
     async def _send_subscription(self, subscription: Subscription, *, subscribe: bool) -> None:

@@ -66,8 +66,10 @@ class MomentumStrategy(BaseStrategy):
                 reasons.append(f"RSI {rsi:.1f} confirms downward momentum")
 
         # --- Stochastic: شتاب کوتاه‌مدت ---
-        stoch_k = context.indicator_value("STOCHASTIC", "k")
-        stoch_d = context.indicator_value("STOCHASTIC", "d")
+        # نسخهٔ ۲.۵.۸: نام درست اندیکاتور در موتور «STOCH» است. نام قبلی
+        # («STOCHASTIC») همیشه None برمی‌گرداند و این جزء هرگز اجرا نمی‌شد.
+        stoch_k = context.indicator_value("STOCH", "k")
+        stoch_d = context.indicator_value("STOCH", "d")
         if stoch_k is not None and stoch_d is not None:
             seen += 1
             if stoch_k > stoch_d and stoch_k < 80:

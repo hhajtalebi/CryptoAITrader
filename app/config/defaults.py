@@ -137,8 +137,12 @@ class SettingKey(str, Enum):
     #: چند نماد برتر در هر دور پویش بررسی شود
     AUTOTRADE_SCAN_SYMBOLS = "scalp.scan_symbols"
     # --- v2.0: حالت‌ها و محافظ‌های رویدادمحور ---
-    #: حالت موتور: selected | scan | ai (خواستهٔ §۳)
+    #: حالت موتور: selected | scan | ai | ultra (۲.۵.۴: اسکالپ فوق‌سریع)
     AUTOTRADE_ENGINE_MODE = "scalp.engine_mode"
+    #: اسکالپ فوق‌سریع — پنجرهٔ تکانه (ثانیه)، کمترین حرکت (درصد) و یکنواختی (۰..۱)
+    ULTRA_WINDOW_SECONDS = "scalp.ultra_window_seconds"
+    ULTRA_MIN_MOVE_PERCENT = "scalp.ultra_min_move_percent"
+    ULTRA_MIN_CONSISTENCY = "scalp.ultra_min_consistency"
     #: نمادهای حالت Selected — جداشده با ویرگول
     AUTOTRADE_SELECTED_SYMBOLS = "scalp.selected_symbols"
     #: فاصلهٔ پویش ورود (ثانیه) — جدا از پایش خروج تیک‌محور
@@ -178,6 +182,16 @@ class SettingKey(str, Enum):
     AUTOTRADE_ALLOCATION_PERCENT = "scalp.allocation_percent"
     #: سقف مجموع مارجین باز نسبت به موجودی (درصد)
     AUTOTRADE_MAX_TOTAL_MARGIN = "scalp.max_total_margin_percent"
+    #: نسخهٔ ۲.۵.۶ — محافظ برتری منفی اندازه‌گیری‌شده و دروازهٔ هزینهٔ اسکالپ
+    AUTOTRADE_EDGE_GUARD_ENABLED = "scalp.edge_guard_enabled"
+    AUTOTRADE_EDGE_GUARD_MIN_TRADES = "scalp.edge_guard_min_trades"
+    SCALP_MIN_COST_MULTIPLE = "scalp.min_cost_multiple"
+    #: نسخهٔ ۲.۵.۷ — سود قفل سر‌به‌سر، دسترس‌پذیری هدف، اسپرد/حد ضرر
+    AUTOTRADE_BREAK_EVEN_LOCK = "scalp.break_even_lock"
+    AUTOTRADE_REACH_RATIO = "scalp.reach_ratio"
+    AUTOTRADE_MAX_SPREAD_STOP_FRACTION = "scalp.max_spread_stop_fraction"
+    #: نسخهٔ ۲.۶.۱ — حالت تشخیصی: همهٔ دروازه‌ها اجرا، هیچ معامله‌ای باز نمی‌شود
+    AUTOTRADE_DIAGNOSTIC_ONLY = "scalp.diagnostic_only"
     UI_TIMEZONE = "ui.timezone"
     EXCHANGE_ACTIVE = "exchange.active"
     MARKET_MANUAL_TOMAN_RATE = "market.manual_toman_rate"
@@ -187,6 +201,8 @@ class SettingKey(str, Enum):
     SIGNAL_TIMEFRAMES = "signals.timeframes"
     SIGNAL_TIMEFRAME_ROLES = "signals.timeframe_roles"
     SIGNAL_MIN_CONFIDENCE = "signals.min_confidence"
+    #: نسخهٔ ۲.۵.۵ — لایهٔ تصمیم هوشمند (کیفیت STRONG/NORMAL/WEAK)
+    SIGNAL_INTELLIGENCE_ENABLED = "signals.intelligence_enabled"
     SIGNAL_REQUIRE_AI = "signals.require_ai"
     SIGNAL_AUTO_SAVE = "signals.auto_save"
     SIGNAL_AI_TIMEOUT = "signals.ai_timeout"
@@ -202,6 +218,16 @@ class SettingKey(str, Enum):
     SIGNAL_AUTO_SCAN_MIN_CONFIDENCE = "signals.auto_scan_min_confidence"
     SIGNAL_AUTO_SCAN_SWEEP_LIMIT = "signals.auto_scan_sweep_limit"
     SIGNAL_AUTO_SCAN_NOTIFY = "signals.auto_scan_notify"
+    #: نسخهٔ ۲.۴.۰ — منبع (found|market|both)، جهان چرخش و پالایش هوشمند
+    SIGNAL_AUTO_SCAN_SOURCE = "signals.auto_scan_source"
+    SIGNAL_AUTO_SCAN_UNIVERSE = "signals.auto_scan_universe"
+    SIGNAL_AUTO_SCAN_MIN_TURNOVER = "signals.auto_scan_min_turnover"
+    SIGNAL_AUTO_SCAN_SMART_FILTER = "signals.auto_scan_smart_filter"
+    #: پویش دستی: جهان (top|all)، تعداد، کمینهٔ گردش و پالایش هوشمند
+    SIGNAL_SCAN_UNIVERSE = "signals.scan_universe"
+    SIGNAL_SCAN_LIMIT = "signals.scan_limit"
+    SIGNAL_SCAN_MIN_TURNOVER = "signals.scan_min_turnover"
+    SIGNAL_SCAN_SMART_FILTER = "signals.scan_smart_filter"
 
     # ---- پیگیری نتیجهٔ واقعی سیگنال‌ها ----
     SIGNAL_TRACK_OUTCOMES = "signals.track_outcomes"
@@ -373,7 +399,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     SettingKey.SCALP_MAX_CONCURRENT.value: 3,
     SettingKey.SCALP_MAX_HOLD.value: 900,
     SettingKey.SCALP_POLL_SECONDS.value: 5.0,
-    SettingKey.SCALP_DAILY_LOSS_LIMIT.value: 20.0,
+    SettingKey.SCALP_DAILY_LOSS_LIMIT.value: 0.0,  # ۲.۷.۰: صفر = خاموش
     SettingKey.SCALP_MIN_TURNOVER.value: 2000000.0,
     SettingKey.SCALP_MAX_SPREAD.value: 0.25,
     SettingKey.SCALP_SCAN_LIMIT.value: 25,
@@ -386,6 +412,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     SettingKey.AUTOTRADE_SCAN_SYMBOLS.value: 40,
     # --- v2.0: حالت‌ها و محافظ‌های رویدادمحور ---
     SettingKey.AUTOTRADE_ENGINE_MODE.value: "scan",
+    SettingKey.ULTRA_WINDOW_SECONDS.value: 30.0,
+    SettingKey.ULTRA_MIN_MOVE_PERCENT.value: 0.04,
+    SettingKey.ULTRA_MIN_CONSISTENCY.value: 0.35,
     SettingKey.AUTOTRADE_SELECTED_SYMBOLS.value: "BTC/USDT,ETH/USDT",
     SettingKey.AUTOTRADE_SCAN_INTERVAL.value: 15.0,
     SettingKey.AUTOTRADE_MIN_LIQUIDITY.value: 2_000_000.0,
@@ -402,6 +431,13 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     SettingKey.AUTOTRADE_ALLOCATION_MODE.value: "fixed",
     SettingKey.AUTOTRADE_ALLOCATION_PERCENT.value: 5.0,
     SettingKey.AUTOTRADE_MAX_TOTAL_MARGIN.value: 60.0,
+    SettingKey.AUTOTRADE_EDGE_GUARD_ENABLED.value: True,
+    SettingKey.AUTOTRADE_EDGE_GUARD_MIN_TRADES.value: 50,
+    SettingKey.SCALP_MIN_COST_MULTIPLE.value: 3.0,
+    SettingKey.AUTOTRADE_BREAK_EVEN_LOCK.value: 0.1,
+    SettingKey.AUTOTRADE_REACH_RATIO.value: 0.5,
+    SettingKey.AUTOTRADE_MAX_SPREAD_STOP_FRACTION.value: 0.33,
+    SettingKey.AUTOTRADE_DIAGNOSTIC_ONLY.value: False,
     # --- v2.2: پویش دائمی فرصت‌ها (مستقل از موتور معامله) ---
     SettingKey.AUTOTRADE_WATCH_SCAN_ENABLED.value: True,
     SettingKey.AUTOTRADE_WATCH_SCAN_INTERVAL.value: 20,
@@ -419,7 +455,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     SettingKey.MARKET_MANUAL_TOMAN_RATE.value: 0.0,
     SettingKey.SECURITY_STORE_SECRETS_IN_DB.value: True,
     # نمایش
-    SettingKey.UI_MARKETS_SORT.value: "value",
+    # v2.5.1: «ارزش بازار + حجم» (BTC، ETH… بالا) — خواستهٔ صریح کاربر
+    SettingKey.UI_MARKETS_SORT.value: "market_cap",
     # قلم پیش‌فرض «ب کودک» است؛ درخواست صریح کاربر برای فارسی‌نویسی.
     SettingKey.UI_FONT_FAMILY.value: "vazirmatn",
     SettingKey.UI_FONT_SCALE.value: 100,
@@ -460,6 +497,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "1d": "macro_trend",
     },
     SettingKey.SIGNAL_MIN_CONFIDENCE.value: 55,
+    SettingKey.SIGNAL_INTELLIGENCE_ENABLED.value: True,
     SettingKey.SIGNAL_REQUIRE_AI.value: False,
     SettingKey.SIGNAL_AUTO_SAVE.value: True,
     # سقف زمان انتظار برای تفسیر هوش مصنوعی؛ پس از آن سیگنال بدون تفسیر
@@ -487,6 +525,14 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     SettingKey.SIGNAL_AUTO_SCAN_MIN_CONFIDENCE.value: 55,
     SettingKey.SIGNAL_AUTO_SCAN_SWEEP_LIMIT.value: 120,
     SettingKey.SIGNAL_AUTO_SCAN_NOTIFY.value: True,
+    SettingKey.SIGNAL_AUTO_SCAN_SOURCE.value: "both",
+    SettingKey.SIGNAL_AUTO_SCAN_UNIVERSE.value: "all",
+    SettingKey.SIGNAL_AUTO_SCAN_MIN_TURNOVER.value: 0.0,
+    SettingKey.SIGNAL_AUTO_SCAN_SMART_FILTER.value: True,
+    SettingKey.SIGNAL_SCAN_UNIVERSE.value: "top",
+    SettingKey.SIGNAL_SCAN_LIMIT.value: 60,
+    SettingKey.SIGNAL_SCAN_MIN_TURNOVER.value: 0.0,
+    SettingKey.SIGNAL_SCAN_SMART_FILTER.value: True,
     # پیگیری نتیجه پیش‌فرض **روشن** است: برخلاف پویش خودکار، هزینه‌اش
     # ناچیز است (یک درخواست قیمت برای نمادهای باز) و بدون آن، آمار
     # عملکرد هرگز شکل نمی‌گیرد. کاربری که سیگنال می‌سازد باید بتواند
@@ -583,6 +629,14 @@ SETTING_CATEGORIES: dict[str, list[str]] = {
         SettingKey.SIGNAL_AUTO_SCAN_MIN_CONFIDENCE.value,
         SettingKey.SIGNAL_AUTO_SCAN_SWEEP_LIMIT.value,
         SettingKey.SIGNAL_AUTO_SCAN_NOTIFY.value,
+        SettingKey.SIGNAL_AUTO_SCAN_SOURCE.value,
+        SettingKey.SIGNAL_AUTO_SCAN_UNIVERSE.value,
+        SettingKey.SIGNAL_AUTO_SCAN_MIN_TURNOVER.value,
+        SettingKey.SIGNAL_AUTO_SCAN_SMART_FILTER.value,
+        SettingKey.SIGNAL_SCAN_UNIVERSE.value,
+        SettingKey.SIGNAL_SCAN_LIMIT.value,
+        SettingKey.SIGNAL_SCAN_MIN_TURNOVER.value,
+        SettingKey.SIGNAL_SCAN_SMART_FILTER.value,
         SettingKey.SIGNAL_TRACK_OUTCOMES.value,
         SettingKey.SIGNAL_TRACK_INTERVAL.value,
         SettingKey.SIGNAL_TRACK_BATCH.value,

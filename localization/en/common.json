@@ -89,5 +89,9 @@
   "unknown": "Unknown",
   "updated_at": "Updated at",
   "volume": "Volume",
-  "yes": "Yes"
+  "yes": "Yes",
+  "unclean_exit": "The previous session closed unexpectedly after {hours} h (memory {memory} MB). The cause is recorded in app.log and crash.log in {path}; please send them.",
+  "clock_skew_warning": "Your Windows clock differs from the exchange by {hours} hours ({direction}). Market data is corrected, but please fix the Windows time zone and clock (Settings → Time & language → Set time zone, Sync now).",
+  "clock_ahead": "ahead",
+  "clock_behind": "behind"
 }

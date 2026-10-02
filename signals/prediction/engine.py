@@ -298,7 +298,8 @@ class PredictiveIntelligenceEngine:
         feature_sets: dict[str, Any] = {}
         for timeframe, candles in usable.items():
             features = self._features.build(
-                candles, timeframe, symbol=symbol, now=now_seconds
+                candles, timeframe, symbol=symbol, now=now_seconds,
+                extra=_orderflow_extra(candles, timeframe, now_seconds),
             )
             feature_sets[timeframe] = features
             assessments[timeframe] = classify_timeframe(timeframe, candles, features)
@@ -546,11 +547,11 @@ class PredictiveIntelligenceEngine:
             model_health=health,
             data_quality=quality,
         )
-        self._report_cache[cache_key] = (time.monotonic(), report)
-        # نسخهٔ نماد را تازه نگه داریم تا report(symbol) همیشه جدیدترین باشد
-        latest = self._latest_for_symbol.get(symbol)
-        if latest is None or time.monotonic() - cached[0] >= 0 or True:
-            self._latest_for_symbol[symbol] = (time.monotonic(), report)
+        # گزارش تازه برای هر دو نما یک زمان دارد. کلید تایم‌فریم تازه
+        # ممکن است cache قبلی نداشته باشد؛ برای ثبت نتیجه نباید آن را خواند.
+        cache_entry = (time.monotonic(), report)
+        self._report_cache[cache_key] = cache_entry
+        self._latest_for_symbol[symbol] = cache_entry
         return report
 
     # ------------------------------------------------------------------
@@ -743,6 +744,35 @@ class PredictiveIntelligenceEngine:
         snapshot["available"] = True
         return snapshot
 
+
+
+def _orderflow_extra(
+    candles: list[Candle], timeframe: str, now_seconds: int | None
+) -> dict[str, list[float | None]] | None:
+    """
+    سری‌های جریان سفارش (نمایندهٔ کندلی) برای `FeatureStore.build(extra=...)`
+    — نسخهٔ ۲.۵.۵.
+
+    هم‌ترازی مهم است: `build` آخرین len(closed) مقدار را برمی‌دارد؛ پس
+    سری باید دقیقاً روی همان کندل‌های «بسته‌شده» ساخته شود، وگرنه مقدار
+    کندل در حال شکل‌گیری یک خانه جابه‌جا و وارد فیچر می‌شد (look-ahead).
+    هر خطا → None (فیچر غایب، نه تصمیم مسدود).
+    """
+    try:
+        from market.quality import timeframe_seconds
+        from signals.orderflow import series_for_features
+
+        step = timeframe_seconds(timeframe)
+        if now_seconds is not None:
+            closed = [c for c in candles if c.timestamp + step <= now_seconds]
+        else:
+            closed = candles[:-1] if len(candles) > 1 else []
+        if len(closed) < 2:
+            return None
+        return series_for_features(closed) or None
+    except Exception:  # noqa: BLE001 - فیچر اختیاری هرگز مسدودکننده نیست
+        logger.debug("Order-flow extra features unavailable", exc_info=True)
+        return None
 
 
 def _recent_for_horizon(store: Any, symbol: str, horizon: str) -> list[Any]:

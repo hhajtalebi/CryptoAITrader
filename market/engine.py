@@ -24,13 +24,18 @@ from __future__ import annotations
 from collections.abc import Callable
 
 import asyncio
+import contextlib
+import contextvars
+import time
+from collections.abc import Iterator
+from datetime import UTC, datetime
 from typing import Any
 
 from app.core.constants import ConnectionStatus
 from app.core.events import EventBus, EventType
 from app.core.models import Candle, OrderBook, SymbolInfo, Ticker
 from app.database.repositories.candle_repository import CandleRepository
-from app.exceptions import AppError, InsufficientDataError, NetworkError
+from app.exceptions import AppError, InsufficientDataError, NetworkError, RateLimitError
 from app.logging import get_logger
 from market.cache.memory_cache import MarketCache
 from market.providers.base import ExchangeProvider
@@ -42,6 +47,65 @@ logger = get_logger(__name__)
 # روی اینترنت ناپایدار، یک درخواست ازدست‌رفته عادی است و نباید کل
 # برنامه را آفلاین نشان دهد. سه بار یعنی قطعیِ واقعی، نه یک چاله.
 REST_FAILURE_TOLERANCE = 3
+
+#: کمینهٔ عمر کش نتیجهٔ REST برای مصرف‌کنندگان دیگر (ثانیه). درخواست بدون
+#: کش (max_age=0) نباید کش مشترک را عملاً خاموش کند؛ وگرنه هر صفحه جداگانه
+#: سنگین‌ترین endpoint صرافی را صدا می‌زند و IP به محدودیت نرخ می‌خورد.
+MIN_SHARED_CACHE_SECONDS = 2.0
+
+#: مکث پیش‌فرض پس از پاسخ «درخواست زیاد» (HTTP 429) و مسدودی موقت (418).
+RATE_LIMIT_COOLDOWN_SECONDS = 30.0
+IP_BAN_COOLDOWN_SECONDS = 120.0
+MAX_COOLDOWN_SECONDS = 300.0
+
+#: ذخیرهٔ snapshot قیمت‌ها در DB برای حالت آفلاین؛ هر چند ثانیه کافی است.
+SNAPSHOT_PERSIST_INTERVAL = 30.0
+
+#: نسخهٔ ۲.۴.۱ — «درخواست انبوه» (پویش صدها/هزاران نماد).
+#:
+#: در این حالت کندل‌ها نه در پایگاه داده نوشته می‌شوند و نه در حافظهٔ نهان
+#: مشترک می‌نشینند. دلیل: پویش کل صرافی یعنی ~۴۰۰۰ درخواست کندل؛ نوشتن ۳۰۰
+#: کندل برای هر کدام میلیون‌ها ردیف SQLite و دیسکِ مشغول می‌ساخت (کل سیستم
+#: کند می‌شد)، و پرشدن حافظهٔ نهان ۵۰۰تایی، تیکر/قیمت داشبورد و معاملهٔ
+#: خودکار را بیرون می‌انداخت و درخواست REST اضافه و محدودیت نرخ می‌ساخت.
+#: ContextVar است تا فقط کارهای همان پویش (و تسک‌های فرزندش) را تحت تأثیر
+#: قرار دهد، نه داشبورد و معاملهٔ خودکار را که روی همان حلقه اجرا می‌شوند.
+_BULK_FETCH: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "market_bulk_fetch", default=False
+)
+
+
+@contextlib.contextmanager
+def bulk_fetch() -> Iterator[None]:
+    """علامت‌گذاری درخواست‌های این بلوک (و تسک‌های ساخته‌شده در آن) به‌عنوان انبوه."""
+    token = _BULK_FETCH.set(True)
+    try:
+        yield
+    finally:
+        _BULK_FETCH.reset(token)
+
+
+def is_bulk_fetch() -> bool:
+    """آیا درخواست جاری بخشی از یک پویش انبوه است؟"""
+    return _BULK_FETCH.get()
+
+
+_RATE_LIMIT_CODES = {429, 418, -1003, -1015, "429", "418", "-1003", "-1015"}
+
+
+def rate_limit_retry_after(exc: BaseException) -> float | None:
+    """اگر خطا محدودیت نرخ صرافی باشد، ثانیهٔ مکث پیشنهادی؛ وگرنه None."""
+    details = getattr(exc, "details", None) or {}
+    status = details.get("status") if isinstance(details, dict) else None
+    code = details.get("code") if isinstance(details, dict) else None
+    if not isinstance(exc, RateLimitError) and status not in _RATE_LIMIT_CODES and code not in _RATE_LIMIT_CODES:
+        return None
+    try:
+        hinted = float(details.get("retry_after") or 0) if isinstance(details, dict) else 0.0
+    except (TypeError, ValueError):
+        hinted = 0.0
+    default = IP_BAN_COOLDOWN_SECONDS if status in (418, "418") else RATE_LIMIT_COOLDOWN_SECONDS
+    return max(5.0, min(MAX_COOLDOWN_SECONDS, hinted or default))
 
 
 class MarketDataEngine:
@@ -82,7 +146,17 @@ class MarketDataEngine:
         self._rest_failures = 0
         self._symbols: dict[str, SymbolInfo] = {}
         self._inflight: dict[str, asyncio.Task[Any]] = {}
+        # نسخهٔ ۲.۶.۲: اختلاف ساعت محلی با صرافی (ms، مثبت = محلی جلوتر)
+        self.exchange_clock_offset_ms = 0.0
         self._lock = asyncio.Lock()
+        self._watchlist_subscriptions: set[str] = set()
+        self._explicit_subscriptions: set[str] = set()
+        #: تا این لحظهٔ monotonic هیچ درخواست REST عمومی فرستاده نمی‌شود.
+        self._rest_cooldown_until = 0.0
+        self._last_snapshot_persist = 0.0
+        #: زمان واقعی دریافت آخرین فهرست کامل تیکرها (نه زمان خواندن از کش).
+        self.all_tickers_fetched_at: datetime | None = None
+        self._rate_limit_events = 0
 
     # ------------------------------------------------------------------
     # چرخه عمر
@@ -119,7 +193,10 @@ class MarketDataEngine:
         if capabilities is None or not getattr(capabilities, "supports_websocket", False):
             return
         try:
-            client = self._provider.create_websocket_client(
+            from market.redundant_stream import RedundantStream
+
+            client = RedundantStream(
+                self._provider.create_websocket_client,
                 on_ticker=self._handle_live_ticker,
                 on_candle=self._handle_live_candle,
                 on_status_change=self._handle_ws_status,
@@ -127,7 +204,7 @@ class MarketDataEngine:
         except Exception as exc:  # noqa: BLE001 - سوکت نباید بالا آمدن برنامه را بشکند
             logger.warning("Live stream unavailable, using REST: %s", exc)
             return
-        if client is None:
+        if not client.available:
             logger.warning(
                 "Exchange '%s' advertises WebSocket support but provides no client; "
                 "falling back to REST polling",
@@ -149,9 +226,14 @@ class MarketDataEngine:
         همان قانون قبلی است. سوکت افتاده هم اینجا دوباره راه می‌افتد.
         """
         await self.ensure_streaming()
+        if self.rest_cooldown_remaining > 0:
+            # صرافی گفته صبر کن؛ پینگ اضافه فقط مسدودی را طولانی‌تر می‌کند.
+            return bool(self.is_online)
         try:
             ok = await self._provider.ping()
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            if self._note_rate_limit(exc):
+                return bool(self.is_online)
             self._mark_rest_alive(False)
             return bool(self.is_online)
         self._mark_rest_alive(bool(ok))
@@ -162,6 +244,11 @@ class MarketDataEngine:
         if self._websocket is not None:
             await self._websocket.stop()
             self._websocket = None
+        pending = list(self._inflight.values())
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        self._inflight.clear()
         await self._provider.close()
         self._update_status(ConnectionStatus.DISCONNECTED)
         logger.info("Market data engine stopped")
@@ -188,6 +275,42 @@ class MarketDataEngine:
     def websocket_status(self) -> ConnectionStatus:
         """وضعیت اتصال WebSocket."""
         return self._websocket.status if self._websocket else ConnectionStatus.DISCONNECTED
+
+    @property
+    def stream_stats(self) -> dict[str, Any]:
+        if self._websocket is None:
+            return {"connections": 0, "connected": 0, "status": "disconnected"}
+        return self._websocket.stats()
+
+    @property
+    def rest_cooldown_remaining(self) -> float:
+        """ثانیه‌های باقی‌ماندهٔ مکث اجباری پس از محدودیت نرخ صرافی."""
+        return max(0.0, self._rest_cooldown_until - time.monotonic())
+
+    def rest_health(self) -> dict[str, Any]:
+        """خلاصهٔ سلامت مسیر REST برای داشبورد."""
+        return {
+            "alive": bool(self._rest_alive),
+            "failures": int(self._rest_failures),
+            "cooldown_seconds": round(self.rest_cooldown_remaining, 1),
+            "rate_limit_events": int(self._rate_limit_events),
+            "last_snapshot": self.all_tickers_fetched_at,
+        }
+
+    def _note_rate_limit(self, exc: BaseException) -> bool:
+        """ثبت محدودیت نرخ؛ اتصال سالم است ولی باید مکث کرد."""
+        retry_after = rate_limit_retry_after(exc)
+        if retry_after is None:
+            return False
+        until = time.monotonic() + retry_after
+        if until > self._rest_cooldown_until:
+            self._rest_cooldown_until = until
+            self._rate_limit_events += 1
+            logger.warning(
+                "Exchange '%s' rate-limited REST; pausing public requests for %.0fs",
+                self._provider.name, retry_after,
+            )
+        return True
 
     @property
     def cache_stats(self) -> dict[str, Any]:
@@ -281,7 +404,7 @@ class MarketDataEngine:
         self._live_tickers[ticker.symbol] = ticker
         # تیک زنده یعنی داده می‌رسد. افتادن یک درخواست REST نباید
         # برنامه‌ای را که قیمت لحظه‌ای دارد آفلاین نشان دهد.
-        self._mark_rest_alive(True)
+        self._update_status(ConnectionStatus.CONNECTED)
         for listener in list(self._ticker_listeners):
             try:
                 listener(ticker)
@@ -323,22 +446,33 @@ class MarketDataEngine:
         پیاده‌سازی با Task انجام شده (نه Future دستی) تا اگر عملیات خطا دهد و
         هیچ‌کس منتظر نباشد، هشدار «استثنای بازیابی‌نشده» در لاگ ظاهر نشود.
         """
+        remaining = self.rest_cooldown_remaining
+        if remaining > 0:
+            raise RateLimitError(
+                "Exchange rate limit cooldown in progress",
+                details={"retry_after": round(remaining, 1), "cooldown": True},
+            )
+
+        async def guarded() -> Any:
+            try:
+                return await factory()
+            except Exception as exc:
+                self._note_rate_limit(exc)
+                raise
+
         async with self._lock:
             task = self._inflight.get(key)
-            is_owner = task is None
             if task is None:
-                task = asyncio.ensure_future(factory())
+                task = asyncio.ensure_future(guarded())
                 self._inflight[key] = task
-
-        try:
-            return await asyncio.shield(task)
-        finally:
-            if is_owner:
-                async with self._lock:
-                    self._inflight.pop(key, None)
-                # بازیابی استثنا برای جلوگیری از هشدار asyncio
-                if task.done() and not task.cancelled():
-                    task.exception()
+                def finished(done):
+                    if self._inflight.get(key) is done:
+                        self._inflight.pop(key, None)
+                    if not done.cancelled():
+                        done.exception()
+                task.add_done_callback(finished)
+        # A timed-out caller must not remove a still-running provider request.
+        return await asyncio.shield(task)
 
     # ------------------------------------------------------------------
     # نمادها
@@ -378,33 +512,89 @@ class MarketDataEngine:
         می‌شود و نتیجه برای مدت کوتاهی در حافظه نهان می‌ماند.
         """
         live = self._live_tickers.get(symbol)
-        if live is not None:
+        if max_age_seconds > 0 and live is not None and self._ticker_is_fresh(live, max_age_seconds, self._offset_seconds()):
             return live
 
         cache_key = MarketCache.make_key("ticker", self._provider.name, symbol)
-        cached = self._cache.get(cache_key)
+        cached = self._cache.get(cache_key) if max_age_seconds > 0 else None
         if cached is not None:
             return cached
 
         async def _fetch() -> Ticker:
             ticker = await self._provider.get_ticker(symbol)
-            self._cache.set(cache_key, ticker, ttl_seconds=max_age_seconds)
-            self._persist_ticker(ticker)
+            self._mark_rest_alive(True)
+            self._cache.set(cache_key, ticker, ttl_seconds=max(max_age_seconds, MIN_SHARED_CACHE_SECONDS))
+            if max_age_seconds > 0:
+                self._persist_ticker(ticker)
             return ticker
 
         return await self._deduplicated(cache_key, _fetch)
 
 
+    def _observe_clock(self, tickers: list[Ticker]) -> None:
+        """اختلاف ساعت از تازه‌ترین مهر دستهٔ کامل (نسخهٔ ۲.۶.۲)."""
+        import time
+
+        try:
+            stamps = [int(getattr(t, "timestamp", 0) or 0) for t in tickers or []]
+            stamps = [s if s > 10_000_000_000 else s * 1000 for s in stamps if s > 0]
+            if len(stamps) < 20:
+                return
+            sample = time.time() * 1000.0 - max(stamps)
+            if abs(sample) > 48 * 3600 * 1000.0:
+                return
+            self.exchange_clock_offset_ms = sample if abs(sample) >= 2000.0 else 0.0
+        except Exception:  # noqa: BLE001
+            logger.debug("Clock offset estimation failed", exc_info=True)
+
+    def _offset_seconds(self) -> float:
+        return float(getattr(self, "exchange_clock_offset_ms", 0.0) or 0.0) / 1000.0
+
     @staticmethod
-    def _ticker_is_fresh(ticker: Ticker, max_age: float = 15.0) -> bool:
-        """تیکر بدون زمان دیده‌شدن کهنه حساب نمی‌شود."""
+    def _ticker_is_fresh(ticker: Ticker, max_age: float = 15.0, clock_offset_seconds: float = 0.0) -> bool:
+        """تیکر بدون زمان دیده‌شدن کهنه حساب نمی‌شود؛ اختلاف ساعت محلی اصلاح می‌شود."""
         import time
 
         seen = int(getattr(ticker, "timestamp", 0) or 0)
         if seen <= 0:
             return True
         stamp = seen / 1000.0 if seen > 10_000_000_000 else float(seen)
-        return time.time() - stamp <= max_age
+        stamp += float(clock_offset_seconds or 0.0)
+        return -5 <= time.time() - stamp <= max_age
+
+    async def refresh_execution_book(self, symbol: str, tick_engine: Any) -> bool:
+        """
+        فقط دفتر سفارش (یک درخواست) → کش تیک. نسخهٔ ۲.۶.۱.
+
+        پیش‌خوانی اسکالپ فقط Bid/Ask لازم دارد؛ قبلاً همراهش تیکر هم
+        خوانده می‌شد و با شکست/کهنگیِ تیکر، دفترِ سالم دور ریخته می‌شد.
+        """
+        book = await asyncio.wait_for(self._provider.get_orderbook(symbol, depth=5), timeout=3.0)
+        return tick_engine.record_book(symbol, book) is not None
+
+    async def refresh_execution_quote(self, symbol: str, tick_engine: Any) -> float:
+        """REST واقعی، بدون کش؛ روی همان صرافی و در نخ asyncio وارد کش تیک می‌شود."""
+        ticker, book = await asyncio.gather(
+            self.get_ticker(symbol, max_age_seconds=0),
+            asyncio.wait_for(self._provider.get_orderbook(symbol, depth=5), timeout=3.0),
+            return_exceptions=True,
+        )
+        # نسخهٔ ۲.۶.۱: دفتر سالم مستقل از نتیجهٔ تیکر ثبت می‌شود.
+        if not isinstance(book, BaseException) and book is not None:
+            try:
+                tick_engine.record_book(symbol, book)
+            except Exception:  # noqa: BLE001
+                logger.debug("record_book failed for %s", symbol, exc_info=True)
+        if isinstance(ticker, BaseException):
+            raise ticker
+        offset_s = float(getattr(tick_engine, "clock_offset_ms", 0.0) or 0.0) / 1000.0 or self._offset_seconds()
+        if not self._ticker_is_fresh(ticker, tick_engine.stale_after_ms / 1000, offset_s):
+            return 0.0
+        tick_engine.record(symbol, ticker.last_price, source="rest",
+                           exchange_ts=ticker.timestamp, change_percent=ticker.change_percent)
+        if not isinstance(book, BaseException) and book is not None:
+            tick_engine.record_book(symbol, book)
+        return float(ticker.last_price)
 
     async def get_current_price(self, symbol: str) -> float:
         """
@@ -414,7 +604,7 @@ class MarketDataEngine:
         هرگز قیمت حدسی برگردانده نمی‌شود.
         """
         live = self._live_tickers.get(symbol)
-        if live is not None and live.last_price > 0 and self._ticker_is_fresh(live):
+        if live is not None and live.last_price > 0 and self._ticker_is_fresh(live, 15.0, self._offset_seconds()):
             return live.last_price
 
         cache_key = MarketCache.make_key("price", self._provider.name, symbol)
@@ -455,7 +645,7 @@ class MarketDataEngine:
         می‌کند.
         """
         cache_key = MarketCache.make_key("all_tickers", self._provider.name)
-        cached = self._cache.get(cache_key)
+        cached = self._cache.get(cache_key) if max_age_seconds > 0 else None
         if cached is not None:
             return cached
 
@@ -463,15 +653,23 @@ class MarketDataEngine:
             tickers = await self._provider.get_all_tickers()
             # موفقیت REST یعنی واقعاً آنلاین هستیم، حتی اگر WebSocket افتاده باشد
             self._mark_rest_alive(True)
-            self._cache.set(cache_key, tickers, ttl_seconds=max_age_seconds)
-            for ticker in tickers[:50]:
-                self._persist_ticker(ticker)
+            self._observe_clock(tickers)
+            self.all_tickers_fetched_at = datetime.now(UTC)
+            self._cache.set(cache_key, tickers, ttl_seconds=max(max_age_seconds, MIN_SHARED_CACHE_SECONDS))
+            now = time.monotonic()
+            if now - self._last_snapshot_persist >= SNAPSHOT_PERSIST_INTERVAL:
+                # نوشتن هم‌زمان DB روی نخ شبکه، حلقهٔ asyncio را کند می‌کند.
+                self._last_snapshot_persist = now
+                for ticker in tickers[:50]:
+                    self._persist_ticker(ticker)
             return tickers
 
         try:
             return await self._deduplicated(cache_key, _fetch)
-        except Exception:
-            self._mark_rest_alive(False)
+        except Exception as exc:
+            # محدودیت نرخ یعنی صرافی در دسترس است؛ آفلاین شمردنش غلط است.
+            if rate_limit_retry_after(exc) is None:
+                self._mark_rest_alive(False)
             raise
 
     def _persist_ticker(self, ticker: Ticker) -> None:
@@ -526,6 +724,9 @@ class MarketDataEngine:
             # `get_all_tickers` سلامت را گزارش می‌کرد، برای همین کاربری
             # که در صفحهٔ تحلیل بود آفلاین می‌ماند با اینکه داده می‌آمد.
             self._mark_rest_alive(True)
+            if is_bulk_fetch():
+                # پویش انبوه: نه دیسک، نه بیرون‌انداختن دادهٔ داغ از حافظهٔ نهان
+                return candles
             ttl = self._cache_ttl_for(timeframe)
             self._cache.set(cache_key, candles, ttl_seconds=ttl)
             self._persist_candles(symbol, timeframe, candles)
@@ -540,7 +741,8 @@ class MarketDataEngine:
             logger.warning(
                 "Falling back to stored candles for %s %s: %s", symbol, timeframe, exc.__class__.__name__
             )
-            self._mark_rest_alive(False)
+            if rate_limit_retry_after(exc) is None:
+                self._mark_rest_alive(False)
             stored = self._load_stored_candles(symbol, timeframe, count)
             if stored:
                 return stored
@@ -648,6 +850,7 @@ class MarketDataEngine:
         """
         if self._websocket is None:
             return
+        self._explicit_subscriptions.add(symbol)
         await self._websocket.subscribe_ticker(symbol)
         if timeframe:
             await self._websocket.subscribe_candles(symbol, timeframe)
@@ -656,7 +859,9 @@ class MarketDataEngine:
         """لغو اشتراک داده زنده یک نماد."""
         if self._websocket is None:
             return
-        await self._websocket.unsubscribe_ticker(symbol)
+        self._explicit_subscriptions.discard(symbol)
+        if symbol not in self._watchlist_subscriptions:
+            await self._websocket.unsubscribe_ticker(symbol)
         if timeframe:
             await self._websocket.unsubscribe_candles(symbol, timeframe)
 
@@ -668,7 +873,10 @@ class MarketDataEngine:
         """
         if self._websocket is None:
             return
-        await self._websocket.unsubscribe_all()
-        for symbol in symbols[:max_symbols]:
+        desired = set(symbols[:max_symbols])
+        for symbol in self._watchlist_subscriptions - desired - self._explicit_subscriptions:
+            await self._websocket.unsubscribe_ticker(symbol)
+        for symbol in desired - self._watchlist_subscriptions:
             await self._websocket.subscribe_ticker(symbol)
+        self._watchlist_subscriptions = desired
         logger.debug("Watchlist subscriptions updated (%d symbols)", min(len(symbols), max_symbols))

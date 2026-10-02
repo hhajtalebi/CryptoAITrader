@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -75,6 +76,8 @@ ANALYSIS_INDICATORS: tuple[str, ...] = (
 )
 
 #: بیشینه تعداد نماد در جدول بازارها (فهرست کامل صرافی هزاران ردیف است)
+# v2.5.1: نشانگر مهاجرت یک‌بارهٔ ترتیب پیش‌فرض بازارها از «value» به «market_cap»
+MARKETS_SORT_MIGRATION_KEY = "ui.markets_sort_v251_migrated"
 MARKET_ROW_LIMIT = 300
 
 #: تعداد نقطهٔ نگه‌داشته‌شده برای نمودار کوچک ستون «روند»
@@ -100,13 +103,16 @@ AI_STATUS_INTERVAL = 180_000
 #: اجرا می‌شود نه هر تیک.
 AUTO_SCAN_TICK_MS = 15_000
 
+#: ۲.۴.۱ — سهم CPU پویش پس‌زمینهٔ خودکار (رجوع: signals.scanner)
+from signals.scanner import BACKGROUND_CPU_DUTY  # noqa: E402
+
 #: تیک بررسی نتیجهٔ سیگنال‌ها. برخلاف پویش، اینجا فقط قیمت خوانده
 #: می‌شود و هزینه‌اش ناچیز است؛ ولی فاصلهٔ واقعی را کاربر تعیین می‌کند
 #: و این تیک صرفاً موعد را می‌سنجد.
 OUTCOME_TICK_MS = 30_000
 # فاصلهٔ پایش معاملات باز. قیمت از کش خوانده می‌شود؛ REST فقط وقتی
 # کش کهنه باشد. دو ثانیه برای بستن سریع اسکالپ کافی است.
-TRADE_MONITOR_TICK_MS = 2_000
+TRADE_MONITOR_TICK_MS = 1_000
 
 #: فاصلهٔ تازه‌سازی داشبورد ترمینال معاملهٔ خودکار (v2.0). خروج
 #: موقعیت‌ها تیک‌محور است؛ این تایمر فقط «نمایش» را تازه می‌کند.
@@ -123,6 +129,43 @@ LIVE_PRICE_TICK_MS = 1_000
 
 #: نگه داشتن اتصال و تلاش دوبارهٔ سوکت
 KEEPALIVE_TICK_MS = 15_000
+
+
+def summarise_market(tickers: Any, *, liquid_count: int = 200, movers: int = 5) -> dict[str, Any]:
+    """
+    پهنای بازار و بیشترین رشد/افت، فقط روی بازارهای نقدشونده.
+
+    بازار کم‌گردش با یک معامله ۴۰٪ جابه‌جا می‌شود؛ رتبه‌بندی بر پایهٔ آن
+    گمراه‌کننده است. پس ابتدا `liquid_count` بازار پرگردش انتخاب می‌شوند.
+    """
+    items = []
+    for ticker in tickers or []:
+        try:
+            price = float(getattr(ticker, "last_price", 0) or 0)
+            turnover = float(getattr(ticker, "turnover_24h", 0) or 0)
+            change = float(getattr(ticker, "change_percent", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if price <= 0 or turnover <= 0 or change != change:
+            continue
+        items.append({"symbol": str(ticker.symbol), "price": price,
+                      "change_percent": change, "turnover": turnover})
+    items.sort(key=lambda row: row["turnover"], reverse=True)
+    liquid = items[:liquid_count]
+    if not liquid:
+        return {"total": 0, "gainers": [], "losers": []}
+    up = sum(1 for row in liquid if row["change_percent"] > 0.05)
+    down = sum(1 for row in liquid if row["change_percent"] < -0.05)
+    ranked = sorted(liquid, key=lambda row: row["change_percent"], reverse=True)
+    return {
+        "total": len(liquid),
+        "up": up,
+        "down": down,
+        "flat": len(liquid) - up - down,
+        "avg_change": sum(row["change_percent"] for row in liquid) / len(liquid),
+        "gainers": [row for row in ranked[:movers] if row["change_percent"] > 0],
+        "losers": [row for row in reversed(ranked[-movers:]) if row["change_percent"] < 0],
+    }
 
 #: دفترچهٔ نتیجه، فقط اگر کاربر خودش خودکار را روشن کرده باشد
 SCORECARD_TICK_MS = 3_600_000
@@ -145,6 +188,11 @@ class MainController(QObject):
     #: پیشرفت پویش بازار (انجام‌شده، کل، نماد، یافته‌شده). مثل بالا،
     #: سیگنال است چون پس‌فراخوانِ پویشگر روی نخ شبکه اجرا می‌شود.
     scan_progress_changed = Signal(int, int, str, int)
+    #: نسخهٔ ۲.۴.۰ — هر سیگنالِ پذیرفته‌شده در میانهٔ پویش دستی (نخ شبکه → UI)
+    scan_partial_found = Signal(object)
+    #: نسخهٔ ۲.۴.۰ — سیگنال/پیشرفتِ پویش خودکار (نخ شبکه → UI)
+    auto_scan_signal_found = Signal(object)
+    auto_scan_progress = Signal(int, int)
     #: رویداد موتور معاملهٔ خودکار (نخ شبکه → نخ رابط کاربری)
     auto_trade_event = Signal(str, dict)
 
@@ -216,7 +264,21 @@ class MainController(QObject):
         self.trades = window.pages["nav.trades"]
         self.wallet = window.pages["nav.wallet"]
         self.settings_page = window.pages["nav.settings"]
+        # نسخهٔ ۲.۶.۰: مرکز لاگ — مخزن ممیزی و پوشهٔ لاگ برنامه
+        self.log_center = window.pages.get("nav.logs")
+        if self.log_center is not None and hasattr(self.log_center, "set_sources"):
+            try:
+                self.log_center.set_sources(
+                    audit_repository=getattr(self.app, "audit_repository", None),
+                    logs_dir=getattr(getattr(self.app, "paths", None), "logs_dir", None),
+                )
+            except Exception:  # noqa: BLE001 - مرکز لاگ نباید راه‌اندازی را بشکند
+                logger.debug("Log center wiring failed", exc_info=True)
 
+        #: ۲.۴.۲ — تازه‌سازی تنبل صفحهٔ عملکرد
+        self._outcome_view_stale = True
+        self._outcome_watch_installed = False
+        self._stall_watchdog = None
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setInterval(60_000)
         self._refresh_timer.timeout.connect(self.refresh_dashboard)
@@ -299,6 +361,9 @@ class MainController(QObject):
         self.chat_tool_started.connect(self._on_chat_tool_started)
         self.chat_tool_finished.connect(self._on_chat_tool_finished)
         self.scan_progress_changed.connect(self.signals.set_scan_progress)
+        self.scan_partial_found.connect(self._on_scan_partial_signal)
+        self.auto_scan_signal_found.connect(self._on_auto_partial_signal)
+        self.auto_scan_progress.connect(self._on_auto_scan_progress)
         self.auto_trade_event.connect(self._handle_auto_trade_event)
         self.chat.action_requested.connect(self._on_chat_action)
         self.chat.chat_cleared.connect(self._on_chat_cleared)
@@ -323,10 +388,12 @@ class MainController(QObject):
         self.signals.generate_button.clicked.connect(self.generate_signal)
         self.signals.scan_requested.connect(self.scan_market)
         self.signals.auto_scan_changed.connect(self.save_auto_scan_config)
+        self.signals.scan_settings_changed.connect(self.save_scan_settings)
         self.signals.auto_scan_run_now.connect(self.run_auto_scan_now)
         self.signals.scan_stop_requested.connect(self.stop_market_scan)
         self.signals.scan_ai_requested.connect(self.analyze_scanned_symbol)
         self.signals.scan_detail_requested.connect(self.show_scanned_signal_detail)
+        self.signals.copy_notice.connect(lambda message: self._toast(message, level="success"))
         self.reports.generate_button.clicked.connect(self.generate_report)
         if self.performance is not None:
             self.performance.refresh_requested.connect(self.refresh_outcomes_now)
@@ -344,6 +411,8 @@ class MainController(QObject):
         self.trades.filters_changed.connect(lambda _f: self.refresh_trades())
         self.trades.refresh_requested.connect(self.refresh_trades)
         self.trades.close_requested.connect(self.close_paper_trade)
+        if hasattr(self.trades, "manual_trade_requested"):
+            self.trades.manual_trade_requested.connect(lambda: self.open_manual_trade_dialog())
         self.trades.close_blocked.connect(
             lambda: self._toast(
                 self.tr_.tr("trades.no_open_trade_selected"), level="warning"
@@ -374,7 +443,7 @@ class MainController(QObject):
         )
         self._terminal_timer = QTimer(self.window)
         self._terminal_timer.setInterval(TERMINAL_UI_INTERVAL_MS)
-        self._terminal_timer.timeout.connect(self._refresh_auto_terminal)
+        self._terminal_timer.timeout.connect(self._terminal_timer_tick)
         self._terminal_timer.start()
         self._terminal_stats_tick = 0
         # پنل باید از همان ابتدا تنظیم‌های واقعی کاربر را نشان دهد،
@@ -383,8 +452,14 @@ class MainController(QObject):
         self.trades.export_requested.connect(self.export_trades)
         self.trades.clear_requested.connect(self.clear_trade_history)
         self.markets.alert_requested.connect(self.create_price_alert)
+        # v2.5.1: منوی کلیک راست جدول بازارها
+        self.markets.analyze_requested.connect(lambda sym: self._coin_analyze(sym, ""))
+        self.markets.signal_requested.connect(lambda sym: self._coin_signal(sym, ""))
         self.wallet.sync_requested.connect(self.sync_wallet)
+        self.wallet.auto_sync_toggled.connect(self._on_wallet_auto_sync_toggled)
         self.wallet.range_changed.connect(lambda _r: self.refresh_wallet())
+        if hasattr(self.wallet, "paper_sync_requested"):
+            self.wallet.paper_sync_requested.connect(self.sync_paper_balance_with_wallet)
 
         # ---- حساب کاربری و حساب‌های صرافی ----
         self.window.login_requested.connect(self.show_auth_dialog)
@@ -423,6 +498,14 @@ class MainController(QObject):
             return
         self._started = True
         self.runner.start()
+        # نسخهٔ ۲.۴.۲: هر «هنگ» نخ رابط با پشتهٔ دقیق در لاگ ثبت می‌شود
+        try:
+            from ui.responsiveness import UiStallWatchdog
+
+            self._stall_watchdog = UiStallWatchdog(self)
+            self._stall_watchdog.start()
+        except Exception:  # noqa: BLE001 - فقط ابزار تشخیص است
+            logger.debug("UI stall watchdog unavailable", exc_info=True)
         self.analysis.apply_chart_palette(self.themes.palette)
         self.trades.apply_chart_palette(self.themes.palette)
         self._populate_indicator_catalog()
@@ -431,6 +514,8 @@ class MainController(QObject):
         # زده نمی‌شد خالی می‌ماند و صفحه بی‌استفاده به نظر می‌رسید.
         # حالا اولین ورود به صفحه، خودش تحلیل را اجرا می‌کند.
         self.analysis.on_activated = self._on_analysis_activated
+        # v2.5.1: ورود به کیف پول، اگر موجودی کهنه باشد، همگام‌سازی می‌کند
+        self.wallet.on_activated = self._on_wallet_activated
         self.settings_page.load_values(self.app.settings.export_all())
         self.apply_display_preferences()
         self._sync_user_chrome()
@@ -485,6 +570,16 @@ class MainController(QObject):
                 except Exception:  # noqa: BLE001 - خاموشی هرگز نباید خطا بدهد
                     logger.warning("Engine shutdown did not finish cleanly")
         self.runner.stop()
+        # کارگرهای استخر محاسبه (۲.۴.۲) حتی اگر app.stop به موقع تمام نشد
+        pool = getattr(self.app, "_compute_pool", None)
+        if pool is not None:
+            try:
+                pool.shutdown()
+            except Exception:  # noqa: BLE001
+                pass
+        stall_watchdog = getattr(self, "_stall_watchdog", None)
+        if stall_watchdog is not None:
+            stall_watchdog.stop()
         logger.info("Controller shut down")
 
     def _on_engines_ready(self) -> None:
@@ -500,6 +595,8 @@ class MainController(QObject):
         self._apply_display_settings()
         self.load_conversations()
         self.status(self.tr_.tr("common.online"))
+        # نسخهٔ ۲.۵.۹: اولامای محلی روشن و مدلش در پس‌زمینه بارگذاری می‌شود
+        QTimer.singleShot(2_000, self._warm_up_local_ai)
         self.dashboard.set_connection_status(self.tr_.tr("common.online"), "bullish")
         self.window.set_connection_indicator(True)
         self.markets.set_palette(self.themes.palette)
@@ -516,6 +613,7 @@ class MainController(QObject):
         self.start_live_chart()
         self.start_connection_keepalive()
         self.start_scorecard_timer()
+        self.start_wallet_auto_sync()
         if hasattr(self.reports, "set_scorecard_auto"):
             self.reports.set_scorecard_auto(
                 self.app.settings.get_bool("signals.scorecard_auto", False)
@@ -544,8 +642,11 @@ class MainController(QObject):
         from market.live_feed import LivePriceFeed
         from market.resilience import ConnectionSupervisor
 
-        self._live_feed = LivePriceFeed(self.app.market)
-        self._live_feed.add_listener(self._on_price_update)
+        bound_market = self.app.market
+        self._live_feed = LivePriceFeed(bound_market)
+        self._live_feed.add_listener(
+            lambda updates: self._on_price_update(updates) if self.app.market is bound_market else None
+        )
 
         self.runner.submit(
             "live-feed",
@@ -626,7 +727,14 @@ class MainController(QObject):
                     symbols.append(symbol)
         except Exception:  # noqa: BLE001
             logger.debug("Open-trade symbols unavailable", exc_info=True)
-        return [item for item in symbols if item]
+        priority = []
+        if engine is not None:
+            priority.extend(t.symbol for t in engine.open_trades)
+        try:
+            priority.extend(r["symbol"] for r in self.app.trade_repository.open_trades(self.app.auth.user_id))
+        except Exception:
+            pass
+        return list(dict.fromkeys(item for item in priority + symbols if item))
 
     async def _sync_streams(
         self,
@@ -652,8 +760,24 @@ class MainController(QObject):
         """
         try:
             # سرویس، نگاشت «نماد به به‌روزرسانی» می‌فرستد
-            items = updates.values() if isinstance(updates, dict) else updates
+            items = list(updates.values() if isinstance(updates, dict) else updates)
+            ticks = getattr(self, "_tick_engine", None)
+            observe = getattr(ticks, "observe_exchange_clock", None)
+            if callable(observe):
+                # نسخهٔ ۲.۶.۱: اختلاف ساعت از تازه‌ترین نماد دستهٔ REST
+                rest_items = [u for u in items if getattr(u, "source", "") == "rest"
+                              and getattr(u, "exchange_ts", 0)]
+                if len(rest_items) >= 20:
+                    freshest = max(rest_items, key=lambda u: float(u.exchange_ts or 0))
+                    observe(freshest.exchange_ts, freshest.updated_at.timestamp() * 1000)
             for update in items:
+                ticks = getattr(self, "_tick_engine", None)
+                if ticks is not None and getattr(update, "source", "") == "rest":
+                    ticks.record(update.symbol, update.price, source="rest",
+                                 exchange_ts=getattr(update, "exchange_ts", None),
+                                 received_at_ms=update.updated_at.timestamp() * 1000)
+                if not getattr(update, "changed", True):
+                    continue
                 self._pending_updates[update.symbol] = {
                     "price": update.price,
                     "change_percent": update.change_percent,
@@ -720,7 +844,14 @@ class MainController(QObject):
         elif self.app.market is not None:
             online = bool(self.app.market.is_online)
 
-        if state == "degraded":
+        cooldown = 0.0
+        if self.app.market is not None and hasattr(self.app.market, "rest_cooldown_remaining"):
+            cooldown = float(self.app.market.rest_cooldown_remaining or 0.0)
+        if state != "online" and cooldown > 0:
+            # صرافی موقتاً درخواست‌ها را محدود کرده؛ اینترنت قطع نیست.
+            label = self.tr_.tr("dashboard.command.rate_limited")
+            role = "neutral"
+        elif state == "degraded":
             # حلقه‌ها زنده‌اند ولی داده کهنه است — در حال بازاتصال، نه آفلاین
             label = self.tr_.tr("common.reconnecting")
             role = "neutral"
@@ -745,6 +876,74 @@ class MainController(QObject):
         self.window.set_connection_card(
             connected=online, exchange=exchange, detail=detail
         )
+        self._refresh_command_center()
+
+    def _refresh_command_center(self, *, force: bool = False) -> None:
+        """
+        کاشی‌های مرکز فرمان داشبورد (2.3.1).
+
+        فقط از داده‌ای که همین حالا در حافظه/DB است؛ هیچ درخواست شبکه‌ای
+        نمی‌زند. وضعیت اتصال هر ۳ ثانیه و پرسش‌های DB هر ۱۰ ثانیه (یا پس از
+        تازه‌سازی داشبورد) اجرا می‌شوند.
+        """
+        dashboard = getattr(self, "dashboard", None)
+        if dashboard is None or not hasattr(dashboard, "set_connection_health"):
+            return
+        now = time.monotonic()
+        if not force and now - getattr(self, "_command_center_at", 0.0) < 3.0:
+            return
+        self._command_center_at = now
+        try:
+            market = self.app.market
+            supervisor = getattr(self, "_connection_supervisor", None)
+            feed = getattr(self, "_live_feed", None)
+            state = "starting"
+            if supervisor is not None:
+                state = str(getattr(supervisor.state, "value", "offline"))
+            elif market is not None and market.is_online:
+                state = "online"
+            dashboard.set_connection_health({
+                "state": state,
+                "exchange": getattr(market, "exchange_name", "") if market is not None else "",
+                "data_age": getattr(feed, "data_age_seconds", None) if feed is not None else None,
+                "streams": getattr(market, "stream_stats", {}) if market is not None else {},
+                "rest": market.rest_health() if market is not None and hasattr(market, "rest_health") else {},
+            })
+
+            engine = getattr(self, "_auto_trader_engine", None)
+            config = engine.config if engine is not None else self._auto_trade_config()
+            dashboard.set_engine_status({
+                "exists": engine is not None,
+                "running": bool(engine is not None and engine.is_running),
+                "halted": bool(engine is not None and getattr(engine, "_halted_reason", "")),
+                "open": len(engine.open_trades) if engine is not None else 0,
+                "max": int(getattr(config, "max_concurrent", 0) or 0),
+                "live": str(getattr(config, "mode", "paper")).lower() == "live",
+                "daily_limit": float(getattr(config, "daily_loss_limit", 0) or 0),
+            })
+
+            if not force and now - getattr(self, "_command_db_at", 0.0) < 10.0:
+                return
+            self._command_db_at = now
+            repo = self.app.trade_repository
+            user_id = self.app.auth.user_id
+            records = list(repo.open_trades(user_id) or [])
+            marked = [r for r in records if r.get("last_price")]
+            margin = 0.0
+            for record in records:
+                leverage = float(record.get("leverage") or 1.0) or 1.0
+                margin += float(record.get("quantity") or 0.0) * float(record.get("entry_price") or 0.0) / leverage
+            realised = repo.daily_realised_pnl(user_id) if hasattr(repo, "daily_realised_pnl") else None
+            statistics = repo.statistics(user_id=user_id)
+            dashboard.set_portfolio({
+                "open_count": len(records),
+                "unrealised": sum(float(r.get("pnl") or 0.0) for r in marked) if marked else None,
+                "realised_today": float(realised) if realised is not None else None,
+                "margin": margin if records else None,
+                "win_rate": float(statistics.get("win_rate", 0.0)) if statistics.get("closed", statistics.get("total", 0)) else None,
+            })
+        except Exception:  # noqa: BLE001 - داشبورد نباید برنامه را بخواباند
+            logger.debug("Command center refresh failed", exc_info=True)
 
     # ------------------------------------------------------------------
     # وضعیت هوش مصنوعی
@@ -930,6 +1129,7 @@ class MainController(QObject):
                 )
             return {
                 "market_rows": rows,
+                "market_summary": summarise_market(tickers),
                 "online": self.app.market.is_online,
                 "exchange": self.app.market.exchange_name,
                 "websocket": self.app.market.websocket_status,
@@ -939,6 +1139,11 @@ class MainController(QObject):
             """نمایش داده گردآوری‌شده."""
             rows = payload["market_rows"]
             self.dashboard.set_market_rows(rows)
+            summary = payload.get("market_summary") or {}
+            if summary.get("total"):
+                self.dashboard.set_breadth(summary)
+                self.dashboard.set_movers(summary.get("gainers", []), summary.get("losers", []))
+            self._refresh_command_center(force=True)
             self.dashboard.set_ticker_items(
                 [
                     {
@@ -982,28 +1187,43 @@ class MainController(QObject):
             return
         self.status(self.tr_.tr("markets.loading"))
 
-        async def collect() -> tuple[list[dict[str, Any]], list[str]]:
+        async def collect() -> tuple[list[dict[str, Any]], list[str], list[Any]]:
             """دریافت تیکرها و نمادها."""
             tickers = await self.app.market.get_all_tickers()
-            rows = [
-                {
+            # v2.5.1: دقت قیمت هر نماد از فهرست نمادهای صرافی (کش یک‌ساعته)
+            # تا قیمت تتری دقیقاً با همان رقم اعشار صرافی نمایش داده شود.
+            infos: dict[str, Any] = {}
+            try:
+                infos = {info.symbol: info for info in await self.app.market.get_symbols()}
+            except Exception:  # noqa: BLE001 - نبود دقت فقط یعنی حدس رقم اعشار
+                logger.debug("Symbol precision unavailable", exc_info=True)
+            rows = []
+            for ticker in tickers:
+                info = infos.get(ticker.symbol)
+                rows.append({
                     "symbol": ticker.symbol,
                     "price": ticker.last_price,
                     "change_percent": ticker.change_percent,
                     "high": ticker.high_24h,
                     "volume": ticker.volume_24h,
-                }
-                for ticker in tickers
-            ]
+                    # ارزش معاملات ۲۴ ساعته به ارز مرجع (برای LBank: turnover)
+                    "quote_volume": ticker.turnover_24h,
+                    "price_precision": getattr(info, "price_precision", None),
+                })
             self._remember_prices(rows)
-            # پرگردش‌ترین بازارها بالا؛ فهرست کامل صرافی برای جدول زیاد است
-            rows.sort(key=lambda row: row.get("volume") or 0.0, reverse=True)
-            symbols = [row["symbol"] for row in rows]
-            return rows[:MARKET_ROW_LIMIT], symbols
+            # v2.5.1: ترتیب «ارزش بازار + ارزش معاملات» پیش از برش ۳۰۰ ردیفی.
+            # قبلاً حجم خام (تعداد واحد) مبنا بود: ارزهای بسیار ارزان با حجم
+            # عددی بزرگ بالای بیت‌کوین می‌نشستند.
+            from market.market_rank import quote_usdt_prices, sort_by_market_value
 
-        def apply(payload: tuple[list[dict[str, Any]], list[str]]) -> None:
+            rows = sort_by_market_value(rows, quote_usdt_prices(rows))
+            symbols = [row["symbol"] for row in rows]
+            return rows[:MARKET_ROW_LIMIT], symbols, list(infos.values())
+
+        def apply(payload: tuple[list[dict[str, Any]], list[str], list[Any]]) -> None:
             """نمایش بازارها و پر کردن همه فهرست‌های نماد."""
-            rows, symbols = payload
+            rows, symbols, infos = payload
+            self._sync_symbol_table(infos)
             self._symbols = symbols
             self.markets.set_palette(self.themes.palette)
             # ستاره‌ها باید پیش از ترسیم ردیف‌ها شناخته شده باشند
@@ -1042,40 +1262,73 @@ class MainController(QObject):
             on_finished=lambda: self.markets.refresh_button.finish_busy(),
         )
 
+    def _sync_symbol_table(self, infos: list[Any]) -> None:
+        """
+        پرکردن جدول `symbols` از فهرست نمادهای صرافی — یک بار در هر اجرا.
+
+        v2.5.1: این جدول تا امروز هیچ‌وقت پر نمی‌شد و واچ‌لیست به همین دلیل
+        ذخیره نمی‌شد (افزودن نماد رکوردی پیدا نمی‌کرد). حالا هم اینجا پر
+        می‌شود و هم افزودن به واچ‌لیست در نبود رکورد، آن را می‌سازد.
+        """
+        exchange = self.app.settings.active_exchange
+        if not infos or getattr(self, "_symbols_synced_for", None) == exchange:
+            return
+        try:
+            self.app.symbol_repository.sync_symbols(exchange, list(infos))
+            self._symbols_synced_for = exchange
+        except Exception:  # noqa: BLE001 - نبود همگام‌سازی نباید بازارها را ببرد
+            logger.warning("Symbol table sync failed", exc_info=True)
+
     def add_to_watchlist(self) -> None:
-        """افزودن نماد انتخاب‌شده به فهرست پیگیری."""
+        """افزودن نماد انتخاب‌شده به فهرست پیگیری (دکمهٔ بالای جدول)."""
         symbol = self.markets.selected_symbol()
         if not symbol:
             self.status(self.tr_.tr("markets.select_symbol_first"))
+            self._toast(self.tr_.tr("markets.select_symbol_first"), level="warning")
             return
-        exchange = self.app.settings.active_exchange
-        added = self.app.symbol_repository.add_to_watchlist(symbol, exchange)
-        key = "markets.added_to_watchlist" if added else "markets.already_in_watchlist"
-        self.status(self.tr_.tr(key, symbol=symbol))
-        self.refresh_dashboard()
+        self.set_watchlist_membership(symbol, True)
 
     def _on_watchlist_toggled(self, symbol: str, added: bool) -> None:
-        """
-        کلیک روی ستارهٔ جدول بازارها.
+        """ستارهٔ جدول بازارها یا منوی کلیک راست (v2.5.1: مسیر واحد)."""
+        self.set_watchlist_membership(symbol, added)
 
-        صفحه پیش از ارسال سیگنال، ستاره را جابه‌جا کرده است؛ اینجا فقط
-        پایگاه داده را هم‌راستا می‌کنیم و اگر ذخیره شکست خورد، ستاره را
-        به وضعیت واقعی برمی‌گردانیم.
+    def set_watchlist_membership(self, symbol: str, added: bool) -> bool:
         """
+        تنها مسیر افزودن/برداشتن نماد از واچ‌لیست (v2.5.1).
+
+        دکمه، ستاره، منوی کلیک راست و مدال جزئیات همه از اینجا می‌گذرند تا
+        پس از ذخیره، ستاره‌های جدول، پنل واچ‌لیست، داشبورد و جریان زنده
+        یک‌جا تازه شوند. قبلاً مدال `add_to_watchlist(symbol)` را بدون
+        صرافی صدا می‌زد (TypeError بی‌صدا) و مسیر دکمه ستاره‌ها را تازه
+        نمی‌کرد؛ و چون جدول نمادها خالی بود، هیچ مسیری واقعاً ذخیره نمی‌کرد.
+        """
+        symbol = str(symbol or "").strip()
+        if not symbol:
+            return False
         exchange = self.app.settings.active_exchange
+        repo = self.app.symbol_repository
         try:
             if added:
-                self.app.symbol_repository.add_to_watchlist(symbol, exchange)
-                key = "markets.added_to_watchlist"
+                changed = repo.add_to_watchlist(symbol, exchange)
+                key = "markets.added_to_watchlist" if changed else "markets.already_in_watchlist"
+                level = "success" if changed else "info"
             else:
-                self.app.symbol_repository.remove_from_watchlist(symbol, exchange)
+                changed = repo.remove_from_watchlist(symbol, exchange)
                 key = "markets.removed_from_watchlist"
-            self.status(self.tr_.tr(key, symbol=symbol))
+                level = "info"
         except Exception:  # noqa: BLE001 - نباید جدول را بشکند
-            logger.exception("Watchlist toggle failed for %s", symbol)
-        self.markets.set_watchlist(self.app.symbol_repository.get_watchlist())
+            logger.exception("Watchlist update failed for %s", symbol)
+            self._toast(self.tr_.tr("watchlist.save_failed", symbol=symbol), level="error")
+            self.markets.set_watchlist(repo.get_watchlist())
+            return False
+        text = self.tr_.tr(key, symbol=symbol)
+        self.status(text)
+        self._toast(text, level=level)
+        self.markets.set_watchlist(repo.get_watchlist())
         self.refresh_watchlist_panel()
+        self._update_streamed_symbols()
         self.refresh_dashboard()
+        return True
 
     # ------------------------------------------------------------------
     # فهرست‌های دیده‌بانی (مورد ۵.۳)
@@ -1616,13 +1869,32 @@ class MainController(QObject):
             return
 
         options = self.signals.scan_options()
+        universe = self.signals.scan_universe_options()
         frames = self.signals.selected_timeframes()
+        self.save_scan_settings(self.signals.scan_settings())
 
+        # نتیجه‌های زنده: هر سیگنال همان لحظه در جدول می‌نشیند و اگر
+        # کاربر پویشِ طولانیِ کل بازار را متوقف کند، از دست نمی‌رود.
+        self._scan_live_signals = []
+        self._scan_live_dirty = False
+        self._scan_live_active = True
         self.signals.set_scanning(True)
         self.signals.set_scan_status(self.tr_.tr("signals.scan_running"))
 
+        def on_signal(signal: Any) -> None:
+            """سیگنال پذیرفته‌شده از نخ شبکه → سیگنال Qt → نخ رابط کاربری."""
+            self.scan_partial_found.emit(signal)
+
+        last_progress = [0.0]
+
         def on_progress(progress: Any) -> None:
             """گزارش پیشرفت از نخ شبکه → سیگنال Qt → نخ رابط کاربری."""
+            # ۲.۴.۱: در پویش کل بازار صدها گزارش در ثانیه صف رابط را پر می‌کرد؛
+            # حداکثر ~۷ بار در ثانیه کافی است (گزارش پایانی همیشه می‌رود).
+            now = time.monotonic()
+            if int(progress.done) < int(progress.total) and now - last_progress[0] < 0.15:
+                return
+            last_progress[0] = now
             self.scan_progress_changed.emit(
                 int(progress.done), int(progress.total),
                 str(progress.symbol), int(progress.found),
@@ -1630,11 +1902,15 @@ class MainController(QObject):
 
         def apply(result: Any) -> None:
             """نمایش نتیجهٔ پویش."""
+            self._scan_live_active = False
+            self._stop_live_flush()
+            self._scan_live_signals = []
             rows = self._apply_stale_filter(
                 self._decorate_validity([signal.to_dict() for signal in result.signals])
             )
             self.signals.set_scan_results(rows)
             self._last_scan = result
+            self._seed_auto_focus(list(result.signals))
             if rows:
                 message = self.tr_.tr(
                     "signals.scan_done",
@@ -1652,6 +1928,8 @@ class MainController(QObject):
 
         def on_error(name: str, error: Exception) -> None:
             """خطای پویش نباید صفحه را در حالت «در حال پویش» رها کند."""
+            self._scan_live_active = False
+            self._stop_live_flush()
             self.signals.set_scan_status(self.tr_.tr("signals.scan_failed"))
             self._on_error(name, error)
 
@@ -1664,10 +1942,140 @@ class MainController(QObject):
                 min_confidence=options["min_confidence"],
                 include_wait=options["include_wait"],
                 on_progress=on_progress,
+                universe=universe["universe"],
+                min_turnover=universe["min_turnover"],
+                smart_filter=universe["smart_filter"],
+                on_signal=on_signal,
             ),
             on_success=apply,
             on_error=on_error,
             on_finished=lambda: self.signals.set_scanning(False),
+        )
+
+    # ------------------------------------------------------------------
+    # نسخهٔ ۲.۴.۰ — نتیجهٔ زندهٔ پویش و تنظیمات پایدار آن
+    # ------------------------------------------------------------------
+    #: فاصلهٔ تازه‌سازی جدول هنگام رسیدن سیگنال‌های زنده (میلی‌ثانیه).
+    #: رسم دوبارهٔ جدول به ازای هر سیگنال، روی پویش ۱۰۰۰+ نماد رابط را
+    #: کند می‌کرد؛ دسته‌کردن تا ۸۰۰ms هم زنده است و هم سبک.
+    SCAN_LIVE_FLUSH_MS = 800
+
+    def save_scan_settings(self, values: dict) -> None:
+        """ذخیرهٔ دامنه/تعداد/پالایش پویش دستی."""
+        for key, value in (values or {}).items():
+            try:
+                self.app.settings.set(key, value)
+            except Exception as error:  # noqa: BLE001 - ذخیره نباید پویش را بشکند
+                logger.debug("Could not persist %s: %s", key, error)
+
+    def _load_scan_settings(self) -> None:
+        """نشاندن تنظیمات ذخیره‌شدهٔ پویش دستی در صفحه."""
+        keys = (
+            "signals.scan_universe",
+            "signals.scan_limit",
+            "signals.scan_min_turnover",
+            "signals.scan_smart_filter",
+        )
+        try:
+            self.signals.set_scan_settings({key: self.app.settings.get(key) for key in keys})
+        except Exception as error:  # noqa: BLE001
+            logger.debug("Could not load scan settings: %s", error)
+
+    def _on_scan_partial_signal(self, signal: Any) -> None:
+        """یک سیگنال زنده رسید؛ جدول با تأخیر کوتاه و دسته‌ای تازه می‌شود."""
+        if not getattr(self, "_scan_live_active", False):
+            # پویش متوقف شده؛ سیگنال‌های دیررسیده جدول را عوض نکنند
+            return
+        live = getattr(self, "_scan_live_signals", None)
+        if live is None:
+            live = self._scan_live_signals = []
+        live.append(signal)
+        self._scan_live_dirty = True
+        timer = getattr(self, "_scan_live_timer", None)
+        if timer is None:
+            timer = self._scan_live_timer = QTimer(self.window)
+            timer.setSingleShot(True)
+            timer.setInterval(self.SCAN_LIVE_FLUSH_MS)
+            timer.timeout.connect(self._flush_scan_live)
+        if not timer.isActive():
+            timer.start()
+
+    def _flush_scan_live(self) -> None:
+        """نمایش سیگنال‌های زندهٔ انباشته، مرتب بر پایهٔ ضریب اطمینان."""
+        if not getattr(self, "_scan_live_dirty", False):
+            return
+        self._scan_live_dirty = False
+        signals = sorted(
+            list(getattr(self, "_scan_live_signals", []) or []),
+            key=lambda item: float(getattr(item, "confidence", 0) or 0),
+            reverse=True,
+        )
+        if not signals:
+            return
+        started = time.monotonic()
+        rows = self._apply_stale_filter(
+            self._decorate_validity([signal.to_dict() for signal in signals])
+        )
+        self.signals.set_scan_results(rows)
+        # تازه‌سازی تطبیقی (۲.۴.۱): اگر رسم جدول طول کشید، دفعهٔ بعد دیرتر؛
+        # رابط کاربری هیچ‌وقت بیش از ~۱۰٪ وقتش را صرف این جدول نمی‌کند.
+        elapsed_ms = (time.monotonic() - started) * 1000.0
+        timer = getattr(self, "_scan_live_timer", None)
+        if timer is not None:
+            timer.setInterval(int(min(5000, max(self.SCAN_LIVE_FLUSH_MS, elapsed_ms * 10))))
+        from types import SimpleNamespace
+
+        # تا پایان پویش، دکمهٔ تحلیل هوشمند/جزئیات روی همین نتایج کار کند
+        self._last_scan = SimpleNamespace(signals=signals)
+
+    def _stop_live_flush(self) -> None:
+        timer = getattr(self, "_scan_live_timer", None)
+        if timer is not None:
+            timer.stop()
+        self._scan_live_dirty = False
+
+    def _seed_auto_focus(self, signals: list) -> None:
+        """
+        نتیجهٔ پویش دستی → فهرست تمرکز سیگنال‌گیر خودکار.
+
+        در حالت «فقط سیگنال‌های پیداشده» فهرست با همین نتایج جایگزین
+        می‌شود؛ در حالت‌های دیگر به بالای فهرست افزوده می‌شود.
+        """
+        scheduler = getattr(self, "_auto_scheduler", None)
+        if scheduler is None or not signals:
+            return
+        from signals.auto_scanner import SOURCE_FOUND, normalize_source
+
+        replace = normalize_source(scheduler.config.source) == SOURCE_FOUND
+        try:
+            scheduler.seed_focus(signals, replace=replace)
+        except Exception as error:  # noqa: BLE001
+            logger.debug("Could not seed auto focus: %s", error)
+            return
+        self._refresh_auto_scan_status()
+
+    def _on_auto_partial_signal(self, signal: Any) -> None:
+        """سیگنال قوی در میانهٔ چرخش کامل: همان لحظه وارد فهرست تمرکز شود."""
+        scheduler = getattr(self, "_auto_scheduler", None)
+        if scheduler is None:
+            return
+        try:
+            scheduler.seed_focus([signal])
+        except Exception as error:  # noqa: BLE001
+            logger.debug("Could not seed auto focus: %s", error)
+
+    def _on_auto_scan_progress(self, done: int, total: int) -> None:
+        """نمایش «X از Y» برای چرخش کامل خودکار."""
+        scheduler = getattr(self, "_auto_scheduler", None)
+        if scheduler is None or not scheduler.running:
+            return
+        self.signals.set_auto_scan_status(
+            self.tr_.tr(
+                "signals.auto.status_progress",
+                done=self.tr_.format_number(int(done), 0),
+                total=self.tr_.format_number(int(total), 0),
+            ),
+            focus=scheduler.focus_symbols,
         )
 
     # ------------------------------------------------------------------
@@ -1697,9 +2105,15 @@ class MainController(QObject):
                     "signals.auto_scan_focus_size",
                     "signals.auto_scan_min_confidence",
                     "signals.auto_scan_notify",
+                    "signals.auto_scan_source",
+                    "signals.auto_scan_universe",
+                    "signals.auto_scan_sweep_limit",
+                    "signals.auto_scan_min_turnover",
+                    "signals.auto_scan_smart_filter",
                 )
             }
         )
+        self._load_scan_settings()
 
         self._auto_timer = QTimer(self.window)
         self._auto_timer.setInterval(AUTO_SCAN_TICK_MS)
@@ -1731,14 +2145,23 @@ class MainController(QObject):
             return
         from signals.auto_scanner import ScanJob
 
-        if scheduler.focus_symbols:
+        from signals.auto_scanner import SOURCE_MARKET, normalize_source
+
+        source = normalize_source(scheduler.config.source)
+        if scheduler.focus_symbols and source != SOURCE_MARKET:
             job = ScanJob(
                 kind="focus",
                 symbols=tuple(scheduler.focus_symbols[: scheduler.config.focus_size]),
                 reason="auto.reason_focus",
             )
-        else:
+        elif scheduler.config.sweep_active or (
+            not scheduler.focus_symbols and source != "found"
+        ):
             job = ScanJob(kind="full", symbols=(), reason="auto.reason_bootstrap")
+        else:
+            # «فقط سیگنال‌های پیداشده» و هنوز چیزی پیدا نشده
+            self.signals.set_auto_scan_status(self.tr_.tr("signals.auto.status_need_scan"))
+            return
         self._execute_auto_job(job)
 
     def _auto_scan_tick(self) -> None:
@@ -1768,7 +2191,37 @@ class MainController(QObject):
         scheduler.start(job)
         frames = self.signals.selected_timeframes()
         symbols = list(job.symbols) or None
-        limit = None if symbols else scheduler.config.sweep_limit
+        config = scheduler.config
+        universe = str(getattr(config, "universe", "top") or "top")
+        full = symbols is None
+        # چرخش کامل روی «کل صرافی» سقف تعداد ندارد؛ فقط حالت «پرگردش‌ترین‌ها»
+        # به `sweep_limit` محدود می‌شود.
+        if full:
+            limit = config.sweep_limit if universe == "top" else None
+        else:
+            limit = None
+
+        def on_signal(signal: Any) -> None:
+            self.auto_scan_signal_found.emit(signal)
+
+        last_auto_progress = [0.0]
+
+        def on_progress(progress: Any) -> None:
+            now = time.monotonic()
+            if int(progress.done) < int(progress.total) and now - last_auto_progress[0] < 0.5:
+                return
+            last_auto_progress[0] = now
+            self.auto_scan_progress.emit(int(progress.done), int(progress.total))
+
+        scan_kwargs: dict[str, Any] = {}
+        if full:
+            scan_kwargs = {
+                "universe": universe,
+                "min_turnover": float(getattr(config, "min_turnover", 0.0) or 0.0),
+                "smart_filter": bool(getattr(config, "smart_filter", True)),
+                "on_signal": on_signal,
+                "on_progress": on_progress,
+            }
 
         self.signals.set_auto_scan_status(
             self.tr_.tr(
@@ -1813,6 +2266,8 @@ class MainController(QObject):
                 limit=limit,
                 min_confidence=scheduler.config.focus_min_confidence,
                 include_wait=False,
+                cpu_duty=BACKGROUND_CPU_DUTY,
+                **scan_kwargs,
             ),
             on_success=apply,
             on_error=failed,
@@ -1862,6 +2317,17 @@ class MainController(QObject):
 
         if not scheduler.config.enabled:
             self.signals.set_auto_scan_status(self.tr_.tr("signals.auto.status_off"))
+            return
+
+        from signals.auto_scanner import SOURCE_FOUND, normalize_source
+
+        if (
+            last_count is None
+            and not scheduler.running
+            and normalize_source(scheduler.config.source) == SOURCE_FOUND
+            and not scheduler.focus_symbols
+        ):
+            self.signals.set_auto_scan_status(self.tr_.tr("signals.auto.status_need_scan"))
             return
 
         if last_count is not None:
@@ -2060,36 +2526,33 @@ class MainController(QObject):
         if not records:
             return
 
-        from trading.trade_monitor import evaluate, position_from_record
+        from trading.trade_monitor import evaluate_staged, position_from_record
 
+        engine = getattr(self, "_auto_trader_engine", None)
+        managed_ids = {t.trade_id for t in engine.open_trades} if engine is not None else set()
+        records = [r for r in records if r.get("id") not in managed_ids and r.get("mode") != "live"]
         positions = [p for p in (position_from_record(r) for r in records) if p is not None]
         if not positions:
             return
         symbols = sorted({p.symbol for p in positions})
         self._trade_monitor_busy = True
-        fee_by_id = {
-            int(row.get("id") or 0): self._exit_fee(row)
-            for row in records
-            if isinstance(row, dict)
-        }
+        ticks = self._ensure_tick_engine()
+        config = self._auto_trade_config()
 
         async def fetch() -> dict[str, float]:
             """اول کش تازه، و فقط اگر کهنه بود REST."""
             prices: dict[str, float] = {}
             market = self.app.market
             for symbol in symbols:
-                cached = self._cached_symbol_price(symbol, max_age=5.0)
-                if cached > 0:
-                    prices[symbol] = cached
-                    continue
                 if market is None:
                     continue
                 try:
-                    price = await market.get_current_price(symbol)
-                except Exception:  # noqa: BLE001 - یک نماد نباید بقیه را ببرد
+                    if ticks.is_stale(symbol):
+                        await asyncio.wait_for(market.refresh_execution_quote(symbol, ticks), timeout=5.0)
+                    if not ticks.is_stale(symbol):
+                        prices[symbol] = ticks.get(symbol).last
+                except Exception:
                     continue
-                if price and price > 0:
-                    prices[symbol] = float(price)
             return prices
 
         def apply(prices: dict[str, float]) -> None:
@@ -2097,7 +2560,16 @@ class MainController(QObject):
             if not prices:
                 return
             self._live_prices.update({k.upper(): v for k, v in prices.items()})
-            updates, closures = evaluate(positions, prices)
+            updates, steps = [], []
+            for position in positions:
+                if ticks.is_stale(position.symbol):
+                    continue
+                quote = ticks.get(position.symbol)
+                price = quote.exit_price(position.side)
+                price *= 1 - config.slippage_percent / 100 if position.is_long else 1 + config.slippage_percent / 100
+                marks, found = evaluate_staged([position], {position.symbol: price})
+                updates.extend(marks)
+                steps.extend(found)
 
             for item in updates:
                 try:
@@ -2110,22 +2582,19 @@ class MainController(QObject):
                 except Exception:  # noqa: BLE001
                     logger.debug("Live PnL update failed", exc_info=True)
 
-            for trade_id, price, reason in closures:
-                try:
-                    self.app.trade_repository.close_trade(
-                        int(trade_id),
-                        exit_price=float(price),
-                        fee=float(fee_by_id.get(int(trade_id), 0.0)),
-                        note=reason,
-                    )
-                    self._toast(
-                        self.tr_.tr(f"trades.closed_{reason}"), level="success"
-                    )
-                except Exception:  # noqa: BLE001
-                    logger.warning("Auto-close failed for trade %s", trade_id)
+            for trade_id, price, step in steps:
+                self._apply_trade_step(
+                    int(trade_id),
+                    float(price),
+                    step,
+                    next((r for r in records if r.get("id") == trade_id), None),
+                )
 
-            if updates or closures:
+            if steps:
                 self.refresh_trades()
+                self._refresh_paper_equity_views()
+            elif updates:
+                self._refresh_open_trade_rows()
 
         def finished() -> None:
             self._trade_monitor_busy = False
@@ -2137,6 +2606,56 @@ class MainController(QObject):
             on_error=lambda *_: None,
             on_finished=finished,
         )
+
+    def _apply_trade_step(
+        self, trade_id: int, price: float, step: dict[str, Any], record: dict[str, Any] | None
+    ) -> None:
+        """
+        اجرای یک گام مدیریت معامله (v2.5.0 — اهداف پلکانی).
+
+        • partial → بستن یک‌سوم در TP1/TP2 (و انتقال حد ضرر به ورود پس از TP1)
+        • final   → بستن باقی‌مانده در آخرین هدف
+        • stop    → بستن باقی‌مانده در حد ضرر (یا نقطهٔ سربه‌سر پس از TP1)
+        """
+        action = str(step.get("action") or "")
+        symbol = str((record or {}).get("symbol") or "")
+        try:
+            if action == "partial":
+                quantity = float(step.get("quantity") or 0.0)
+                partial_record = dict(record or {})
+                partial_record["quantity"] = quantity
+                result = self.app.trade_repository.partial_close(
+                    trade_id,
+                    quantity=quantity,
+                    exit_price=price,
+                    fee=self._exit_fee(partial_record, price=price),
+                    target_index=int(step.get("index") or 0),
+                    new_stop_loss=step.get("new_stop"),
+                )
+                if result is not None:
+                    index = int(step.get("index") or 0) + 1
+                    key = "trades.staged.tp_hit_breakeven" if step.get("new_stop") else "trades.staged.tp_hit"
+                    self._toast(
+                        self.tr_.tr(key, target=index, symbol=symbol,
+                                    price=self.tr_.format_number(price, 6)),
+                        level="success",
+                    )
+                return
+            reason = str(step.get("reason") or ("take_profit" if action == "final" else "stop_loss"))
+            if action == "final" and step.get("index") is not None:
+                reason = "take_profit"
+            self.app.trade_repository.close_trade(
+                trade_id,
+                exit_price=price,
+                fee=self._exit_fee(record, price=price),
+                note=reason,
+            )
+            self._toast(
+                self.tr_.tr(f"trades.closed_{reason}"),
+                level="success" if reason in ("take_profit", "breakeven") else "warning",
+            )
+        except Exception:  # noqa: BLE001 - یک معامله نباید پایش بقیه را متوقف کند
+            logger.warning("Trade step %s failed for trade %s", action, trade_id, exc_info=True)
 
     def start_outcome_tracker(self) -> None:
         """
@@ -2431,26 +2950,73 @@ class MainController(QObject):
         self._run_outcome_check()
 
     def _refresh_outcome_view(self, *, quiet: bool = False) -> None:
-        """تازه‌سازی صفحهٔ عملکرد اگر ساخته شده باشد."""
+        """
+        تازه‌سازی صفحهٔ عملکرد اگر ساخته شده باشد.
+
+        نسخهٔ ۲.۴.۲: این متد هر ۳۰ ثانیه از تایمر پیگیری نتیجه صدا زده
+        می‌شد و روی نخ رابط تا ۵۰۰۰ ردیف پایگاه داده می‌خواند و گروه‌بندی
+        می‌کرد — یکی از علت‌های «هنگ» پس از چند ساعت. حالا:
+            * وقتی صفحه پنهان است، فقط «کهنه» علامت می‌خورد و هنگام نمایش
+              صفحه تازه می‌شود؛
+            * پرس‌وجوها در نخ پس‌زمینه اجرا و فقط نتیجه روی رابط نشانده
+              می‌شود.
+        """
         page = getattr(self, "performance", None)
         if page is None:
             return
+        if not self._outcome_watch_installed:
+            self._outcome_watch_installed = True
+            try:
+                from ui.responsiveness import ShowWatcher
+
+                self._outcome_show_watcher = ShowWatcher(page, self._on_outcome_view_shown)
+            except Exception:  # noqa: BLE001
+                logger.debug("Performance show watcher unavailable", exc_info=True)
+        if quiet and not page.isVisible():
+            self._outcome_view_stale = True
+            return
+        self._outcome_view_stale = False
         try:
             days = int(getattr(page, "selected_period", lambda: 0)() or 0)
-            report = self.app.outcome_repository.performance(days=days or None)
-            page.set_performance(report)
-            page.set_history(
-                [
-                    self._outcome_row(record)
-                    for record in self.app.outcome_repository.history(
-                        days=days or None, limit=300
-                    )
-                ]
-            )
         except Exception:  # noqa: BLE001
+            days = 0
+        repository = self.app.outcome_repository
+
+        def load() -> tuple[Any, list[Any]]:
+            report = repository.performance(days=days or None)
+            records = list(repository.history(days=days or None, limit=300))
+            return report, records
+
+        def apply(result: tuple[Any, list[Any]]) -> None:
+            report, records = result
+            try:
+                page.set_performance(report)
+                page.set_history([self._outcome_row(record) for record in records])
+            except Exception:  # noqa: BLE001
+                logger.debug("Could not apply performance view", exc_info=True)
+                if not quiet:
+                    self.status(self.tr_.tr("signals.outcome.error"))
+
+        def failed(_name: str, _error: Exception) -> None:
             logger.debug("Could not refresh performance view", exc_info=True)
             if not quiet:
                 self.status(self.tr_.tr("signals.outcome.error"))
+
+        if not self.runner.running:
+            # پیش از راه‌اندازی حلقهٔ پس‌زمینه (و در آزمون‌ها): همان مسیر هم‌گام
+            try:
+                apply(load())
+            except Exception as error:  # noqa: BLE001
+                failed("outcome-view", error)
+            return
+        self.runner.run_blocking(
+            "outcome-view", load, on_success=apply, on_error=failed
+        )
+
+    def _on_outcome_view_shown(self) -> None:
+        """صفحهٔ عملکرد نمایش داده شد؛ اگر کهنه است تازه شود."""
+        if self._outcome_view_stale:
+            self._refresh_outcome_view(quiet=True)
 
     def _outcome_row(self, record: Any) -> dict:
         """تبدیل یک رکورد نتیجه به ردیف جدول."""
@@ -2475,9 +3041,20 @@ class MainController(QObject):
     def stop_market_scan(self) -> None:
         """توقف پویش در جریان."""
         self.runner.cancel("market-scan")
+        self._scan_live_active = False
         self.signals.set_scanning(False)
-        self.signals.set_scan_status(self.tr_.tr("signals.scan_cancelled"))
-        self.status(self.tr_.tr("signals.scan_cancelled"))
+        # نتیجه‌های زندهٔ تا این لحظه حفظ و نمایش داده می‌شوند
+        self._scan_live_dirty = bool(getattr(self, "_scan_live_signals", None))
+        self._flush_scan_live()
+        self._stop_live_flush()
+        partial = list(getattr(self, "_scan_live_signals", []) or [])
+        if partial:
+            self._seed_auto_focus(partial)
+            message = self.tr_.tr("signals.scan_cancelled_partial", found=len(partial))
+        else:
+            message = self.tr_.tr("signals.scan_cancelled")
+        self.signals.set_scan_status(message)
+        self.status(message)
 
     def analyze_scanned_symbol(self, symbol: str) -> None:
         """
@@ -2569,7 +3146,14 @@ class MainController(QObject):
             payload, self.tr_, self.window, theme=self.themes.tokens
         )
         self._prime_calculator(dialog)
-        dialog.trade_requested.connect(self._on_trade_requested)
+        dialog.trade_requested.connect(
+            lambda payload, d=dialog: self._on_trade_requested(payload, dialog=d)
+        )
+        # v2.5.9: «ویرایش و باز کردن معامله» با فرم معاملهٔ دستی
+        if hasattr(dialog, "manual_trade_requested"):
+            dialog.manual_trade_requested.connect(
+                lambda values, d=dialog: self.open_manual_trade_dialog(values, parent=d)
+            )
         # از همین پنجره هم باید بشود تحلیل هوشمند خواست؛ کاربر خواسته
         # بود بعد از پویش، هر نماد را جداگانه به هوش مصنوعی بسپارد.
         if hasattr(dialog, "ai_analysis_requested"):
@@ -3132,22 +3716,8 @@ class MainController(QObject):
         self.markets.search_input.setText(symbol)
 
     def _coin_watchlist_toggled(self, symbol: str, added: bool) -> None:
-        """افزودن یا برداشتن نماد از واچ‌لیست از داخل مدال."""
-        try:
-            if added:
-                self.app.symbol_repository.add_to_watchlist(symbol)
-                self.status(self.tr_.tr("markets.added_to_watchlist", symbol=symbol))
-                self._toast(
-                    self.tr_.tr("markets.added_to_watchlist", symbol=symbol),
-                    level="success",
-                )
-            else:
-                self.app.symbol_repository.remove_from_watchlist(symbol)
-                self.status(self.tr_.tr("markets.remove_from_watchlist"))
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Watchlist update failed: %s", exc)
-            return
-        self.refresh_dashboard()
+        """افزودن یا برداشتن نماد از واچ‌لیست از داخل مدال (v2.5.1: مسیر واحد)."""
+        self.set_watchlist_membership(symbol, added)
 
     # ------------------------------------------------------------------
     # تحلیل نوشتاری سیگنال و خروجی PDF
@@ -3597,8 +4167,23 @@ class MainController(QObject):
         self._open_signal_detail(row)
 
     def _on_history_double_clicked(self, row: int, _column: int) -> None:
-        """دوبار کلیک روی سابقه سیگنال‌ها."""
-        self._open_signal_detail(row)
+        """
+        دوبار کلیک روی سابقه سیگنال‌ها.
+
+        ۲.۴.۲: جدول سابقه ممکن است مرتب/گروه‌بندی شده باشد؛ ردیف جدول با
+        شناسه به ردیف متناظر `_last_signal_rows` نگاشته می‌شود تا جزئیات
+        همان سیگنالی باز شود که کاربر رویش کلیک کرده.
+        """
+        target = row
+        getter = getattr(self.signals, "history_row_at", None)
+        shown = getter(row) if callable(getter) else {}
+        record_id = shown.get("id") if shown else None
+        if record_id is not None:
+            for index, candidate in enumerate(self._last_signal_rows):
+                if candidate.get("id") == record_id:
+                    target = index
+                    break
+        self._open_signal_detail(target)
 
     def _open_signal_detail(self, row: int) -> None:
         """
@@ -3626,25 +4211,182 @@ class MainController(QObject):
             payload, self.tr_, self.window, theme=self.themes.tokens
         )
         self._prime_calculator(dialog)
-        dialog.trade_requested.connect(self._on_trade_requested)
+        dialog.trade_requested.connect(
+            lambda payload, d=dialog: self._on_trade_requested(payload, dialog=d)
+        )
+        # v2.5.9: «ویرایش و باز کردن معامله» با فرم معاملهٔ دستی
+        if hasattr(dialog, "manual_trade_requested"):
+            dialog.manual_trade_requested.connect(
+                lambda values, d=dialog: self.open_manual_trade_dialog(values, parent=d)
+            )
         dialog.exec()
 
     def _prime_calculator(self, dialog: Any) -> None:
         """
         دادن سرمایه و درصد ریسک واقعی کاربر به ماشین‌حساب پنجرهٔ سیگنال.
 
-        ماشین‌حساب پیش‌فرض ۱۰۰۰ دارد که فقط یک عدد نمونه است؛ با تنظیمات
-        واقعی کاربر، حجم پیشنهادی هم واقعی می‌شود.
+        v2.5.0: سرمایه = موجودی کاغذی (برابر کیف پول واقعی) در حالت
+        کاغذی، یا کل ارزش کیف پول در حالت واقعی؛ فقط اگر هیچ‌کدام نبود،
+        عدد تنظیمات ریسک. منبع عدد زیر ماشین‌حساب نوشته می‌شود.
         """
         setter = getattr(dialog, "set_account_balance", None)
         if not callable(setter):
             return
         try:
-            balance = float(self.app.settings.get("risk.account_balance", 0) or 0)
             risk = float(self.app.settings.get("risk.risk_percent", 0) or 0)
         except (TypeError, ValueError):
-            return
-        setter(balance, risk)
+            risk = 0.0
+        balance, source_text = self._trading_capital()
+        try:
+            setter(balance, risk, source_text)
+        except TypeError:  # پنجره‌های قدیمی‌تر پارامتر سوم ندارند
+            setter(balance, risk)
+
+    # ------------------------------------------------------------------
+    # موجودی کاغذی (v2.5.0)
+    # ------------------------------------------------------------------
+    def _is_paper_mode(self) -> bool:
+        """آیا معامله‌ها کاغذی‌اند؟ (حالت واقعی فقط با تأیید صریح کاربر)"""
+        return str(self.app.settings.get("scalp.mode", "paper") or "paper").strip().lower() != "live"
+
+    def _wallet_total_usdt(self) -> float:
+        """کل ارزش تتری حساب صرافی پیش‌فرض (۰ اگر حسابی نیست)."""
+        try:
+            user_id = self.app.auth.user_id
+            account = (
+                self.app.exchange_accounts.default_account(user_id) if user_id is not None else None
+            )
+        except Exception:  # noqa: BLE001
+            return 0.0
+        if not account:
+            return 0.0
+        try:
+            return float(account.get("total_value_usdt") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _paper_account(self) -> Any:
+        """
+        خلاصهٔ حساب کاغذی: شروع + سود تحقق‌یافته + شناور − مارجین.
+
+        اولین بار که کیف پول واقعی ارزش دارد، عدد شروع برابر آن ثبت
+        می‌شود (خواستهٔ کاربر: موجودی کاغذی = موجودی واقعی). بدون حساب
+        متصل، `risk.account_balance` مبنا است و ذخیره نمی‌شود تا با اتصال
+        حساب، خودکار به کیف پول واقعی برسد.
+        """
+        from trading import paper_account as pa
+
+        settings = self.app.settings
+        try:
+            start = float(settings.get(pa.KEY_START, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            start = 0.0
+        source = str(settings.get(pa.KEY_SOURCE, "") or "")
+        start_at = str(settings.get(pa.KEY_START_AT, "") or "")
+        if start <= 0:
+            wallet = self._wallet_total_usdt()
+            if wallet > 0:
+                start, source, start_at = wallet, pa.SOURCE_WALLET, pa.utc_now_text()
+                settings.set(pa.KEY_START, start, notify=False)
+                settings.set(pa.KEY_SOURCE, source, notify=False)
+                settings.set(pa.KEY_START_AT, start_at, notify=False)
+            else:
+                try:
+                    start = float(settings.get("risk.account_balance", 1000.0) or 1000.0)
+                except (TypeError, ValueError):
+                    start = 1000.0
+                source, start_at = pa.SOURCE_SETTINGS, ""
+        user_id = self.app.auth.user_id
+        repository = self.app.trade_repository
+        try:
+            realized = repository.realized_pnl_since(user_id, pa.parse_start_at(start_at))
+        except Exception:  # noqa: BLE001
+            realized = 0.0
+        try:
+            open_rows = [r for r in repository.open_trades(user_id) if r.get("mode") != "live"]
+        except Exception:  # noqa: BLE001
+            open_rows = []
+        return pa.build_account(
+            start=start, realized=realized, open_trades=open_rows, source=source, start_at=start_at
+        )
+
+    def sync_paper_balance_with_wallet(self) -> bool:
+        """
+        «همگام‌سازی موجودی کاغذی با کیف پول»: شروع = کل ارزش کیف پول واقعی.
+
+        سود/زیان کاغذی قبلی از این لحظه دیگر در موجودی شمرده نمی‌شود
+        (تاریخچه دست‌نخورده می‌ماند).
+        """
+        from trading import paper_account as pa
+
+        wallet = self._wallet_total_usdt()
+        if wallet <= 0:
+            self._toast(self.tr_.tr("wallet.paper.sync_no_wallet"), level="warning")
+            return False
+        settings = self.app.settings
+        settings.set(pa.KEY_START, wallet, notify=False)
+        settings.set(pa.KEY_SOURCE, pa.SOURCE_WALLET, notify=False)
+        settings.set(pa.KEY_START_AT, pa.utc_now_text(), notify=False)
+        self._toast(self.tr_.tr("wallet.paper.synced", amount=self._money(wallet)), level="success")
+        self.refresh_wallet()
+        return True
+
+    def _trading_capital(self) -> tuple[float, str]:
+        """
+        سرمایهٔ مبنای اندازهٔ پوزیشن + متن منبع آن.
+
+        کاغذی → موجودی دفتری حساب کاغذی؛ واقعی → کل ارزش کیف پول.
+        """
+        if self._is_paper_mode():
+            account = self._paper_account()
+            key = "sizing.capital_paper" if account.source == "wallet" else "sizing.capital_paper_settings"
+            return account.balance, self.tr_.tr(key, amount=self._money(account.balance))
+        wallet = self._wallet_total_usdt()
+        if wallet > 0:
+            return wallet, self.tr_.tr("sizing.capital_live", amount=self._money(wallet))
+        try:
+            fallback = float(self.app.settings.get("risk.account_balance", 0) or 0)
+        except (TypeError, ValueError):
+            fallback = 0.0
+        return fallback, ""
+
+    def _refresh_open_trade_rows(self) -> None:
+        """تازه‌سازی سبک جدول معاملات فقط وقتی صفحه دیده می‌شود (هر تیک)."""
+        try:
+            visible = self.window.stack.currentWidget() is self.trades
+        except Exception:  # noqa: BLE001
+            visible = False
+        if visible:
+            self.refresh_trades()
+
+    def _refresh_paper_equity_views(self) -> None:
+        """پس از بستن (جزئی/کامل) معامله، موجودی کاغذی کیف پول تازه شود."""
+        try:
+            if self.window.stack.currentWidget() is self.wallet:
+                self.refresh_wallet()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _live_fill_price(self, symbol: str, side: str) -> float:
+        """
+        قیمت قابل‌اجرای زنده برای ورود (Ask برای خرید، Bid برای فروش).
+
+        فقط تیک تازه پذیرفته می‌شود؛ قیمت کهنه صفر برمی‌گرداند تا ورود با
+        عدد ماشین‌حساب انجام شود نه با قیمتی که دیگر وجود ندارد.
+        """
+        ticks = getattr(self, "_tick_engine", None)
+        if ticks is None or not symbol:
+            return 0.0
+        try:
+            if ticks.is_stale(symbol):
+                return 0.0
+            quote = ticks.get(symbol)
+            entry_price = getattr(quote, "entry_price", None)
+            if callable(entry_price):
+                return float(entry_price(side) or 0.0)
+            return float(getattr(quote, "last", 0.0) or 0.0)
+        except Exception:  # noqa: BLE001
+            return 0.0
 
     def _load_signal_detail(self, record_id: Any) -> dict[str, Any]:
         """خواندن جزئیات کامل یک سیگنال از پایگاه داده."""
@@ -3685,6 +4427,11 @@ class MainController(QObject):
             "created_at_raw": record.created_at,
             "timeframes": list(timeframes),
             **self._review_payload(record_id),
+            # نسخهٔ ۲.۵.۵: داشبورد کیفیت سیگنال از عکس لحظه‌ای ذخیره‌شده
+            "intelligence": dict(
+                ((getattr(analysis, "market_snapshot", None) or {}) if analysis else {}).get("intelligence")
+                or {}
+            ),
         }
 
     def _analysis_payload(self, analysis_text: str) -> dict[str, Any]:
@@ -3731,67 +4478,272 @@ class MainController(QObject):
             "review_lesson": review.lesson or "",
         }
 
-    def _on_trade_requested(self, signal: dict[str, Any]) -> None:
+    def _on_trade_requested(self, signal: dict[str, Any], dialog: Any = None) -> None:
         """
-        اقدام روی یک سیگنال.
+        اقدام روی یک سیگنال — نسخهٔ ۲.۵.۰.
 
-        معامله به‌صورت تمرینی ثبت می‌شود؛ سفارش واقعی روی صرافی ارسال
-        نمی‌شود. این موضوع صریحاً به کاربر گفته می‌شود تا تصور نکند پول
-        واقعی جابه‌جا شده است.
+        معامله به‌صورت تمرینی (کاغذی) ثبت می‌شود؛ هیچ سفارش واقعی ارسال
+        نمی‌شود و نگهبان سفارش زنده دور زده نمی‌شود.
+
+        جریان:
+            ۱. اعداد از ماشین‌حساب پنجره (`signal["plan"]`) — همان ورود،
+               حد ضرر، TP1..TP3، اهرم، سرمایه و درصد ریسکی که کاربر دید.
+            ۲. قیمت ورود = قیمت قابل‌اجرای زندهٔ تیک (Ask/Bid) اگر تازه
+               باشد، وگرنه ورود ماشین‌حساب. اگر قیمت زنده از حد ضرر یا
+               TP1 گذشته باشد، معامله باز نمی‌شود.
+            ۳. حجم از ریسک مجاز روی فاصلهٔ واقعی ورود تا حد ضرر؛ مارجین
+               بیش از موجودی آزاد کاغذی مجاز نیست.
+            ۴. ثبت با اهداف پلکانی (⅓ در TP1 + حد ضرر به ورود، ⅓ در TP2،
+               باقی در TP3)، بستن پنجره، رفتن به جدول معاملات باز و اعلان.
         """
+        from signals.paper_trader import PaperTrader
+        from trading.staged_targets import clean_targets, stop_crossed, target_crossed, targets_text
+        from ui.widgets.position_calculator import signal_entry
+
         direction = str(signal.get("direction", "WAIT")).upper()
         if direction not in {"LONG", "SHORT"}:
             self.status(self.tr_.tr("signals.no_action_on_wait"))
             return
+        side = "long" if direction == "LONG" else "short"
+        symbol = str(signal.get("symbol") or "").upper()
+        plan = dict(signal.get("plan") or {})
 
-        trader = self._paper_trader()
-        entry = trader._pick_entry(signal)  # noqa: SLF001 - محاسبه یکسان برای پیش‌نمایش
-        confirm = QMessageBox.question(
-            self.window,
-            self.tr_.tr("signals.paper_trade_title"),
-            self.tr_.tr(
-                "signals.confirm_trade",
-                direction=self.tr_.tr(f"signals.{direction.lower()}", direction),
-                symbol=signal.get("symbol", ""),
-                entry=self.tr_.format_number(entry or 0.0, 4),
-                stop=self.tr_.format_number(signal.get("stop_loss") or 0.0, 4),
-            )
-            + "\n\n"
-            + self.tr_.tr("signals.paper_trade_note"),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if confirm != QMessageBox.StandardButton.Yes:
+        planned_entry = float(plan.get("entry") or 0.0) or signal_entry(signal)
+        stop = float(plan.get("stop_loss") or signal.get("stop_loss") or 0.0)
+        raw_targets = plan.get("targets") or signal.get("take_profits") or signal.get("take_profit") or []
+        fill = self._live_fill_price(symbol, side) or planned_entry
+
+        def refuse(key: str, **values: Any) -> None:
+            text = self.tr_.tr(key, **values)
+            self.status(text)
+            self._toast(text, level="warning")
+
+        if fill <= 0 or stop <= 0:
+            refuse("signals.trade_open_failed")
+            return
+        if stop_crossed(fill, stop, side) or fill == stop:
+            refuse("signals.trade_refused_stop", price=self.tr_.format_number(fill, 6))
+            return
+        targets = clean_targets(raw_targets, entry=fill, side=side)
+        planned_targets = clean_targets(raw_targets, entry=planned_entry, side=side)
+        if planned_targets and target_crossed(fill, planned_targets[0], side):
+            refuse("signals.trade_refused_target", price=self.tr_.format_number(fill, 6))
             return
 
-        risk = self.app.risk_parameters()
-        position = trader.open_from_signal(
-            signal,
-            balance=getattr(risk, "account_balance", 0.0),
-            risk_percent=getattr(risk, "risk_percent", 1.0),
+        capital, _source = self._trading_capital()
+        capital = float(plan.get("capital") or 0.0) or capital
+        risk_percent = float(plan.get("risk_percent") or 0.0) or float(
+            self.app.settings.get("risk.risk_percent", 1) or 1
         )
+        leverage = max(1, int(float(plan.get("leverage") or signal.get("leverage") or 1)))
+
+        # PaperTrader دفتر قدیمی JSON را هم نگه می‌دارد؛ ورود همان قیمت اجرا است
+        trader = self._paper_trader() if hasattr(self, "_paper_trader") else PaperTrader(self.app.settings)
+        order = dict(signal)
+        order.update(entry=fill, entry_min=fill, entry_max=fill, stop_loss=stop,
+                     take_profits=targets, leverage=leverage)
+        order.pop("plan", None)
+        position = trader.open_from_signal(order, balance=capital, risk_percent=risk_percent)
         if position is None:
-            self.status(self.tr_.tr("signals.paper_trade_failed"))
+            refuse("signals.paper_trade_failed")
             return
+
+        quantity = float(position.size or 0.0)
+        # سقف مارجین: در حالت کاغذی بیش از موجودی آزاد نمی‌شود
+        if self._is_paper_mode() and quantity > 0:
+            available = self._paper_account().available
+            margin = quantity * fill / leverage
+            if available > 0 and margin > available:
+                quantity = available * leverage / fill
+                self._toast(self.tr_.tr("signals.trade_margin_capped"), level="info")
 
         # `PaperTrader` معامله را در یک رشتهٔ JSON داخل تنظیمات نگه
-        # می‌دارد، ولی صفحهٔ «معاملات» از `trade_repository` (پایگاه داده)
-        # می‌خواند. تا پیش از این، دکمهٔ معامله فقط در آن حافظهٔ جداگانه
-        # می‌نوشت، پس کاربر هیچ ردی از معامله‌اش در تاریخچه نمی‌دید —
-        # همان گزارشِ «دکمهٔ معامله هیچ چیزی باز نمی‌کند». حالا در هر دو
-        # جا ثبت می‌شود تا تاریخچه واقعاً معامله را نشان دهد.
-        record = dict(signal)
+        # می‌دارد، ولی صفحهٔ «معاملات» از `trade_repository` می‌خواند؛
+        # پس در هر دو جا ثبت می‌شود تا تاریخچه واقعاً معامله را نشان دهد.
+        record = dict(order)
         record["entry_price"] = position.entry
-        self.record_paper_trade(record)
+        record["quantity"] = quantity
+        record["take_profits"] = targets
+        trade = self.record_paper_trade(record)
+        if not trade:
+            return
+
+        # جریان وب‌سوکت نماد تازه را فوراً دنبال کند (پایش بی‌تأخیر)
+        try:
+            self._update_streamed_symbols()
+        except Exception:  # noqa: BLE001
+            logger.debug("Stream update after trade failed", exc_info=True)
+
+        if dialog is not None:
+            closer = getattr(dialog, "trade_opened", None) or getattr(dialog, "accept", None)
+            if callable(closer):
+                closer()
+        self._go_to("nav.trades")
+        try:
+            self.trades.show_open_history()
+        except Exception:  # noqa: BLE001
+            logger.debug("Showing open trades failed", exc_info=True)
+        self.refresh_trades()
 
         message = self.tr_.tr(
-            "signals.paper_trade_opened",
+            "signals.trade_opened_toast",
             direction=self.tr_.tr(f"signals.{position.direction.lower()}", position.direction),
             symbol=position.symbol,
-            entry=self.tr_.format_number(position.entry, 4),
+            entry=self.tr_.format_number(position.entry, 6),
+            stop=self.tr_.format_number(stop, 6),
+            targets=targets_text(targets, lambda v: self.tr_.format_number(v, 6)) or "—",
         )
         self.status(message)
-        QMessageBox.information(self.window, self.tr_.tr("signals.paper_trade_title"), message)
+        self._toast(message, level="success")
+
+    # ------------------------------------------------------------------
+    # معاملهٔ دستی (v2.5.9)
+    # ------------------------------------------------------------------
+    def _manual_trade_symbols(self) -> list[str]:
+        """نمادهای پیشنهادی فرم: جدول بازارها + قیمت‌های زنده + تاریخچهٔ معاملات."""
+        symbols: set[str] = set()
+        for row in getattr(self.markets, "_all_rows", []) or []:
+            if row.get("symbol"):
+                symbols.add(str(row["symbol"]))
+        for source in (getattr(self, "_live_prices", {}) or {}).keys():
+            symbols.add(str(source))
+        for row in getattr(self.trades, "_rows", []) or []:
+            if row.get("symbol"):
+                symbols.add(str(row["symbol"]))
+        return sorted(s for s in symbols if s)
+
+    def open_manual_trade_dialog(self, prefill: dict[str, Any] | None = None, parent: Any = None) -> Any:
+        """
+        پنجرهٔ «باز کردن معامله»: نماد، مبلغ از موجودی، اسپات/فیوچرز، اهرم ۱–۱۰۰،
+        حد سود و ضرر. از سیگنال با مقادیر پر شده، یا خالی از صفحهٔ معاملات.
+        """
+        from ui.dialogs.manual_trade_dialog import ManualTradeDialog
+
+        available = 0.0
+        try:
+            available = float(self._paper_account().available) if self._is_paper_mode() else 0.0
+        except Exception:  # noqa: BLE001
+            logger.debug("Paper balance unavailable for manual trade", exc_info=True)
+        if available <= 0:
+            try:
+                available = float(self._trading_capital()[0] or 0.0)
+            except Exception:  # noqa: BLE001
+                available = 0.0
+        fee_rate = float(self.app.settings.get("scalp.taker_fee_rate", 0.0006) or 0.0)
+        dialog = ManualTradeDialog(
+            self.tr_,
+            symbols=self._manual_trade_symbols(),
+            available=available,
+            fee_rate=fee_rate,
+            parent=parent or self.window,
+        )
+        dialog.price_requested.connect(lambda symbol, d=dialog: self._manual_trade_price(symbol, d))
+        dialog.order_requested.connect(lambda order, d=dialog: self._on_manual_order(order, dialog=d))
+        values = dict(prefill or {})
+        if values:
+            dialog.prefill(values)
+        symbol = dialog.symbol()
+        if symbol:
+            # قیمت لحظه‌ای فقط وقتی جایگزین ورود می‌شود که سیگنالی ورود نداده باشد
+            if not values.get("entry"):
+                self._manual_trade_price(symbol, dialog)
+        self._manual_trade_dialog = dialog
+        dialog.show()
+        return dialog
+
+    def _manual_trade_price(self, symbol: str, dialog: Any) -> None:
+        """قیمت لحظه‌ای: کش زنده/جدول بازارها، وگرنه تیکر صرافی در پس‌زمینه."""
+        price = self._live_fill_price(symbol, "long") or self._last_price(symbol)
+        if price > 0:
+            dialog.set_price(symbol, price)
+            return
+        market = getattr(self.app, "market", None)
+        if market is None:
+            return
+
+        async def fetch() -> float:
+            ticker = await market.get_ticker(symbol)
+            return float(getattr(ticker, "last_price", 0.0) or 0.0)
+
+        self.runner.submit(
+            f"manual-price-{symbol}",
+            fetch(),
+            on_success=lambda value, d=dialog, sym=symbol: d.set_price(sym, float(value or 0.0)),
+            on_error=lambda message, exc=None: logger.info("Manual trade price failed: %s", message),
+        )
+
+    def _on_manual_order(self, order: dict[str, Any], dialog: Any = None) -> None:
+        """
+        ثبت معاملهٔ دستی (کاغذی با قیمت زنده).
+
+        ورود = قیمت قابل‌اجرای زندهٔ تازه (Ask/Bid) اگر هست، وگرنه عدد فرم؛
+        با قیمت تازه دوباره اعتبارسنجی می‌شود تا حد ضرر/سود سمت اشتباه نیفتد.
+        """
+        from trading.manual_order import ManualOrderRequest, plan_manual_order
+
+        symbol = str(order.get("symbol") or "")
+        side = "long" if str(order.get("direction") or "LONG").upper() == "LONG" else "short"
+        fill = self._live_fill_price(symbol, side) or float(order.get("entry") or 0.0)
+        plan = plan_manual_order(ManualOrderRequest(
+            symbol=symbol,
+            market_type=str(order.get("market_type") or "futures"),
+            direction=str(order.get("direction") or "LONG"),
+            amount=float(order.get("amount") or 0.0),
+            leverage=int(order.get("leverage") or 1),
+            entry=fill,
+            take_profit=float(order.get("take_profit") or 0.0),
+            stop_loss=float(order.get("stop_loss") or 0.0),
+            available=float(order.get("available") or 0.0),
+            fee_rate=float(self.app.settings.get("scalp.taker_fee_rate", 0.0006) or 0.0),
+        ))
+        if not plan.valid:
+            keys = ", ".join(self.tr_.tr(f"trades.manual.error_{key}") for key in plan.errors)
+            text = self.tr_.tr("trades.manual.refused_live", price=self.tr_.format_number(fill, 6), reasons=keys)
+            if dialog is not None and hasattr(dialog, "show_error"):
+                dialog.show_error(text)
+            self._toast(text, level="warning")
+            return
+
+        record = {
+            "symbol": plan.symbol,
+            "direction": plan.direction,
+            "entry_price": plan.entry,
+            "stop_loss": plan.stop_loss or None,
+            "take_profits": [plan.take_profit] if plan.take_profit else [],
+            "leverage": float(plan.leverage),
+            "quantity": plan.quantity,
+            "margin": plan.amount,
+            "market_type": plan.market_type,
+            "source": str(order.get("source") or "manual"),
+            "reason": self.tr_.tr("trades.manual.note", market=plan.market_type, leverage=plan.leverage),
+        }
+        trade = self.record_paper_trade(record)
+        if not trade:
+            return
+        try:
+            self._update_streamed_symbols()
+        except Exception:  # noqa: BLE001
+            logger.debug("Stream update after manual trade failed", exc_info=True)
+        if dialog is not None:
+            closer = getattr(dialog, "trade_opened", None) or getattr(dialog, "accept", None)
+            if callable(closer):
+                closer()
+        self._go_to("nav.trades")
+        try:
+            self.trades.show_open_history()
+        except Exception:  # noqa: BLE001
+            logger.debug("Showing open trades failed", exc_info=True)
+        self.refresh_trades()
+        message = self.tr_.tr(
+            "trades.manual.opened_toast",
+            direction=self.tr_.tr(f"signals.{plan.direction.lower()}", plan.direction),
+            symbol=plan.symbol,
+            entry=self.tr_.format_number(plan.entry, 6),
+            leverage=plan.leverage,
+            amount=self._money(plan.amount),
+        )
+        self.status(message)
+        self._toast(message, level="success")
 
     def _paper_trader(self) -> Any:
         """ساخت تنبل دفتر معاملهٔ تمرینی."""
@@ -3851,7 +4803,19 @@ class MainController(QObject):
 
     def _apply_display_settings(self) -> None:
         """اعمال تنظیمات نمایش روی صفحه‌ها."""
-        sort_mode = str(self.app.settings.get("ui.markets_sort", "value") or "value")
+        settings = self.app.settings
+        sort_mode = str(settings.get("ui.markets_sort", "market_cap") or "market_cap")
+        # v2.5.1: مهاجرت یک‌باره — «value» پیش‌فرض قبلی بود و تقریباً همیشه
+        # انتخاب کاربر نیست؛ به ترتیب تازهٔ «ارزش بازار + حجم» می‌رود. انتخاب
+        # صریح دیگر (رشد، الفبا…) دست نمی‌خورد و پس از این هم «value» محترم است.
+        if not settings.get(MARKETS_SORT_MIGRATION_KEY, False):
+            try:
+                if sort_mode == "value":
+                    sort_mode = "market_cap"
+                    settings.set("ui.markets_sort", sort_mode, notify=False)
+                settings.set(MARKETS_SORT_MIGRATION_KEY, True, notify=False)
+            except Exception:  # noqa: BLE001 - نبود ذخیره فقط یعنی تکرار مهاجرت
+                logger.debug("markets sort migration not saved", exc_info=True)
         combo = getattr(self.markets, "sort_combo", None)
         if combo is not None:
             index = combo.findData(sort_mode)
@@ -3914,13 +4878,54 @@ class MainController(QObject):
         کار سنگین (اتصال شبکه) در نخ پس‌زمینه انجام می‌شود تا رابط کاربری
         قفل نشود.
         """
+        engine = getattr(self, "_auto_trader_engine", None)
+        pending = any(str(key).startswith(("auto-manual-enter-", "auto-trade-start", "auto-trade-stop")) for key in self.runner.active_keys())
+        if pending or (engine is not None and engine.is_running) or self.app.trade_repository.open_trades(self.app.auth.user_id):
+            self.app.settings.set("exchange.active", self.app.market.exchange_name)
+            self._toast(self.tr_.tr("trades.auto.exchange_locked"), level="warning")
+            return
+        self._exchange_switching = True
         self.status(self.tr_.tr("settings.exchange_switching", exchange=exchange))
+
+        async def switch():
+            feed = self._live_feed
+            supervisor = self._connection_supervisor
+            if supervisor is not None:
+                await supervisor.stop()
+            if feed is not None:
+                await feed.stop()
+            try:
+                return await self.app.switch_exchange(exchange)
+            except Exception:
+                if feed is not None:
+                    await feed.start()
+                if supervisor is not None:
+                    await supervisor.start()
+                raise
 
         def done(active: str) -> None:
             """پس از تعویض موفق، داده‌های همهٔ صفحه‌ها باید نو شوند."""
             # نمادها و قیمت‌های کش‌شده متعلق به صرافی قبلی بودند
             self._symbols = []
             self._asset_prices = {}
+            self._auto_trader_engine = None
+            self._exchange_switching = False
+            self._live_feed = None
+            self._connection_supervisor = None
+            self._pending_updates.clear()
+            self._watch_candidates = {}
+            self._watch_rows = []
+            self._auto_prediction_payload = None
+            self._start_live_feed()
+            ticks = getattr(self, "_tick_engine", None)
+            if ticks is not None:
+                if engine is not None:
+                    ticks.remove_listener(engine._on_tick)
+                ticks.clear()
+                bound_market = self.app.market
+                bound_market.add_ticker_listener(
+                    lambda ticker: self._on_market_ticker(ticker) if self.app.market is bound_market else None
+                )
             self._refresh_connection_indicator()
             self._toast(
                 self.tr_.tr("settings.exchange_switched", exchange=active),
@@ -3932,12 +4937,15 @@ class MainController(QObject):
 
         def failed(text: str, exc: Any = None) -> None:
             """شکست تعویض نباید بی‌صدا بماند."""
+            self._exchange_switching = False
+            if self.app.market is not None:
+                self.app.settings.set("exchange.active", self.app.market.exchange_name)
             self._refresh_connection_indicator()
             self._on_error(self.tr_.tr("settings.exchange_switch_failed"), exc)
 
         self.runner.submit(
             "switch-exchange",
-            self.app.switch_exchange(exchange),
+            switch(),
             on_success=done,
             on_error=failed,
         )
@@ -3962,6 +4970,41 @@ class MainController(QObject):
             self.settings_page.ai_key_input.setPlaceholderText("••••••••")
         else:
             self.settings_page.ai_key_input.setPlaceholderText("")
+
+    def _warm_up_local_ai(self) -> None:
+        """
+        روشن کردن اولامای نصب‌شده و بارگذاری مدل در پس‌زمینه (نسخهٔ ۲.۵.۹).
+
+        بدون این، اولین تحلیل یا چت باید منتظر بارگذاری چند گیگابایت بماند و
+        معمولاً از مهلت می‌گذشت. شکست فقط در لاگ ثبت می‌شود؛ خطا نیست.
+        """
+        app = self.app
+        try:
+            if not app.ai_enabled() or str(app.settings.get("ai.provider", "") or "").lower() != "ollama":
+                return
+            if app.ai_analyst() is None:
+                return
+            manager = getattr(app, "_ai_manager", None)
+            provider = manager.get("ollama") if manager is not None else None
+        except Exception:  # noqa: BLE001 - گرم‌کردن اختیاری است
+            logger.debug("Local AI warm-up skipped", exc_info=True)
+            return
+        warm = getattr(provider, "warm_up", None)
+        if not callable(warm):
+            return
+
+        def done(result: Any) -> None:
+            ok, detail = result if isinstance(result, tuple) else (False, str(result))
+            logger.info("Local AI warm-up: %s (%s)", "ok" if ok else "failed", detail)
+            if not ok:
+                self.status(self.tr_.tr("settings.ai_warmup_failed", detail=detail))
+
+        self.runner.submit(
+            "ai-warm-up",
+            warm(),
+            on_success=done,
+            on_error=lambda message, exc=None: logger.info("Local AI warm-up failed: %s", message),
+        )
 
     def test_ai_connection(self) -> None:
         """
@@ -5057,18 +6100,26 @@ class MainController(QObject):
             logger.exception("Loading trades failed")
             self._on_error(self.tr_.tr("common.state.error"), exc)
 
-    def record_paper_trade(self, signal: dict[str, Any]) -> None:
+    def record_paper_trade(self, signal: dict[str, Any]) -> dict[str, Any] | None:
         """
         ثبت یک معاملهٔ کاغذی از روی سیگنال.
 
         کاربر خواسته است فعلاً هیچ سفارش واقعی ارسال نشود؛ مقدار `mode`
         روی «paper» می‌ماند تا وقتی سفارش‌گذاری واقعی فعال شود.
+
+        v2.5.0: اهداف TP1..TP3 در `extra.targets` برای مدیریت پلکانی ثبت
+        می‌شوند و `take_profit` = آخرین هدف است (پیش‌تر `take_profit`
+        از کلیدی خوانده می‌شد که سیگنال‌ها نداشتند و همیشه خالی می‌ماند).
+        حجم اگر از پیش حساب شده باشد (`quantity`) همان به کار می‌رود.
+        بازگشتی: رکورد معامله یا `None`.
         """
+        from trading.staged_targets import clean_targets
+
         try:
             entry = float(signal.get("entry_price") or signal.get("entry_min") or 0.0)
             if entry <= 0:
                 self.status(self.tr_.tr("common.state.no_data"))
-                return
+                return None
             direction = str(signal.get("direction", "")).upper()
             if direction not in ("LONG", "SHORT"):
                 # آرگومان دوم `tr` مقدار پیش‌فرض است نه متغیر؛ نام جهت باید
@@ -5079,32 +6130,63 @@ class MainController(QObject):
                         direction=self.tr_.tr(f"signals.{direction.lower()}", direction),
                     )
                 )
-                return
+                return None
+            side = "long" if direction == "LONG" else "short"
 
-            balance = float(self.app.settings.get("risk.account_balance", 1000) or 1000)
-            risk_percent = float(self.app.settings.get("risk.risk_percent", 1) or 1)
             stop = float(signal.get("stop_loss") or 0.0)
-            distance = abs(entry - stop) or entry * 0.01
-            quantity = (balance * risk_percent / 100.0) / distance
+            quantity = float(signal.get("quantity") or 0.0)
+            if quantity <= 0:
+                balance, _source = self._trading_capital()
+                balance = balance or float(self.app.settings.get("risk.account_balance", 1000) or 1000)
+                risk_percent = float(self.app.settings.get("risk.risk_percent", 1) or 1)
+                distance = abs(entry - stop) or entry * 0.01
+                quantity = (balance * risk_percent / 100.0) / distance
+                # نسخهٔ ۲.۵.۵: کیفیت سیگنال اندازه را تعدیل می‌کند
+                # (STRONG 1.0 / NORMAL 0.75 / WEAK 0.5)
+                intel_size = (signal.get("intelligence") or {}).get("size_multiplier")
+                if isinstance(intel_size, (int, float)) and 0 < intel_size <= 1:
+                    quantity *= float(intel_size)
+
+            raw_targets = signal.get("take_profits") or signal.get("take_profit") or []
+            targets = clean_targets(raw_targets, entry=entry, side=side)
+            fee_rate = float(self.app.settings.get("scalp.taker_fee_rate", 0.0006) or 0.0)
+            extra = {
+                "targets": targets,
+                "targets_hit": 0,
+                "original_quantity": quantity,
+                "realized_gross": 0.0,
+                "fee_rate": fee_rate,
+                "source": str(signal.get("source") or "signal"),
+                # v2.5.9: معاملهٔ دستی — نوع بازار و مبلغ انتخابی کاربر
+                "market_type": str(signal.get("market_type") or "futures"),
+                "margin": float(signal.get("margin") or 0.0),
+                "staged": len(targets) > 1,
+                # عکس لحظه‌ای تصمیم هوشمند: سنجش عملکرد به تفکیک کیفیت + یادگیری
+                "quality": str((signal.get("intelligence") or {}).get("quality") or ""),
+                "intelligence": dict(signal.get("intelligence") or {}),
+            }
 
             trade = self.app.trade_repository.open_trade(
                 symbol=str(signal.get("symbol", "")),
-                side="long" if direction == "LONG" else "short",
+                side=side,
                 quantity=quantity,
                 entry_price=entry,
                 user_id=self.app.auth.user_id,
                 signal_id=signal.get("id"),
                 stop_loss=stop or None,
-                take_profit=float(signal.get("take_profit") or 0.0) or None,
+                take_profit=(targets[-1] if targets else None),
                 leverage=float(signal.get("leverage") or 1.0),
+                fee=quantity * entry * fee_rate,
                 note=str(signal.get("reason", ""))[:200],
+                extra=extra,
             )
             self.status(self.tr_.tr("trades.opened"))
-            self._toast(self.tr_.tr("trades.opened"), level="success")
             self.refresh_trades()
             logger.info("Paper trade recorded from signal: id=%s", trade.get("id"))
+            return trade
         except Exception as exc:  # noqa: BLE001
             self._on_error(self.tr_.tr("common.state.error"), exc)
+            return None
 
     # ------------------------------------------------------------------
     # معاملهٔ خودکار
@@ -5118,7 +6200,8 @@ class MainController(QObject):
         تا ری‌استارت بعدی بی‌اثر می‌ماند.
         """
         existing = getattr(self, "_auto_trader_engine", None)
-        if existing is not None and existing.is_running:
+        if existing is not None:
+            existing.apply_config(self._auto_trade_config())
             return existing
 
         from trading.auto_trader import AutoTrader
@@ -5127,12 +6210,14 @@ class MainController(QObject):
         service = ScalpService(self.app)
         config = self._auto_trade_config()
 
+        bound_market = self.app.market
+
         async def price_source(symbol: str) -> float:
-            """اول کش زنده، بعد REST."""
-            cached = self._cached_symbol_price(symbol, max_age=5.0)
-            if cached > 0:
-                return cached
-            return float(await self.app.market.get_current_price(symbol))
+            """REST همان صرافی‌ای که موتور به آن متصل شد."""
+            market = bound_market
+            if market is None:
+                return 0.0
+            return await market.refresh_execution_quote(symbol, self._tick_engine)
 
         # کاربر خواست معاملهٔ خودکار روی **همهٔ ارزها** تحلیل کند و هر
         # نمادی که اطمینانش از حد تعیین‌شده بالاتر رفت وارد معامله شود.
@@ -5142,6 +6227,22 @@ class MainController(QObject):
         from trading.confidence_source import ConfidenceCandidateSource
 
         confidence_source = ConfidenceCandidateSource(self.app)
+
+        # نسخهٔ ۲.۵.۴: اسکالپ فوق‌سریع — بدون درخواست اضافه، از کش تیک.
+        from trading.ultra_scalp import UltraScalpSource
+
+        async def ultra_tickers() -> list:
+            market = bound_market
+            # نسخهٔ ۲.۶.۱: ۵ ثانیه (همان نظرسنجی بازار)؛ ۱۰ ثانیه عمر کش مشترک
+            # را دراز می‌کرد و تیک‌های REST مدام از آستانهٔ کهنگی رد می‌شدند.
+            return await market.get_all_tickers(max_age_seconds=5) if market is not None else []
+
+        ultra_source = UltraScalpSource(
+            lambda: getattr(self, "_tick_engine", None),
+            tickers_source=ultra_tickers,
+            settings=lambda key, default: self.app.settings.get(key, default),
+        )
+        self._ultra_source = ultra_source
 
         async def candidate_source() -> list:
             """
@@ -5162,13 +6263,26 @@ class MainController(QObject):
 
             if engine_mode == "ai":
                 return await self._ai_candidate_scan()
+            if engine_mode == "ultra":
+                trader = getattr(self, "_auto_trader_engine", None)
+                held = {t.symbol for t in trader.open_trades} if trader is not None else set()
+                capacity = (trader.config.max_concurrent - len(held)) if trader is not None else 50
+                return await ultra_source.scan(
+                    symbols=self._auto_selected_symbols(), exclude=held,
+                    limit=max(5, capacity * 2),
+                )
 
             selected = self._auto_selected_symbols()
             if source_mode == "confidence":
-                candidates = await confidence_source.scan()
+                candidates = await confidence_source.scan(symbols=selected if engine_mode == "selected" else None)
             else:
-                candidates = await service.scan()
-                candidates = [c for c in candidates if service.feasibility(c)[0]]
+                candidates = await service.scan(symbols=selected if engine_mode == "selected" else None)
+                feasible = [c for c in candidates if service.feasibility(c)[0]]
+                # نسخهٔ ۲.۶.۰ (فقط ثبت): نامزدهای حذف‌شده با هدف ناممکن در خلاصهٔ پویش
+                from app.logging import audit as _audit
+
+                _audit.note_scan(reasons={"target_infeasible": len(candidates) - len(feasible)})
+                candidates = feasible
             if engine_mode == "selected" and selected is not None:
                 candidates = [
                     c for c in candidates
@@ -5188,7 +6302,20 @@ class MainController(QObject):
             user_id=self.app.auth.user_id,
             portfolio_source=self._portfolio_snapshot,
             invalidation_source=self._prediction_direction,
+            # نسخهٔ ۲.۵.۵: اجرای واقعی تا عبور از دروازهٔ اعتبارسنجی قفل است
+            live_gate=self.app.validation_gate.live_allowed,
         )
+
+        async def book_source(symbol: str) -> bool:
+            """نسخهٔ ۲.۶.۱: پیش‌خوانی فقط دفتر سفارش (یک درخواست)."""
+            market = bound_market
+            ticks = getattr(self, "_tick_engine", None)
+            refresh = getattr(market, "refresh_execution_book", None)
+            if market is None or ticks is None or not callable(refresh):
+                return bool(await price_source(symbol))
+            return await refresh(symbol, ticks)
+
+        engine.set_book_source(book_source)
         # مسیر تیک: هر تیک وب‌سوکت بلافاصله TP/SL/سر‌به‌سر/تریلینگ را
         # می‌سنجد — پایش فقط fallback است (خواستهٔ §۶).
         engine.attach_tick_engine(self._ensure_tick_engine())
@@ -5224,6 +6351,7 @@ class MainController(QObject):
             "scalp.max_loss",
             "scalp.leverage",
             "scalp.max_concurrent",
+            "scalp.max_hold_seconds",
             "scalp.min_confidence",
             "scalp.candidate_source",
             "scalp.mode",
@@ -5257,41 +6385,84 @@ class MainController(QObject):
         """
         self.auto_trade_event.emit(str(event), dict(payload or {}))
 
+    #: کمترین فاصلهٔ دو اعلان شناور معاملهٔ خودکار (ثانیه)؛ بقیه در نوار وضعیت
+    AUTO_TOAST_MIN_INTERVAL = 2.5
+    #: ادغام تازه‌سازی جدول/پنل پس از رویدادهای پیاپی (میلی‌ثانیه)
+    AUTO_REFRESH_COALESCE_MS = 400
+
     def _handle_auto_trade_event(self, event: str, payload: dict) -> None:
-        """نمایش رویداد معاملهٔ خودکار روی صفحه (نخ رابط کاربری)."""
+        """
+        نمایش رویداد معاملهٔ خودکار روی صفحه (نخ رابط کاربری).
+
+        نسخهٔ ۲.۵.۴: با اسکالپ فوق‌سریع صدها رویداد در دقیقه می‌رسد. قبلاً هر
+        رویداد (حتی «رد نامزد») جدول معاملات را از پایگاه داده دوباره می‌ساخت
+        و برای هر باز/بسته شدن یک اعلان شناور می‌آمد. حالا: رد/کهنگی هیچ
+        تازه‌سازی‌ای ندارند، تازه‌سازی‌ها در یک نوبت ۴۰۰ms ادغام می‌شوند و
+        اعلان‌ها حداکثر هر ۲٫۵ ثانیه یکی است (بقیه خلاصه در نوار وضعیت).
+        """
         # موتور، معامله را زیر کلید `trade` و نتیجهٔ ذخیره‌شده را زیر
         # `record` می‌فرستد؛ خواندن مستقیم `symbol` از payload همیشه
         # «؟» می‌داد.
+        if event in {"rejected", "stale", "tick"}:
+            return
         trade = payload.get("trade")
         record = payload.get("record") or {}
         symbol = getattr(trade, "symbol", "") or record.get("symbol", "?")
 
+        message = ""
+        level = "info"
         if event == "opened":
             price = getattr(trade, "entry_price", None) or record.get("entry_price", "?")
-            self._toast(
-                self.tr_.tr(
-                    "trades.auto.opened",
-                    symbol=symbol,
-                    price=f"{float(price):,.6g}" if isinstance(price, (int, float)) else price,
-                ),
-                level="info",
+            message = self.tr_.tr(
+                "trades.auto.opened",
+                symbol=symbol,
+                price=f"{float(price):,.6g}" if isinstance(price, (int, float)) else price,
             )
         elif event == "closed":
             pnl = float(record.get("pnl", 0) or 0)
-            self._toast(
-                self.tr_.tr(
-                    "trades.auto.closed",
-                    symbol=symbol,
-                    pnl=f"{pnl:+.2f}",
-                    reason=str(payload.get("reason", "")),
-                ),
-                level="success" if pnl >= 0 else "warning",
+            message = self.tr_.tr(
+                "trades.auto.closed",
+                symbol=symbol,
+                pnl=f"{pnl:+.2f}",
+                reason=str(payload.get("reason", "")),
             )
+            level = "success" if pnl >= 0 else "warning"
         elif event == "halted":
-            self._toast(
-                self.tr_.tr("trades.auto.blocked", reason=payload.get("reason", "")),
-                level="warning",
-            )
+            message = self.tr_.tr("trades.auto.blocked", reason=payload.get("reason", ""))
+            level = "warning"
+        if message:
+            self._auto_event_toast(message, level=level, force=event in {"halted", "started", "stopped"})
+        if event in {"opened", "closed"}:
+            self._auto_streams_dirty = True
+        self._schedule_auto_refresh()
+
+    def _auto_event_toast(self, message: str, *, level: str, force: bool = False) -> None:
+        """اعلان شناور با سقف نرخ؛ پیام‌های اضافه فقط در نوار وضعیت."""
+        now = time.monotonic()
+        last = getattr(self, "_auto_last_toast", 0.0)
+        if force or now - last >= self.AUTO_TOAST_MIN_INTERVAL:
+            self._auto_last_toast = now
+            skipped = getattr(self, "_auto_toasts_skipped", 0)
+            self._auto_toasts_skipped = 0
+            if skipped:
+                message = f"{message}  (+{skipped})"
+            self._toast(message, level=level)
+        else:
+            self._auto_toasts_skipped = getattr(self, "_auto_toasts_skipped", 0) + 1
+            self.status(message)
+
+    def _schedule_auto_refresh(self) -> None:
+        """یک تازه‌سازی ادغام‌شده برای همهٔ رویدادهای ۴۰۰ms اخیر."""
+        if getattr(self, "_auto_refresh_pending", False):
+            return
+        self._auto_refresh_pending = True
+        QTimer.singleShot(self.AUTO_REFRESH_COALESCE_MS, self._flush_auto_refresh)
+
+    def _flush_auto_refresh(self) -> None:
+        self._auto_refresh_pending = False
+        if getattr(self, "_auto_streams_dirty", False):
+            self._auto_streams_dirty = False
+            self._update_streamed_symbols()
         self.refresh_trades()
         self._refresh_auto_trade_panel()
 
@@ -5343,12 +6514,59 @@ class MainController(QObject):
             )
             detail = f"{len(engine.open_trades)} / {engine.config.max_concurrent}"
             detail = self.tr_.tr("trades.auto.running") + f" • {detail}"
+            scan_text = self._auto_scan_summary(engine)
+            if scan_text:
+                detail += f" • {scan_text}"
         if not detail:
             detail = self._auto_economics_text()
         self.trades.set_auto_state(running, detail)
 
+    #: توضیح فارسی/انگلیسی دلیل‌های رد رایج (کلید ترجمه)
+    AUTO_REJECTION_KEYS = (
+        "stale_data", "price_unavailable", "wide_spread", "low_liquidity", "trend_conflict",
+        "no_available_margin", "max_concurrent_reached", "daily_loss_limit", "negative_edge", "target_unreachable", "spread_eats_stop", "no_orderbook",
+        "fees_exceed_loss_budget", "risk_exceeds_loss_budget", "poor_net_reward_risk",
+        "invalid_risk_levels", "symbol_already_open", "stale_candidate", "symbol_not_selected",
+        "no_price",
+    )
+
+    def _auto_scan_summary(self, engine: Any) -> str:
+        """«آخرین پویش: N نامزد، M باز شد؛ رد: دلیل×k» — تا کاربر علت را ببیند."""
+        stats = engine.scan_stats() if hasattr(engine, "scan_stats") else {}
+        if not stats:
+            return ""
+        parts = []
+        for reason, count in list(stats.get("rejections") or [])[:2]:
+            key = f"trades.auto.reject.{reason}"
+            label = self.tr_.tr(key) if reason in self.AUTO_REJECTION_KEYS and self.tr_.has(key) else reason
+            parts.append(f"{label}×{count}")
+        text = self.tr_.tr(
+            "trades.auto.scan_summary",
+            candidates=int(stats.get("candidates", 0) or 0),
+            opened=int(stats.get("opened", 0) or 0),
+            reasons="، ".join(parts) if parts else "—",
+        )
+        # نسخهٔ ۲.۵.۷: نتیجهٔ واقعی همین اجرا — برد و دلیل‌های خروج
+        edge = engine.edge_stats() if hasattr(engine, "edge_stats") else {}
+        if edge and int(edge.get("trades", 0) or 0) > 0:
+            exits = sorted((edge.get("exit_reasons") or {}).items(), key=lambda kv: -kv[1])[:3]
+            exit_text = "، ".join(f"{name}×{count}" for name, count in exits) or "—"
+            summary = self.tr_.tr(
+                "trades.auto.edge_summary",
+                trades=int(edge["trades"]),
+                win=f"{float(edge.get('win_rate') or 0.0):.0f}",
+                mean=f"{float(edge.get('mean') or 0.0):+.2f}",
+                exits=exit_text,
+            )
+            if summary != "trades.auto.edge_summary":
+                text = f"{text} • {summary}"
+        return text
+
     def toggle_auto_trading(self, start: bool) -> None:
         """روشن یا خاموش کردن معاملهٔ خودکار به درخواست کاربر."""
+        if start and getattr(self, "_exchange_switching", False):
+            self._toast(self.tr_.tr("trades.auto.exchange_locked"), level="warning")
+            return
         if start:
             engine = self._auto_trader()
 
@@ -5388,24 +6606,36 @@ class MainController(QObject):
         )
 
     def close_paper_trade(self, trade_id: int) -> None:
-        """بستن یک معاملهٔ باز با آخرین قیمت بازار."""
-        try:
-            record = self.app.trade_repository.get_by_id(int(trade_id))
-            symbol = getattr(record, "symbol", "") if record else ""
-            price = self._last_price(symbol)
-            if price <= 0:
-                self.status(self.tr_.tr("common.state.no_data"))
-                return
-            self.app.trade_repository.close_trade(
-                int(trade_id),
-                exit_price=price,
-                fee=self._exit_fee(record),
+        """یک مسیر خروج برای تاریخچه، مودال و موقعیت‌ها؛ بدون قیمت کهنهٔ UI."""
+        key = f"close-trade-{int(trade_id)}"
+        if key in set(self.runner.active_keys()):
+            return
+        engine = getattr(self, "_auto_trader_engine", None)
+        managed = next((t for t in engine.open_trades if t.trade_id == int(trade_id)), None) if engine else None
+        ticks = self._ensure_tick_engine()
+        market = self.app.market
+        if market is None:
+            self.status(self.tr_.tr("common.state.no_data"))
+            return
+
+        async def close():
+            if managed is not None:
+                return await engine.close_trade(managed, "manual")
+            from trading.paper_execution import close_paper_position
+            return await close_paper_position(
+                self.app.trade_repository, int(trade_id), ticks,
+                lambda symbol: market.refresh_execution_quote(symbol, ticks),
+                slippage_percent=self._auto_trade_config().slippage_percent,
+                fee_rate=self._auto_trade_config().fee_rate,
             )
-            self._toast(self.tr_.tr("trades.closed"), level="success")
+
+        def done(result):
+            self._toast(self.tr_.tr("trades.closed" if result else "trades.auto.close_failed"),
+                        level="success" if result else "warning")
             self.refresh_trades()
             self.refresh_wallet()
-        except Exception as exc:  # noqa: BLE001
-            self._on_error(self.tr_.tr("common.state.error"), exc)
+
+        self.runner.submit(key, close(), on_success=done, on_error=self._on_error)
 
     def clear_trade_history(self) -> None:
         """پاک‌کردن تاریخچه پس از تأیید کاربر."""
@@ -5460,9 +6690,12 @@ class MainController(QObject):
     # ------------------------------------------------------------------
     # کیف پول
     # ------------------------------------------------------------------
-    def sync_wallet(self) -> None:
+    def sync_wallet(self, silent: bool = False) -> None:
         """
         گرفتن موجودی تازه از صرافی و سپس تازه‌سازی صفحه.
+
+        `silent` برای همگام‌سازی خودکار دوره‌ای است: پیام نوار وضعیت نمی‌دهد
+        و اگر همگام‌سازی دیگری در راه باشد کاری نمی‌کند (v2.5.1).
 
         پیش‌تر دکمهٔ «همگام‌سازی» فقط همان دادهٔ ذخیره‌شده را دوباره رسم
         می‌کرد و هیچ درخواستی به صرافی نمی‌رفت؛ برای همین کیف پول حتی با
@@ -5476,12 +6709,17 @@ class MainController(QObject):
         )
         if account is None:
             self.wallet.set_connected(False)
-            self.status(self.tr_.tr("wallet.no_account"))
+            if not silent:
+                self.status(self.tr_.tr("wallet.no_account"))
             return
+        if getattr(self, "_wallet_sync_running", False):
+            return
+        self._wallet_sync_running = True
 
         account_id = int(account["id"])
         self.wallet.set_busy(True)
-        self.status(self.tr_.tr("wallet.syncing"))
+        if not silent:
+            self.status(self.tr_.tr("wallet.syncing"))
 
         # از همان سازندهٔ مشترک استفاده می‌شود تا منطق ساخت ارائه‌دهنده در
         # دو جا تکرار (و واگرا) نشود.
@@ -5497,7 +6735,14 @@ class MainController(QObject):
 
         def done(result: dict[str, Any]) -> None:
             """نمایش نتیجه؛ خطا هم باید دیده شود نه اینکه بی‌صدا رد شود."""
+            self._wallet_sync_running = False
+            self._wallet_synced_at = time.monotonic()
             self.wallet.set_busy(False)
+            if silent:
+                # refresh_wallet → _paper_account: نخستین موجودی واقعی خودکار
+                # مبنای حساب کاغذی می‌شود
+                self.refresh_wallet()
+                return
             if result.get("balances"):
                 self.status(self.tr_.tr("wallet.sync_done"))
             else:
@@ -5512,8 +6757,11 @@ class MainController(QObject):
 
         def failed(text: str, exc: Any = None) -> None:
             """شکست همگام‌سازی نباید بی‌صدا بماند."""
+            self._wallet_sync_running = False
+            self._wallet_synced_at = time.monotonic()
             self.wallet.set_busy(False)
-            self._on_error(self.tr_.tr("wallet.sync_failed"), exc)
+            if not silent:
+                self._on_error(self.tr_.tr("wallet.sync_failed"), exc)
             self.refresh_wallet()
 
         self.runner.submit(
@@ -5538,6 +6786,7 @@ class MainController(QObject):
             if account is None:
                 return
 
+            self._fill_paper_panel()
             balances = account.get("balances") or {}
             total = float(account.get("total_value_usdt") or 0.0)
             # تفکیک اسپات/فیوچرز که هنگام همگام‌سازی ذخیره شده است
@@ -5549,6 +6798,12 @@ class MainController(QObject):
 
             statistics = self.app.trade_repository.statistics(user_id=user_id)
             available = float(balances.get("USDT", 0.0) or 0.0)
+            # v2.5.0: «آزاد» دقیق = USDT آزاد اسپات + مارجین آزاد فیوچرز
+            wallet_details = dict((account.get("extra_config") or {}).get("wallet_details") or {})
+            spot_usdt = (wallet_details.get("spot") or {}).get("USDT") or {}
+            futures_usdt = (wallet_details.get("futures") or {}).get("USDT") or {}
+            if spot_usdt or futures_usdt:
+                available = float(spot_usdt.get("free") or 0.0) + float(futures_usdt.get("available") or 0.0)
             self.wallet.set_summary(
                 total=self._money(total),
                 available=self._money(available),
@@ -5569,9 +6824,303 @@ class MainController(QObject):
                 if account.get("last_sync_at")
                 else ""
             )
+            details = dict((account.get("extra_config") or {}).get("wallet_details") or {})
+            self._fill_wallet_tabs(by_wallet, details, balances)
+            self._fill_wallet_report(account, details)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Wallet refresh failed")
             self._on_error(self.tr_.tr("common.state.error"), exc)
+
+    # ---------------------------------------------------------- v2.5.1
+    #: فاصلهٔ همگام‌سازی خودکار موجودی (میلی‌ثانیه)
+    WALLET_AUTO_SYNC_MS = 60_000
+    #: اگر آخرین همگام‌سازی کهنه‌تر از این باشد، ورود به کیف پول همگام می‌کند
+    WALLET_STALE_SECONDS = 30.0
+
+    def start_wallet_auto_sync(self) -> None:
+        """
+        همگام‌سازی خودکار موجودی: یک بار بلافاصله و سپس هر ۶۰ ثانیه.
+
+        قبلاً موجودی فقط با دکمهٔ «همگام‌سازی» خوانده می‌شد؛ کاربری که آن را
+        نمی‌زد (یا خطای آن را نمی‌دید) کیف پول را همیشه خالی می‌دید. هزینه
+        ناچیز است: یک درخواست اسپات + چهار درخواست قرارداد در دقیقه، در
+        برابر سقف ۲۰۰ درخواست در ۱۰ ثانیهٔ LBank.
+        """
+        if getattr(self, "_wallet_timer", None) is None:
+            self._wallet_timer = QTimer(self.window)
+            self._wallet_timer.setInterval(self.WALLET_AUTO_SYNC_MS)
+            self._wallet_timer.timeout.connect(lambda: self.sync_wallet(silent=True))
+        enabled = bool(self.app.settings.get("wallet.auto_sync", True))
+        self.wallet.auto_sync_checkbox.blockSignals(True)
+        self.wallet.auto_sync_checkbox.setChecked(enabled)
+        self.wallet.auto_sync_checkbox.blockSignals(False)
+        if enabled:
+            self._wallet_timer.start()
+        else:
+            self._wallet_timer.stop()
+        # همیشه یک بار در شروع (حتی اگر خودکار خاموش باشد)
+        self.sync_wallet(silent=True)
+
+    def _on_wallet_auto_sync_toggled(self, enabled: bool) -> None:
+        """کلید «تازه‌سازی خودکار» کیف پول."""
+        try:
+            self.app.settings.set("wallet.auto_sync", bool(enabled))
+        except Exception:  # noqa: BLE001
+            logger.debug("Could not persist wallet.auto_sync", exc_info=True)
+        timer = getattr(self, "_wallet_timer", None)
+        if timer is None:
+            return
+        if enabled:
+            timer.start()
+            self.sync_wallet(silent=True)
+        else:
+            timer.stop()
+
+    def _on_wallet_activated(self) -> None:
+        """ورود به صفحهٔ کیف پول: همگام‌سازی اگر داده کهنه است."""
+        last = getattr(self, "_wallet_synced_at", None)
+        if last is None or time.monotonic() - last > self.WALLET_STALE_SECONDS:
+            self.sync_wallet(silent=True)
+
+    def _fill_wallet_report(self, account: dict[str, Any], details: dict[str, Any]) -> None:
+        """
+        نوار وضعیت همگام‌سازی کیف پول (v2.5.1).
+
+        برای اسپات و فیوچرز جدا می‌گوید چه آمد و اگر نیامد چرا — با
+        راهنمای رفع (مجوز کلید، فهرست IP، مجوز قرارداد).
+        """
+        if not hasattr(self.wallet, "set_sync_report"):
+            return
+        report = dict(details.get("report") or {})
+        last_error = str(account.get("last_error") or "")
+        lines: list[tuple[str, str]] = []
+        hints: list[str] = []
+        tr = self.tr_.tr
+        if not account.get("last_sync_at") and not report:
+            if last_error:
+                lines.append(("error", tr("wallet.report.sync_error", error=self._localize_exchange_message(last_error))))
+                hints.append(self._wallet_error_hint(last_error))
+            else:
+                lines.append(("warn", tr("wallet.report.never")))
+            self.wallet.set_sync_report(lines, " ".join(h for h in hints if h))
+            return
+        for section in ("spot", "futures"):
+            info = report.get(section)
+            label = tr(f"wallet.report.{section}")
+            if not isinstance(info, dict):
+                continue
+            if info.get("ok"):
+                count = int(info.get("assets") or 0)
+                if count:
+                    lines.append(("ok", tr("wallet.report.ok", section=label, count=self.tr_.format_number(count, 0))))
+                elif info.get("note") == "no_positive_fields" and info.get("fields"):
+                    lines.append(("warn", tr("wallet.report.unknown_fields", section=label,
+                                             fields=", ".join(info.get("fields")[:12]))))
+                else:
+                    lines.append(("warn", tr("wallet.report.empty", section=label)))
+            else:
+                error = str(info.get("error") or last_error or "")
+                lines.append(("error", tr("wallet.report.failed", section=label, error=error or "—")))
+                hints.append(self._wallet_error_hint(error, futures=(section == "futures")))
+        if not report and last_error:
+            lines.append(("error", tr("wallet.report.sync_error", error=self._localize_exchange_message(last_error))))
+            hints.append(self._wallet_error_hint(last_error))
+        elif last_error and all(level != "error" for level, _ in lines):
+            lines.append(("warn", tr("wallet.report.sync_error", error=self._localize_exchange_message(last_error))))
+        unique_hints = list(dict.fromkeys(h for h in hints if h))
+        self.wallet.set_sync_report(lines, " ".join(unique_hints))
+
+    def _wallet_error_hint(self, error: str, *, futures: bool = False) -> str:
+        """راهنمای رفع بر پایهٔ متن/کد خطا."""
+        text = str(error or "").lower()
+        tr = self.tr_.tr
+        # v2.5.1: رد درخواست پیش از رسیدن به API (Cloudflare/فایروال) — مشکل
+        # کلید نیست؛ باید پیش از بررسی کدهای مجوز تشخیص داده شود.
+        if "cloudflare" in text or "blocked" in text or "http 403" in text or "forbidden" in text:
+            if "1009" in text or "country" in text:
+                return tr("wallet.hint.blocked_region")
+            return tr("wallet.hint.blocked")
+        if "10022" in text or "permission" in text or "10009" in text or "10067" in text:
+            return tr("wallet.hint.futures_permission" if futures else "wallet.hint.permission")
+        if any(code in text for code in ("10007", "10010", "10003", "signature")):
+            return tr("wallet.hint.signature")
+        if any(code in text for code in ("10005", "10008", "176", "177", "authentication")):
+            return tr("wallet.hint.key")
+        if "10600" in text or "timestamp" in text:
+            return tr("wallet.hint.clock")
+        if "10205" in text or "region" in text:
+            return tr("wallet.hint.region")
+        if any(word in text for word in ("network", "timeout", "timed out", "connect")):
+            return tr("wallet.hint.network")
+        if futures:
+            return tr("wallet.hint.futures_permission")
+        return tr("wallet.hint.generic")
+
+    def _asset_usdt_price(self, code: str, prices: dict[str, Any] | None = None) -> float:
+        """قیمت تتری دارایی: جدول زنده → قیمت‌های همگام‌سازی → ۰."""
+        code = str(code or "").upper()
+        if code in ("USDT", "USD"):
+            return 1.0
+        live = self._last_price(f"{code}/USDT") or self._asset_prices.get(code, 0.0)
+        if live:
+            return float(live)
+        try:
+            return float((prices or {}).get(code) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _fill_paper_panel(self) -> None:
+        """پنل حساب کاغذی کیف پول (v2.5.0)."""
+        if not hasattr(self.wallet, "set_paper"):
+            return
+        try:
+            account = self._paper_account()
+        except Exception:  # noqa: BLE001
+            logger.debug("Paper account unavailable", exc_info=True)
+            return
+        money = self._money
+        colors = {}
+        tokens = getattr(getattr(self, "themes", None), "tokens", None)
+        palette = getattr(tokens, "colors", None)
+        for key, value in (("realized", account.realized), ("unrealized", account.unrealized)):
+            if palette is not None and value:
+                colors[key] = palette.success if value > 0 else palette.danger
+        if account.source == "wallet":
+            from trading.paper_account import parse_start_at
+
+            moment = parse_start_at(account.start_at)
+            source = self.tr_.tr(
+                "wallet.paper.source_wallet",
+                amount=money(account.start),
+                time=self._localized_datetime(moment) if moment else "—",
+            )
+        else:
+            source = self.tr_.tr("wallet.paper.source_settings", amount=money(account.start))
+        signed = lambda v: ("+" if v > 0 else "") + money(v)  # noqa: E731
+        self.wallet.set_paper(
+            {
+                "balance": money(account.balance),
+                "equity": money(account.equity),
+                "available": money(account.available),
+                "realized": signed(account.realized),
+                "unrealized": signed(account.unrealized),
+                "used_margin": money(account.used_margin),
+                "start": money(account.start),
+            },
+            source_text=source,
+            colors=colors,
+            card_value=money(account.equity),
+            card_caption=self.tr_.tr("wallet.paper.m_available") + ": " + money(account.available),
+        )
+
+    def _fill_wallet_tabs(
+        self, by_wallet: dict[str, Any], details: dict[str, Any], balances: dict[str, Any]
+    ) -> None:
+        """
+        زبانه‌های اسپات و فیوچرز با اعداد دقیق همگام‌سازی (v2.5.0).
+
+        جزئیات آزاد/قفل و مارجین/سود شناور از `wallet_details` می‌آید؛ اگر
+        همگام‌سازی قدیمی‌تر باشد و جزئیات نداشته باشد، کل موجودی نمایش
+        داده می‌شود و خانه‌های نامعلوم «—» می‌مانند (عدد ساختگی نه).
+        """
+        if not hasattr(self.wallet, "set_spot"):
+            return
+        fmt = self.tr_.format_number
+        money = self._money
+        prices = dict(details.get("prices") or {})
+        tokens = getattr(getattr(self, "themes", None), "tokens", None)
+        palette = getattr(tokens, "colors", None)
+
+        # --- اسپات ---
+        spot = dict((by_wallet or {}).get("spot") or {})
+        spot_details = dict(details.get("spot") or {})
+        rows: list[dict[str, Any]] = []
+        spot_total = 0.0
+        locked_value = 0.0
+        for asset, amount in spot.items():
+            code = str(asset).upper()
+            info = spot_details.get(code) or {}
+            total = float(info.get("total") or amount or 0.0)
+            if total <= 0:
+                continue
+            price = self._asset_usdt_price(code, prices)
+            value = total * price if price else 0.0
+            spot_total += value
+            locked = float(info.get("locked") or 0.0)
+            locked_value += locked * price if price else 0.0
+            rows.append({"asset": code, "total": total, "value": value, "price": price,
+                         "free": info.get("free"), "locked": info.get("locked")})
+        # v2.5.1: بیشترین ارزش تتری بالا (مثل صرافی‌ها)؛ دارایی بی‌قیمت آخر
+        rows.sort(key=lambda r: (not r["price"], -r["value"], r["asset"]))
+        spot_rows = []
+        for r in rows:
+            change = self._change_percent(f"{r['asset']}/USDT") if r["price"] and r["asset"] not in ("USDT", "USD") else None
+            spot_rows.append({
+                "asset": r["asset"],
+                "value": r["value"] if r["price"] else None,
+                "free_text": fmt(r["free"], 8) if r["free"] is not None else "—",
+                "locked_text": fmt(r["locked"], 8) if r["locked"] is not None else "—",
+                "total_text": fmt(r["total"], 8),
+                "price_text": fmt(r["price"], 6) if r["price"] else "—",
+                "value_text": money(r["value"]) if r["price"] else "—",
+                "share_text": (fmt(r["value"] / spot_total * 100, 1) + "%") if spot_total and r["price"] else "—",
+                "change": change,
+                "change_text": self._change_text(f"{r['asset']}/USDT") if change is not None else "—",
+            })
+        free_usdt = spot_details.get("USDT", {}).get("free") if spot_details.get("USDT") else spot.get("USDT")
+        self.wallet.set_spot(spot_rows, {
+            "value": money(spot_total),
+            "available_usdt": money(float(free_usdt or 0.0)),
+            "locked_value": money(locked_value) if spot_details else "—",
+            "assets": fmt(len(spot_rows), 0),
+        })
+
+        # --- فیوچرز ---
+        futures = dict((by_wallet or {}).get("futures") or {})
+        futures_details = dict(details.get("futures") or {})
+        f_rows = []
+        sums = {"equity": 0.0, "wallet": 0.0, "available": 0.0, "margin": 0.0, "frozen": 0.0, "unrealized": 0.0}
+        for asset in sorted(set(futures) | set(futures_details)):
+            code = str(asset).upper()
+            info = futures_details.get(code) or {}
+            equity = float(info.get("total") or futures.get(asset) or 0.0)
+            if equity <= 0 and not info:
+                continue
+            price = self._asset_usdt_price(code, prices)
+            value = equity * price if price else 0.0
+            row = {"asset": code, "unrealized": float(info.get("unrealized") or 0.0)}
+            for key, source in (("equity", equity), ("wallet", info.get("wallet")),
+                                ("available", info.get("available")), ("margin", info.get("margin")),
+                                ("frozen", info.get("frozen")), ("unrealized", info.get("unrealized"))):
+                if source is None:
+                    row[f"{key}_text"] = "—"
+                    continue
+                number = float(source or 0.0)
+                row[f"{key}_text"] = fmt(number, 8 if code not in ("USDT", "USDC") else 4)
+                if price:
+                    sums[key] += number * price
+            row["value_text"] = money(value) if price else "—"
+            f_rows.append(row)
+        has_details = bool(futures_details)
+        used = sums["margin"] + sums["frozen"]
+        colors = {}
+        if palette is not None and sums["unrealized"]:
+            colors["unrealized"] = palette.success if sums["unrealized"] > 0 else palette.danger
+        dash = "—"
+        summary = {
+            "equity": money(sums["equity"]) if f_rows else money(0.0),
+            "wallet": money(sums["wallet"]) if has_details else dash,
+            "available": money(sums["available"]) if has_details else dash,
+            "used_margin": money(used) if has_details else dash,
+            "unrealized": (("+" if sums["unrealized"] > 0 else "") + money(sums["unrealized"])) if has_details else dash,
+            "margin_ratio": (fmt(used / sums["equity"] * 100, 2) + "%") if has_details and sums["equity"] else dash,
+        }
+        note = ""
+        if not f_rows:
+            note = self.tr_.tr("wallet.futures_tab.empty")
+        elif not has_details:
+            note = self.tr_.tr("wallet.futures_tab.no_details")
+        self.wallet.set_futures(f_rows, summary, note=note, colors=colors)
 
     # ------------------------------------------------------------------
     # نوار بالا
@@ -5667,6 +7216,7 @@ class MainController(QObject):
             "nav.wallet": self.refresh_wallet,
             "nav.signals": self._load_signal_history,
             "nav.reports": self._refresh_outcome_view,
+            "nav.logs": getattr(self.log_center, "refresh", None) if getattr(self, "log_center", None) else None,
         }
         handler = handlers.get(key)
         if handler is not None:
@@ -5685,8 +7235,44 @@ class MainController(QObject):
 
     def _trade_row(self, item: dict[str, Any]) -> dict[str, Any]:
         """قالب‌بندی یک معامله برای نمایش در جدول."""
+        item = dict(item)
+        ticks = getattr(self, "_tick_engine", None)
+        quote = ticks.get(str(item.get("symbol") or "")) if ticks is not None else None
+        estimated_fee = float(item.get("fee") or 0)
+        if item.get("status") == "open" and quote is not None:
+            side = str(item.get("side") or "long")
+            price = quote.exit_price(side)
+            slip = self._auto_trade_config().slippage_percent / 100
+            price *= 1 - slip if side == "long" else 1 + slip
+            estimated_fee += self._exit_fee(item, price=price)
+            quantity = float(item.get("quantity") or 0)
+            entry = float(item.get("entry_price") or 0)
+            extra_info = item.get("extra") or {}
+            # v2.5.0: پس از بستن جزئی، سود تحقق‌یافته و مارجین اولیه منظور می‌شود
+            base_quantity = max(quantity, float(extra_info.get("original_quantity") or 0.0))
+            realized = float(extra_info.get("realized_gross") or 0.0)
+            margin = base_quantity * entry / float(item.get("leverage") or 1)
+            item["last_price"] = price
+            item["pnl"] = (price - entry) * quantity * (1 if side == "long" else -1) + realized - estimated_fee
+            item["pnl_percent"] = item["pnl"] / margin * 100 if margin else 0
         row = dict(item)
+        row["data_age_text"] = (
+            self.tr_.tr("trades.auto.stale_data") if quote is None or ticks.is_stale(quote.symbol)
+            else f"{quote.age_ms:.0f} ms"
+        ) if item.get("status") == "open" else "—"
         row["date_text"] = self._localized_datetime(item.get("opened_at"))
+        fmt = self.tr_.format_number
+        entry = float(item.get("entry_price") or 0)
+        quantity = float(item.get("quantity") or 0)
+        leverage = float(item.get("leverage") or 1)
+        row["side_text"] = self.tr_.tr(f"trades.sides.{item.get('side')}")
+        row["status_text"] = self.tr_.tr(f"trades.statuses.{item.get('status')}")
+        row["margin_text"] = fmt(entry * quantity / leverage, 2)
+        row["notional_text"] = fmt(entry * quantity, 2)
+        row["tp_text"] = fmt(item.get("take_profit") or 0, 6)
+        row["sl_text"] = fmt(item.get("stop_loss") or 0, 6)
+        row.update(self._trade_stage_texts(item))
+        row["fee_text"] = fmt(estimated_fee, 4)
         row["quantity_text"] = self.tr_.format_number(item.get("quantity") or 0.0, 4)
         row["entry_text"] = self.tr_.format_number(item.get("entry_price") or 0.0, 4)
         exit_price = item.get("exit_price")
@@ -5702,12 +7288,56 @@ class MainController(QObject):
             row["exit_text"] = (
                 self.tr_.format_number(live, 4) if live > 0 else "—"
             )
+        row["current_text"] = row["exit_text"]
         row["leverage_text"] = f"{self.tr_.format_number(item.get('leverage') or 1.0, 0)}x"
         pnl = float(item.get("pnl") or 0.0)
         row["pnl_text"] = ("+" if pnl >= 0 else "") + self.tr_.format_number(pnl, 2)
         percent = float(item.get("pnl_percent") or 0.0)
         row["pnl_percent_text"] = ("+" if percent >= 0 else "") + self.tr_.format_number(percent, 2) + "%"
         return row
+
+    def _trade_stage_texts(self, item: dict[str, Any]) -> dict[str, str]:
+        """
+        متن‌های ستون «اهداف»، مرحله و «زمان/علت بسته شدن» (v2.5.0).
+
+        اهداف خورده با ✓ علامت می‌خورند؛ معامله‌های قدیمی که فقط یک
+        `take_profit` دارند همان یک هدف را نشان می‌دهند.
+        """
+        extra = item.get("extra") or {}
+        targets = [float(v) for v in (extra.get("targets") or []) if v]
+        if not targets and item.get("take_profit"):
+            targets = [float(item.get("take_profit") or 0.0)]
+        hit = int(extra.get("targets_hit") or 0)
+        status = str(item.get("status") or "")
+        note = str(item.get("note") or "")
+        if status == "closed" and note == "take_profit":
+            hit = len(targets)
+        parts = []
+        for index, value in enumerate(targets, start=1):
+            mark = " ✓" if index <= hit else ""
+            parts.append(f"TP{index} {self.tr_.format_number(value, 6)}{mark}")
+        texts = {"targets_text": " · ".join(parts) if parts else "—"}
+        partials = extra.get("partials") or []
+        if partials:
+            texts["targets_tip"] = "\n".join(
+                f"TP{p.get('target') or '?'}: {self.tr_.format_number(p.get('quantity') or 0, 6)} @ "
+                f"{self.tr_.format_number(p.get('price') or 0, 6)}"
+                for p in partials
+            )
+        if status == "open" and len(targets) > 1:
+            stage = self.tr_.tr("trades.staged.stage", hit=hit, total=len(targets))
+            if hit > 0 and abs(float(item.get("stop_loss") or 0) - float(item.get("entry_price") or 0)) < 1e-12:
+                stage += " · " + self.tr_.tr("trades.staged.breakeven")
+            texts["stage_text"] = stage
+        if status in ("closed", "cancelled"):
+            reason_key = note if note in ("take_profit", "stop_loss", "breakeven", "manual") else ""
+            closed_at = self._localized_datetime(item.get("closed_at")) if item.get("closed_at") else "—"
+            texts["closed_text"] = (
+                f"{closed_at} · {self.tr_.tr(f'trades.reasons.{reason_key}')}" if reason_key else closed_at
+            )
+        else:
+            texts["closed_text"] = "—"
+        return texts
 
     def _digits(self, value: Any) -> str:
         """تبدیل عدد به رشته با ارقام زبان جاری."""
@@ -5895,13 +7525,23 @@ class MainController(QObject):
                 config.max_loss,
                 config.fee_rate,
             )
-            return self.tr_.tr(
+            text = self.tr_.tr(
                 "trades.auto.economics",
                 notional=f"{plan.notional:.0f}",
                 fee=f"{plan.round_trip_fee:.2f}",
                 target=f"{plan.net_target:.2f}",
                 gross=f"{plan.gross_target:.2f}",
             )
+            # نسخهٔ ۲.۵.۶: برد لازم و امید ریاضی بدون برتری، صادقانه
+            edge = self.tr_.tr(
+                "trades.auto.edge",
+                tp=f"{plan.target_move_percent:.2f}",
+                sl=f"{plan.stop_move_percent:.2f}",
+                be=f"{plan.breakeven_win_rate:.0f}",
+                rw=f"{plan.random_win_rate:.0f}",
+                ev=f"{plan.no_edge_expectancy:+.2f}",
+            )
+            return f"{text}\n{edge}" if edge and edge != "trades.auto.edge" else text
         except Exception:  # noqa: BLE001
             return ""
 
@@ -5937,7 +7577,9 @@ class MainController(QObject):
 
         market = self.app.market
         if market is not None:
-            market.add_ticker_listener(self._on_market_ticker)
+            market.add_ticker_listener(
+                lambda ticker: self._on_market_ticker(ticker) if self.app.market is market else None
+            )
 
         # نوسازی دوره‌ای دفتر سفارش برای Bid/Ask — تیک وب‌سوکتِ این
         # صرافی Bid/Ask ندارد؛ دفتر واقعی جداگانه خوانده و روی کش
@@ -5976,6 +7618,13 @@ class MainController(QObject):
         symbols = list(dict.fromkeys(self._stream_symbols()))
         if not symbols:
             return
+        # نسخهٔ ۲.۶.۱: اگر دور قبلی هنوز تمام نشده، دور تازه آن را نکُشد —
+        # قبلاً هر ۵ ثانیه کار نیمه‌تمام لغو می‌شد و دفتر هیچ‌وقت ثبت نمی‌شد.
+        try:
+            if "terminal-orderbook" in self.runner.active_keys():
+                return
+        except Exception:  # noqa: BLE001
+            pass
 
         async def refresh() -> None:
             market = self.app.market
@@ -5985,7 +7634,7 @@ class MainController(QObject):
                 except Exception:  # noqa: BLE001
                     continue
                 engine = getattr(self, "_tick_engine", None)
-                if engine is not None and book is not None:
+                if engine is not None and book is not None and market is self.app.market:
                     engine.record_book(symbol, book)
 
         self.runner.submit(
@@ -6023,22 +7672,18 @@ class MainController(QObject):
         کاغذی (صفر در بدترین حالت) — هیچ عددی از بیرون ساخته نمی‌شود.
         """
         engine = getattr(self, "_auto_trader_engine", None)
-        used_margin = 0.0
-        open_count = 0
-        if engine is not None:
-            used_margin = sum(
-                float(t.used_margin() or 0.0) for t in engine.open_trades
-            )
-            open_count = len(engine.open_trades)
-        else:
-            try:
-                rows = self.app.trade_repository.open_trades(self.app.auth.user_id)
-                open_count = len(rows)
-                used_margin = sum(
-                    float((row or {}).get("margin") or 0.0) for row in rows
-                )
-            except Exception:  # noqa: BLE001
-                pass
+        managed = {t.trade_id: t for t in engine.open_trades} if engine else {}
+        used_margin = sum(t.used_margin() for t in managed.values())
+        open_count = len(managed)
+        try:
+            rows = self.app.trade_repository.open_trades(self.app.auth.user_id)
+            for row in rows:
+                if row.get("id") in managed:
+                    continue
+                open_count += 1
+                used_margin += float(row.get("entry_price") or 0) * float(row.get("quantity") or 0) / float(row.get("leverage") or 1)
+        except Exception:
+            logger.debug("Portfolio records unavailable", exc_info=True)
         balance = 0.0
         try:
             user_id = self.app.auth.user_id
@@ -6051,6 +7696,13 @@ class MainController(QObject):
                 balance = float(account.get("total_value_usdt") or 0.0)
         except Exception:  # noqa: BLE001
             pass
+        if self._is_paper_mode():
+            # v2.5.0: معاملهٔ کاغذی با موجودی جعلی کاغذی (= کیف پول واقعی +
+            # سود/زیان کاغذی) سنجیده می‌شود، نه با موجودی واقعی ثابت.
+            try:
+                balance = self._paper_account().balance
+            except Exception:  # noqa: BLE001
+                logger.debug("Paper account unavailable", exc_info=True)
         stats = getattr(self, "_terminal_stats", {}) or {}
         return {
             "balance": balance,
@@ -6095,7 +7747,7 @@ class MainController(QObject):
     def change_auto_engine_mode(self, mode: str) -> None:
         """تغییر حالت موتور (Selected/Scan/AI) از صفحهٔ معاملات."""
         value = str(mode or "scan").strip().lower()
-        if value not in ("selected", "scan", "ai"):
+        if value not in ("selected", "scan", "ai", "ultra"):
             return
         try:
             self.app.settings.set("scalp.engine_mode", value)
@@ -6220,14 +7872,14 @@ class MainController(QObject):
         """
         engine = getattr(self, "_auto_trader_engine", None)
         clean = str(symbol or "").strip().upper()
-        if engine is None:
-            # موتور خاموش است — ورود ممکن نیست؛ پویش فقط «دید» است
-            self._toast(
-                self.tr_.tr("trades.auto.engine_required"),
-                level="warning",
-            )
+        if getattr(self, "_exchange_switching", False):
+            self._toast(self.tr_.tr("trades.auto.exchange_locked"), level="warning")
             return
-        candidate = engine.opportunity_candidate(clean)
+        key = f"auto-manual-enter-{clean}"
+        runner = getattr(self, "runner", None)
+        if runner is not None and key in set(runner.active_keys()):
+            return
+        candidate = engine.opportunity_candidate(clean) if engine is not None else None
         if candidate is None:
             # نامزد پویش پس‌زمینه (v2.2) — همان پروتکل موتور
             candidate = (getattr(self, "_watch_candidates", {}) or {}).get(clean)
@@ -6237,6 +7889,9 @@ class MainController(QObject):
                 level="warning",
             )
             return
+        if engine is None:
+            # موتور فقط وقتی نامزد واقعی هست ساخته می‌شود.
+            engine = self._auto_trader()
 
         def done(result: Any) -> None:
             if result is not None:
@@ -6245,17 +7900,20 @@ class MainController(QObject):
                                 price=f"{getattr(result, 'entry_price', 0):,.6g}"),
                     level="info",
                 )
+                self._go_to("nav.trades")
+                self.trades.show_open_history()
             else:
                 self._toast(
                     self.tr_.tr(
-                        "trades.auto.blocked", reason="rejected_by_guards"
+                        "trades.auto.blocked", reason=engine.rejection_reason(clean)
                     ),
                     level="warning",
                 )
             self.refresh_trades()
 
+        self._toast(self.tr_.tr("trades.auto.entering"), level="info")
         self.runner.submit(
-            "auto-manual-enter",
+            key,
             engine.open_trade(candidate),
             on_success=done,
             on_error=self._on_error,
@@ -6427,9 +8085,12 @@ class MainController(QObject):
         if self.app.market is None:
             return
         self._watch_scan_running = True
+        bound_market = self.app.market
 
         def apply(candidates: list) -> None:
             self._watch_scan_running = False
+            if self.app.market is not bound_market:
+                return
             self._watch_candidates = {
                 str(getattr(c, "symbol", "") or ""): c for c in candidates or []
             }
@@ -6567,18 +8228,7 @@ class MainController(QObject):
         return result
 
     def close_auto_position(self, trade_id: int) -> None:
-        """بستن یک موقعیت باز از جدول موقعیت‌های ترمینال."""
-        engine = getattr(self, "_auto_trader_engine", None)
-        if engine is not None:
-            for managed in engine.open_trades:
-                if int(getattr(managed, "trade_id", 0)) == int(trade_id):
-                    self.runner.submit(
-                        "auto-close-position",
-                        engine.close_trade(managed, "manual"),
-                        on_success=lambda _r: self.refresh_trades(),
-                        on_error=self._on_error,
-                    )
-                    return
+        """تمام دکمه‌های خروج از مسیر مشترک با محافظ قیمت تازه عبور می‌کنند."""
         self.close_paper_trade(trade_id)
 
     def emergency_exit_positions(self) -> None:
@@ -6626,7 +8276,9 @@ class MainController(QObject):
                     price = self._cached_symbol_price(managed.symbol, max_age=30.0)
                 if price <= 0:
                     price = managed.entry_price
-                pnl = managed.unrealised(price)
+                if quote is not None:
+                    price = engine._exit_price_for(managed, quote)
+                pnl = managed.net_unrealised(price)
                 notional = managed.margin * managed.leverage
                 age_ms = (
                     float(getattr(quote, "age_ms", -1.0))
@@ -6662,6 +8314,8 @@ class MainController(QObject):
                         "tp_text": fmt(managed.target_price, 4),
                         "sl_text": fmt(managed.effective_stop, 4),
                         "pnl": pnl,
+                        "fee_text": fmt(managed.unrealised(price) - pnl, 4),
+                        "status": "open",
                         "pnl_text": f"{pnl:+.2f}",
                         "pnl_percent_text": (
                             f"{(pnl / managed.margin * 100):+.1f}٪"
@@ -6682,10 +8336,12 @@ class MainController(QObject):
                         ),
                     }
                 )
-            return rows
 
+        existing_ids = {row["id"] for row in rows}
         try:
             for record in self.app.trade_repository.open_trades(self.app.auth.user_id):
+                if record.get("id") in existing_ids:
+                    continue
                 symbol = str((record or {}).get("symbol") or "")
                 quote = quote_for(symbol)
                 price = float(getattr(quote, "last", 0.0) or 0.0)
@@ -6695,7 +8351,9 @@ class MainController(QObject):
                 quantity = float((record or {}).get("quantity") or 0.0)
                 side = str((record or {}).get("side") or "long")
                 sign = 1.0 if side == "long" else -1.0
-                pnl = (price - entry) * sign * quantity if price > 0 and entry > 0 else 0.0
+                from trading.trade_monitor import position_from_record
+                position = position_from_record(record)
+                pnl = position.unrealised(price)[0] if position is not None else 0.0
                 margin = float((record or {}).get("margin") or 0.0)
                 leverage = float((record or {}).get("leverage") or 1.0) or 1.0
                 age_ms = (
@@ -6847,6 +8505,19 @@ class MainController(QObject):
             "verdict_role": verdict_role,
         }
 
+    def _terminal_timer_tick(self) -> None:
+        """
+        تیک ۱ ثانیه‌ای ترمینال (۲.۴.۲): وقتی صفحهٔ معاملات دیده نمی‌شود،
+        نشاندن کارت‌ها، نمودار و جدول‌هایش فقط CPU و GIL را هدر می‌دهد.
+        خروج موقعیت‌ها تیک‌محور است و به این نمایش وابسته نیست.
+        """
+        try:
+            if not self.trades.isVisible():
+                return
+        except RuntimeError:
+            return
+        self._refresh_auto_terminal()
+
     def _refresh_auto_terminal(self) -> None:
         """
         تازه‌سازی ترمینال (تایمر ۱ ثانیه — فقط نمایش).
@@ -6862,6 +8533,14 @@ class MainController(QObject):
 
             # آمار سنگین (SQLite) هر ۵ تیک؛ بقیهٔ مقادیر هر تیک
             self._terminal_stats_tick += 1
+            if engine is not None and engine.is_running and self._terminal_stats_tick % 3 == 0:
+                # «آخرین پویش: … رد: …» حتی وقتی هیچ معامله‌ای باز نمی‌شود (۲.۵.۴)
+                running_text = (
+                    self.tr_.tr("trades.auto.running")
+                    + f" • {len(engine.open_trades)} / {engine.config.max_concurrent}"
+                )
+                scan_text = self._auto_scan_summary(engine)
+                page.set_auto_state(True, running_text + (f" • {scan_text}" if scan_text else ""))
             if self._terminal_stats_tick % 5 == 0:
                 try:
                     statistics = self.app.trade_repository.statistics(
@@ -6906,6 +8585,7 @@ class MainController(QObject):
             last_age = tick_stats.get("last_tick_age_ms")
             tick_pill = {
                 "websocket": websocket_ok,
+                "connections": market.stream_stats if market is not None else {},
                 "avg_total_latency_ms": tick_stats.get("avg_total_latency_ms"),
                 "stale": bool(
                     last_age is not None
@@ -6946,6 +8626,10 @@ class MainController(QObject):
                 }
             )
             page.set_tick_status(tick_pill)
+            # History stays live after manual-entry navigation, not only at close.
+            if page.tabs.currentIndex() == 1 and time.monotonic() - getattr(self, "_history_refreshed_at", 0) >= 1:
+                self._history_refreshed_at = time.monotonic()
+                self.refresh_trades()
             page.set_paper_live(
                 bool(engine is not None and engine.config.is_live)
                 if engine is not None
@@ -7062,13 +8746,15 @@ class MainController(QObject):
             return []
 
         scan_limit = max(1, int(self.app.settings.get("scalp.scan_limit", 10) or 10))
-        symbols: list[str] = []
-        selected = self._auto_selected_symbols() or []
-        symbols.extend(selected)
-        for symbol in self._watchlist_symbols():
-            if symbol not in symbols:
-                symbols.append(symbol)
-        symbols = symbols[:scan_limit]
+        from trading.universe import RotatingUniverse
+        if not hasattr(self, "_ai_universe"):
+            self._ai_universe = RotatingUniverse()
+        tickers = await market.get_all_tickers()
+        symbols = self._ai_universe.select(
+            tickers, limit=scan_limit, selected=self._auto_selected_symbols(),
+            favorites=self._watchlist_symbols(),
+            min_turnover=float(self._auto_trade_config().min_liquidity),
+        )
 
         config = self._auto_trade_config()
         portfolio_dict = self._portfolio_snapshot()
@@ -7080,11 +8766,12 @@ class MainController(QObject):
             max_total_margin_percent=float(config.max_total_margin_percent),
         )
 
-        candidates: list = []
-        for symbol in symbols:
+        async def assess(symbol):
+            if tick_engine.is_stale(symbol):
+                await asyncio.wait_for(market.refresh_execution_quote(symbol, tick_engine), timeout=5.0)
             quote = tick_engine.get(symbol)
             if quote is None or quote.last <= 0 or tick_engine.is_stale(symbol):
-                continue
+                return None
             try:
                 ticker = await market.get_ticker(symbol)
                 turnover = float(getattr(ticker, "turnover_24h", 0.0) or 0.0)
@@ -7096,7 +8783,7 @@ class MainController(QObject):
                 symbol, timeframes=("5m", "15m", "1h", "4h")
             )
             if report is None:
-                continue
+                return None
             payload = report.to_dict()
             ladder = build_ladder(
                 symbol,
@@ -7107,6 +8794,9 @@ class MainController(QObject):
                 ],
             )
 
+            if tick_engine.is_stale(symbol):
+                await asyncio.wait_for(market.refresh_execution_quote(symbol, tick_engine), timeout=5.0)
+            quote = tick_engine.get(symbol)
             decision = ai_decide(
                 symbol=symbol,
                 report=payload,
@@ -7141,7 +8831,7 @@ class MainController(QObject):
                         turnover_24h=turnover,
                         trend_ladder=ladder,
                     )
-                continue
+                return None
 
             horizons = payload.get("horizons") or []
             prediction_text = ""
@@ -7157,8 +8847,7 @@ class MainController(QObject):
                 p50 = float((first.get("quantiles") or {}).get("p50", 0.0) or 0.0)
                 if p50 > 0 and quote.last > 0:
                     expected_move = (p50 / quote.last - 1.0) * 100.0
-            candidates.append(
-                AICandidate(
+            return AICandidate(
                     symbol=symbol,
                     price=quote.last,
                     direction=decision.direction,
@@ -7180,8 +8869,18 @@ class MainController(QObject):
                     ),
                     risk_reward=round(decision.risk_reward, 2),
                 )
-            )
-        return candidates
+
+        semaphore = asyncio.Semaphore(3)
+        async def limited(symbol):
+            async with semaphore:
+                try:
+                    return await assess(symbol)
+                except Exception:
+                    logger.debug("Candidate assessment failed for %s", symbol, exc_info=True)
+                    return None
+        candidates = await asyncio.gather(*(limited(symbol) for symbol in symbols))
+        return sorted((c for c in candidates if c is not None),
+                      key=lambda c: (c.score, c.risk_reward), reverse=True)
 
     def _market_reachable(self) -> bool:
         """آنلاین اگر REST سالم باشد یا قیمت تازه از سوکت آمده باشد."""
@@ -7240,7 +8939,7 @@ class MainController(QObject):
         except Exception:  # noqa: BLE001
             return []
 
-    def _exit_fee(self, record: Any) -> float:
+    def _exit_fee(self, record: Any, *, price: float | None = None) -> float:
         """کارمزد خروج از روی ارزش موقعیت. ورود جداگانه ذخیره شده است."""
         from trading.micro_plan import exit_fee_from_notional
 
@@ -7254,7 +8953,9 @@ class MainController(QObject):
                 return 0.0
 
         rate = float(self.app.settings.get("scalp.taker_fee_rate", 0.0006) or 0.0)
-        return exit_fee_from_notional(_get("quantity") * _get("entry_price"), rate)
+        extra = record.get("extra", {}) if isinstance(record, dict) else getattr(record, "extra", {})
+        rate = float((extra or {}).get("fee_rate", rate))
+        return exit_fee_from_notional(_get("quantity") * (price if price is not None else _get("entry_price")), rate)
 
     def start_connection_keepalive(self) -> None:
         """هر ۱۵ ثانیه پینگ و تلاش دوبارهٔ سوکت."""
@@ -7381,6 +9082,90 @@ class MainController(QObject):
         if isinstance(value, date):
             return datetime.combine(value, time.max if end_of_day else time.min)
         return None
+
+    # ------------------------------------------------------------------
+    # سلامت نشست (نسخهٔ ۲.۵.۴)
+    # ------------------------------------------------------------------
+    HEALTH_LOG_EVERY = 10  # ضربان‌ها؛ هر ضربان یک دقیقه
+
+    def health_counters(self) -> dict[str, Any]:
+        """عددهایی که رشد بی‌پایانشان نشانهٔ نشت است — در session.json و لاگ."""
+        runner = getattr(self, "runner", None)
+        engine = getattr(self, "_auto_trader_engine", None)
+        ticks = getattr(self, "_tick_engine", None)
+        counters: dict[str, Any] = {}
+        try:
+            if runner is not None:
+                counters["runner_handles"] = runner.live_handles()
+                counters["runner_children"] = len(runner.children())
+                counters["runner_submitted"] = int(getattr(runner, "submitted_total", 0))
+            if engine is not None:
+                counters["auto_open"] = len(engine.open_trades)
+                counters["auto_running"] = bool(engine.is_running)
+            if ticks is not None:
+                counters["tick_symbols"] = int(ticks.stats().get("symbols", 0))
+            counters["pending_updates"] = len(getattr(self, "_pending_updates", {}) or {})
+        except Exception:  # noqa: BLE001 - گزارش سلامت نباید چیزی را بشکند
+            counters["error"] = "health counters failed"
+        return counters
+
+    def log_health(self, snapshot: dict[str, Any]) -> None:
+        """ثبت ضربان در لاگ هر ده دقیقه (و فوراً اگر حافظه بالا رفت)."""
+        self._health_beats = getattr(self, "_health_beats", 0) + 1
+        self._check_clock_skew()
+        memory = float(snapshot.get("memory_mb", 0.0) or 0.0)
+        if self._health_beats % self.HEALTH_LOG_EVERY == 1 or memory > 1500:
+            logger.info(
+                "Health: uptime=%.2fh memory=%.0fMB peak=%.0fMB threads=%s %s",
+                float(snapshot.get("uptime_hours", 0.0) or 0.0), memory,
+                float(snapshot.get("peak_memory_mb", 0.0) or 0.0),
+                snapshot.get("threads"), snapshot.get("extra"),
+            )
+
+    def _check_clock_skew(self) -> None:
+        """
+        هشدار یک‌باره وقتی ساعت سیستم با صرافی بیش از یک دقیقه اختلاف دارد.
+
+        نسخهٔ ۲.۶.۲: ساعت/منطقهٔ زمانی اشتباه ویندوز همهٔ داده‌ها را «کهنه»
+        نشان می‌داد. داده اصلاح می‌شود، ولی کاربر باید علت را بداند چون
+        زمان سیگنال‌ها، کندل‌ها و گزارش‌ها هم به ساعت سیستم وابسته است.
+        """
+        try:
+            ticks = getattr(self, "_tick_engine", None)
+            offset_ms = float(getattr(ticks, "clock_offset_ms", 0.0) or 0.0)
+            if not offset_ms and self.app.market is not None:
+                offset_ms = float(getattr(self.app.market, "exchange_clock_offset_ms", 0.0) or 0.0)
+            if abs(offset_ms) < 60_000:
+                return
+            hours = offset_ms / 3_600_000.0
+            if abs(hours - float(getattr(self, "_clock_warned_hours", 0.0) or 0.0)) < 0.05:
+                return
+            self._clock_warned_hours = hours
+            logger.warning("System clock differs from exchange by %+.2f hours", hours)
+            message = self.tr_.tr(
+                "common.clock_skew_warning",
+                hours=f"{hours:+.1f}",
+                direction=self.tr_.tr("common.clock_ahead" if hours > 0 else "common.clock_behind"),
+            )
+            self.status(message)
+            self._toast(message, level="warning")
+        except Exception:  # noqa: BLE001 - هشدار نباید جریان را بشکند
+            logger.debug("Clock skew check failed", exc_info=True)
+
+    def report_unclean_exit(self, previous: Any) -> None:
+        """به کاربر بگو نشست قبلی ناگهان بسته شد و لاگش کجاست."""
+        try:
+            logs = str(self.app.paths.logs_dir)
+        except Exception:  # noqa: BLE001
+            logs = "data/logs"
+        message = self.tr_.tr(
+            "common.unclean_exit",
+            hours=f"{float(getattr(previous, 'uptime_hours', 0.0) or 0.0):.1f}",
+            memory=f"{float(getattr(previous, 'memory_mb', 0.0) or 0.0):.0f}",
+            path=logs,
+        )
+        self.status(message)
+        self._toast(message, level="warning")
 
     def _toast(self, message: str, *, level: str = "info") -> None:
         """نمایش اعلان شناور روی پنجرهٔ اصلی."""
