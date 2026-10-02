@@ -70,6 +70,18 @@ _VALIDITY_MINUTES = {
 }
 
 
+def _round_price(value: float) -> float:
+    """
+    گرد کردن با ۸ رقم معنادار (نه ۶ رقم اعشار).
+
+    `round(x, 6)` قیمت ۰٫۰۰۰۰۱۲۳ را ۰٫۰۰۰۰۱۲ می‌کرد؛ برای میم‌کوین‌های پرحجم
+    حد ضرر و هدف عملاً روی قیمت ورود می‌افتادند.
+    """
+    if not value:
+        return 0.0
+    return float(f"{value:.8g}")
+
+
 def analyse(
     symbol: str,
     highs: list[float],
@@ -174,10 +186,10 @@ def analyse(
         direction=direction,
         price=price,
         confidence=confidence,
-        entry_low=round(price - band, 6),
-        entry_high=round(price + band, 6),
-        stop_loss=round(stop, 6),
-        take_profits=[round(t, 6) for t in targets],
+        entry_low=_round_price(price - band),
+        entry_high=_round_price(price + band),
+        stop_loss=_round_price(stop),
+        take_profits=[_round_price(t) for t in targets],
         reasons=reasons,
         timeframe=timeframe,
         valid_minutes=_VALIDITY_MINUTES.get(timeframe, 720),

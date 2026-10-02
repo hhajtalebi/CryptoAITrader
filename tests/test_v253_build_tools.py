@@ -194,7 +194,9 @@ def test_mobile_assets_referenced_by_spec_and_app_exist() -> None:
         rel = line.split("=", 1)[1].strip().replace("%(source.dir)s/", "")
         assert (mobile / rel).is_file(), rel
     assert (mobile / "assets" / "Vazirmatn-Regular.ttf").is_file()
-    assert "assets/Vazirmatn-Regular.ttf" in (mobile / "main.py").read_text(encoding="utf-8")
+    # ۲.۷.۰: ثبت قلم از main.py به app/widgets.py منتقل شد
+    ui_sources = (mobile / "main.py").read_text(encoding="utf-8") + (mobile / "app" / "widgets.py").read_text(encoding="utf-8")
+    assert "assets/Vazirmatn-Regular.ttf" in ui_sources
     # PNG معتبر با اندازهٔ درست
     from struct import unpack
 

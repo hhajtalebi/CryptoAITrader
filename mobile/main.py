@@ -1,284 +1,271 @@
 """
 معامله‌گر هوشمند رمزارز — نسخهٔ موبایل (اندروید).
 
-این یک برنامهٔ مستقل است: روی گوشی اجرا می‌شود، خودش داده می‌گیرد و
-خودش تحلیل می‌کند. به کامپیوتر یا سرور نیازی ندارد.
+برنامهٔ مستقل: روی گوشی داده می‌گیرد و تحلیل می‌کند؛ کامپیوتر یا سرور
+لازم نیست. Kivy خالص (Qt for Python روی اندروید بسته‌بندی پایدار ندارد).
+**رابط** مخصوص موبایل است ولی **موتور** همان فرمول‌های دسکتاپ است.
 
-چرا Kivy و نه PySide6؟
-    Qt for Python روی اندروید بسته‌بندی رسمی و پایداری ندارد. Kivy تنها
-    مسیر آزموده‌شده برای APK پایتونی است. بنابراین **رابط** از نو نوشته
-    شده ولی **موتور** همان است: همان فرمول‌ها، همان آستانه‌ها، همان
-    منطق «منتظر».
+عمداً اینجا نیست: کلید API و معاملهٔ واقعی (روی گوشیِ گم‌شدنی، کلید
+صرافی ریسکی است که ارزشش را ندارد). فقط خواندن و تحلیل.
 
-چه چیزی عمداً اینجا نیست؟
-    کلید API و معاملهٔ واقعی. روی گوشیِ گم‌شدنی، نگه‌داشتن کلید صرافی
-    ریسکی است که ارزشش را ندارد. نسخهٔ موبایل فقط می‌خواند و تحلیل
-    می‌کند.
+پنج صفحه با نوار پایین: بازار، سیگنال‌ها، دیدبان، تحلیل، تنظیمات.
 """
 
 from __future__ import annotations
 
+import os
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 
-from kivy.app import App
-from kivy.clock import Clock
-from kivy.core.text import LabelBase
-from kivy.metrics import dp
-from kivy.uix.boxlayout import BoxLayout
-from kivy.uix.button import Button
-from kivy.uix.label import Label
-from kivy.uix.scrollview import ScrollView
-from kivy.uix.spinner import Spinner
-from kivy.utils import get_color_from_hex
+os.environ.setdefault("KIVY_NO_ARGS", "1")
 
-from app.market_lite import MarketError, fetch_candles
-from app.signal_lite import analyse
+from kivy.animation import Animation  # noqa: E402
+from kivy.app import App  # noqa: E402
+from kivy.clock import Clock  # noqa: E402
+from kivy.core.window import Window  # noqa: E402
+from kivy.metrics import dp  # noqa: E402
+from kivy.uix.boxlayout import BoxLayout  # noqa: E402
+from kivy.uix.floatlayout import FloatLayout  # noqa: E402
+from kivy.uix.screenmanager import FadeTransition, ScreenManager  # noqa: E402
 
-# پالت «سرمه‌ای اداری» — همان تم پیش‌فرض نسخهٔ دسکتاپ.
-BG = get_color_from_hex("#0F1724")
-CARD = get_color_from_hex("#16213A")
-TEXT = get_color_from_hex("#E6EDF7")
-MUTED = get_color_from_hex("#8FA3C0")
-GREEN = get_color_from_hex("#2ECC71")
-RED = get_color_from_hex("#E74C3C")
-AMBER = get_color_from_hex("#F1C40F")
-ACCENT = get_color_from_hex("#3B82F6")
+from app import viewmodel as vm  # noqa: E402
+from app.market_lite import MarketError, fetch_candles, fetch_tickers  # noqa: E402
+from app.screens import AnalysisScreen, MarketScreen, SettingsScreen, SignalsScreen, WatchlistScreen  # noqa: E402
+from app.signal_lite import analyse  # noqa: E402
+from app.store import Store  # noqa: E402
+from app.widgets import BG, FONT, SURFACE2, BottomNav, RtlLabel, Surface, TEXT  # noqa: E402,F401 — FONT: ثبت فونت
 
-SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT", "BNB/USDT"]
-TIMEFRAMES = ["15m", "1h", "4h", "1d"]
-
-# فونت فارسی. اگر نبود، Kivy به فونت پیش‌فرض برمی‌گردد و برنامه
-# نمی‌شکند — فقط ظاهر ضعیف‌تر می‌شود.
-try:
-    LabelBase.register(name="fa", fn_regular="assets/Vazirmatn-Regular.ttf")
-    FONT = "fa"
-except OSError:
-    FONT = "Roboto"
+NAV = [
+    ("market", "market", "بازار"),
+    ("signals", "signals", "سیگنال‌ها"),
+    ("watch", "star", "دیدبان"),
+    ("analysis", "chart", "تحلیل"),
+    ("settings", "settings", "تنظیمات"),
+]
+TICKER_TTL = 15.0
+ANALYSIS_TTL = 45.0
 
 
-def shape(text: str) -> str:
-    """
-    آماده‌سازی متن فارسی برای نمایش راست‌به‌چپ.
-
-    Kivy خودش حروف فارسی را به هم نمی‌چسباند. اگر کتابخانه‌های شکل‌دهی
-    در دسترس بودند استفاده می‌شوند، وگرنه متن خام برمی‌گردد.
-    """
-    try:
-        import arabic_reshaper  # noqa: PLC0415
-        from bidi.algorithm import get_display  # noqa: PLC0415
-
-        return get_display(arabic_reshaper.reshape(text))
-    except ImportError:
-        return text
-
-
-class SignalCard(BoxLayout):
-    """کارت نمایش یک سیگنال."""
-
-    def __init__(self, signal, **kwargs) -> None:  # noqa: ANN001
-        super().__init__(
-            orientation="vertical",
-            size_hint_y=None,
-            padding=dp(12),
-            spacing=dp(6),
-            **kwargs,
-        )
-        colors = {"LONG": GREEN, "SHORT": RED, "WAIT": AMBER}
-        labels = {"LONG": "خرید", "SHORT": "فروش", "WAIT": "منتظر"}
-        color = colors.get(signal.direction, MUTED)
-
-        # نماد لاتین است و نباید راست‌به‌چپ بشود.
-        self._add(f"{signal.symbol}   {labels.get(signal.direction, '')}", color, 20, True)
-        self._add(shape(f"قیمت: {signal.price:,.2f}"), TEXT, 15)
-        self._add(shape(f"اطمینان: {signal.confidence:.0f}٪"), color, 15)
-
-        if signal.is_tradeable:
-            self._add(
-                shape(f"ورود: {signal.entry_low:,.2f} تا {signal.entry_high:,.2f}"),
-                TEXT,
-                14,
-            )
-            self._add(shape(f"حد ضرر: {signal.stop_loss:,.2f}"), RED, 14)
-            targets = "  ".join(f"{t:,.2f}" for t in signal.take_profits)
-            self._add(shape(f"اهداف: {targets}"), GREEN, 14)
-            self._add(
-                shape(
-                    f"سود به زیان: {signal.risk_reward}   "
-                    f"اعتبار: {signal.valid_minutes} دقیقه"
-                ),
-                MUTED,
-                13,
-            )
-
-        for reason in signal.reasons:
-            self._add(shape(f"• {reason}"), MUTED, 13)
-
-        self.bind(minimum_height=self.setter("height"))
-
-    def _add(self, text: str, color, size: int, mono: bool = False) -> None:  # noqa: ANN001
-        label = Label(
-            text=text,
-            color=color,
-            font_size=dp(size),
-            font_name="Roboto" if mono else FONT,
-            size_hint_y=None,
-            halign="right",
-            valign="middle",
-        )
-        label.bind(
-            width=lambda inst, value: setattr(inst, "text_size", (value, None)),
-            texture_size=lambda inst, value: setattr(inst, "height", value[1] + dp(4)),
-        )
-        self.add_widget(label)
+def _friendly(exc: Exception) -> str:
+    if isinstance(exc, MarketError):
+        return str(exc)
+    return "خطا در دریافت داده"
 
 
 class TraderApp(App):
-    """برنامهٔ اصلی."""
+    title = "معامله‌گر هوشمند رمزارز"
 
+    # ---------------------------------------------------------- ساخت
     def build(self):  # noqa: ANN201
-        from kivy.core.window import Window
-
         Window.clearcolor = BG
-        self.title = "معامله‌گر هوشمند رمزارز"
+        self.store = Store(self.user_data_dir)
+        self.pool = ThreadPoolExecutor(max_workers=4)
+        self._tickers: list[dict] = []
+        self._tickers_at = 0.0
+        self._tickers_loading: list = []
+        self._analysis: dict[tuple[str, str], tuple[float, tuple]] = {}
+        self._watch_dirty = False
+        self._scan_token = 0
+        self._history: list[str] = []
 
-        root = BoxLayout(orientation="vertical", padding=dp(10), spacing=dp(8))
+        root = FloatLayout()
+        column = BoxLayout(orientation="vertical")
+        self.manager = ScreenManager(transition=FadeTransition(duration=0.12))
+        self.screens = {
+            "market": MarketScreen(name="market"),
+            "signals": SignalsScreen(name="signals"),
+            "watch": WatchlistScreen(name="watch"),
+            "analysis": AnalysisScreen(name="analysis"),
+            "settings": SettingsScreen(name="settings"),
+        }
+        for screen in self.screens.values():
+            self.manager.add_widget(screen)
+        column.add_widget(self.manager)
+        self.nav = BottomNav(NAV, self.go)
+        column.add_widget(self.nav)
+        root.add_widget(column)
 
-        header = Label(
-            text=shape("معامله‌گر هوشمند رمزارز"),
-            color=TEXT,
-            font_name=FONT,
-            font_size=dp(22),
-            size_hint_y=None,
-            height=dp(46),
-        )
-        root.add_widget(header)
+        self._toast = Surface(size_hint=(None, None), height=dp(42), radius=dp(21), bg=SURFACE2,
+                              padding=(dp(18), 0), opacity=0)
+        self._toast_label = RtlLabel(raw="", auto_height=False, align="center", color=TEXT)
+        self._toast.add_widget(self._toast_label)
+        root.add_widget(self._toast)
 
-        controls = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(8))
-        self.symbol_spinner = Spinner(
-            text=SYMBOLS[0], values=SYMBOLS, background_color=CARD, color=TEXT
-        )
-        self.timeframe_spinner = Spinner(
-            text="1h", values=TIMEFRAMES, background_color=CARD, color=TEXT,
-            size_hint_x=0.4,
-        )
-        controls.add_widget(self.symbol_spinner)
-        controls.add_widget(self.timeframe_spinner)
-        root.add_widget(controls)
-
-        self.analyse_button = Button(
-            text=shape("تحلیل کن"),
-            font_name=FONT,
-            font_size=dp(17),
-            size_hint_y=None,
-            height=dp(52),
-            background_color=ACCENT,
-            color=TEXT,
-        )
-        self.analyse_button.bind(on_release=self.on_analyse)
-        root.add_widget(self.analyse_button)
-
-        self.scan_button = Button(
-            text=shape("پویش همهٔ نمادها"),
-            font_name=FONT,
-            font_size=dp(16),
-            size_hint_y=None,
-            height=dp(46),
-            background_color=CARD,
-            color=TEXT,
-        )
-        self.scan_button.bind(on_release=self.on_scan)
-        root.add_widget(self.scan_button)
-
-        self.status = Label(
-            text=shape("یک نماد انتخاب کنید"),
-            color=MUTED,
-            font_name=FONT,
-            font_size=dp(14),
-            size_hint_y=None,
-            height=dp(30),
-        )
-        root.add_widget(self.status)
-
-        self.results = BoxLayout(
-            orientation="vertical", size_hint_y=None, spacing=dp(10)
-        )
-        self.results.bind(minimum_height=self.results.setter("height"))
-        scroll = ScrollView()
-        scroll.add_widget(self.results)
-        root.add_widget(scroll)
-
-        credit = Label(
-            text=shape("تولیدکننده: حسین حاج طالبی"),
-            color=MUTED,
-            font_name=FONT,
-            font_size=dp(12),
-            size_hint_y=None,
-            height=dp(26),
-        )
-        root.add_widget(credit)
+        Window.bind(on_keyboard=self._on_key)
+        self._refresh_event = None
+        self._schedule_refresh()
+        Clock.schedule_once(lambda _dt: self.go("market"), 0)
         return root
 
-    # ---- عملیات ----------------------------------------------------
-    # شبکه هرگز روی نخ رابط کاربری اجرا نمی‌شود، وگرنه اندروید برنامه را
-    # «پاسخ نمی‌دهد» اعلام و می‌بندد.
+    def on_stop(self) -> None:
+        self.pool.shutdown(wait=False, cancel_futures=True)
 
-    def _set_status(self, text: str) -> None:
-        Clock.schedule_once(lambda _dt: setattr(self.status, "text", shape(text)))
+    # ---------------------------------------------------------- ناوبری
+    def go(self, key: str, remember: bool = True) -> None:
+        current = self.manager.current
+        if remember and current != key:
+            self._history.append(current)
+            self._history = self._history[-10:]
+        self.manager.current = key
+        self.nav.set_active(key)
+        screen = self.screens[key]
+        if key == "watch" or (key == "market" and self._watch_dirty):
+            self._watch_dirty = False if key == "market" else self._watch_dirty
+            if key == "market":
+                screen.render()
+        screen.refresh(force=False)
 
-    def _set_busy(self, busy: bool) -> None:
-        def apply(_dt) -> None:  # noqa: ANN001
-            self.analyse_button.disabled = busy
-            self.scan_button.disabled = busy
+    def open_analysis(self, symbol: str) -> None:
+        self.go("analysis")
+        self.screens["analysis"].show(symbol)
 
-        Clock.schedule_once(apply)
+    def _on_key(self, _window, key, *_args) -> bool:  # noqa: ANN001
+        if key == 27:  # دکمهٔ بازگشت اندروید
+            if self._history:
+                self.go(self._history.pop(), remember=False)
+                return True
+            return False  # خروج
+        return False
 
-    def _show(self, signals: list) -> None:
-        def apply(_dt) -> None:  # noqa: ANN001
-            self.results.clear_widgets()
-            for signal in signals:
-                self.results.add_widget(SignalCard(signal))
+    def mark_watch_dirty(self) -> None:
+        self._watch_dirty = True
 
-        Clock.schedule_once(apply)
+    def settings_changed(self, key: str) -> None:
+        if key == "refresh_seconds":
+            self._schedule_refresh()
+        if key in ("timeframe", "scan_size"):
+            self.screens["signals"].signals = []
 
-    def on_analyse(self, _button) -> None:  # noqa: ANN001
-        symbol = self.symbol_spinner.text
-        timeframe = self.timeframe_spinner.text
-        self._set_busy(True)
-        self._set_status(f"در حال تحلیل {symbol} ...")
-        threading.Thread(
-            target=self._work, args=([symbol], timeframe), daemon=True
-        ).start()
+    def _schedule_refresh(self) -> None:
+        if self._refresh_event is not None:
+            self._refresh_event.cancel()
+            self._refresh_event = None
+        seconds = self.store.get("refresh_seconds")
+        if seconds:
+            self._refresh_event = Clock.schedule_interval(self._auto_refresh, seconds)
 
-    def on_scan(self, _button) -> None:  # noqa: ANN001
-        timeframe = self.timeframe_spinner.text
-        self._set_busy(True)
-        self._set_status("در حال پویش همهٔ نمادها ...")
-        threading.Thread(
-            target=self._work, args=(SYMBOLS, timeframe), daemon=True
-        ).start()
+    def _auto_refresh(self, _dt) -> None:  # noqa: ANN001
+        current = self.manager.current
+        if current in ("market", "watch", "analysis"):
+            self.screens[current].refresh(force=True)
 
-    def _work(self, symbols: list[str], timeframe: str) -> None:
-        """کار شبکه و محاسبه، روی نخ پس‌زمینه."""
-        signals = []
-        errors = 0
-        for symbol in symbols:
+    # ---------------------------------------------------------- پیام کوتاه
+    def toast(self, text: str) -> None:
+        from kivy.core.text import Label as CoreLabel  # noqa: PLC0415
+
+        from app.widgets import shape  # noqa: PLC0415
+
+        self._toast_label.raw = text
+        width = CoreLabel(font_name=self._toast_label.font_name, font_size=self._toast_label.font_size).get_extents(shape(text))[0]
+        self._toast.width = min(width + dp(40), Window.width - dp(32))
+        self._toast.x = (Window.width - self._toast.width) / 2
+        self._toast.y = dp(80)
+        Animation.cancel_all(self._toast)
+        (Animation(opacity=1, d=0.15) + Animation(d=1.8) + Animation(opacity=0, d=0.3)).start(self._toast)
+
+    # ---------------------------------------------------------- داده (پس‌زمینه)
+    def _bg(self, work, done, fail) -> None:  # noqa: ANN001
+        """کار روی نخ پس‌زمینه؛ نتیجه روی نخ رابط."""
+        def runner() -> None:
             try:
-                highs, lows, closes = fetch_candles(symbol, timeframe, 200)
-                signals.append(analyse(symbol, highs, lows, closes, timeframe))
-            except MarketError:
-                errors += 1
-            except (ValueError, OSError):
-                errors += 1
+                result = work()
+            except Exception as exc:  # noqa: BLE001
+                message = _friendly(exc)
+                Clock.schedule_once(lambda _dt: fail(message))
+                return
+            Clock.schedule_once(lambda _dt: done(result))
 
-        # سیگنال‌های قابل معامله بالاتر بنشینند.
-        signals.sort(key=lambda s: (s.is_tradeable, s.confidence), reverse=True)
-        self._show(signals)
-        if not signals:
-            self._set_status("دریافت داده ناموفق بود. اینترنت را بررسی کنید.")
-        else:
-            suffix = f"  ({errors} ناموفق)" if errors else ""
-            self._set_status(f"{len(signals)} نتیجه{suffix}")
-        self._set_busy(False)
+        self.pool.submit(runner)
+
+    def load_tickers(self, done, fail, force: bool = False) -> None:  # noqa: ANN001
+        fresh = time.time() - self._tickers_at < TICKER_TTL
+        if self._tickers and fresh and not force:
+            done(self._tickers)
+            return
+        self._tickers_loading.append((done, fail))
+        if len(self._tickers_loading) > 1:
+            return  # یک درخواست در جریان است؛ همه منتظر همان می‌مانند
+
+        def ok(rows: list[dict]) -> None:
+            self._tickers, self._tickers_at = rows, time.time()
+            waiting, self._tickers_loading = self._tickers_loading, []
+            for d, _f in waiting:
+                d(rows)
+
+        def bad(message: str) -> None:
+            waiting, self._tickers_loading = self._tickers_loading, []
+            for _d, f in waiting:
+                f(message)
+
+        if force:
+            from app import market_lite  # noqa: PLC0415
+
+            market_lite._cache.clear()  # noqa: SLF001
+        self._bg(fetch_tickers, ok, bad)
+
+    def _analyse_sync(self, symbol: str, timeframe: str, force: bool = False) -> tuple:
+        key = (symbol, timeframe)
+        cached = self._analysis.get(key)
+        if cached and not force and time.time() - cached[0] < ANALYSIS_TTL:
+            return cached[1]
+        highs, lows, closes = fetch_candles(symbol, timeframe, 200)
+        result = (symbol, timeframe, analyse(symbol, highs, lows, closes, timeframe), highs, lows, closes)
+        self._analysis[key] = (time.time(), result)
+        return result
+
+    def analyse_one(self, symbol: str, timeframe: str, done, fail, force: bool = False) -> None:  # noqa: ANN001
+        self._bg(lambda: self._analyse_sync(symbol, timeframe, force), done, fail)
+
+    def analyse_many(self, symbols: list[str], timeframe: str, done, force: bool = False) -> None:  # noqa: ANN001
+        def work() -> list:
+            out = []
+            for symbol in symbols:
+                try:
+                    out.append(self._analyse_sync(symbol, timeframe, force)[2])
+                except Exception:  # noqa: BLE001, S112
+                    continue
+            return out
+
+        self._bg(work, done, lambda _m: None)
+
+    def scan(self, timeframe: str, size: int, progress, done, fail) -> None:  # noqa: ANN001
+        """پویش پرحجم‌ترین نمادها؛ پیشرفت زنده؛ پویش تازه، قبلی را بی‌اثر می‌کند."""
+        self._scan_token += 1
+        token = self._scan_token
+
+        def work() -> list:
+            rows = self._tickers if time.time() - self._tickers_at < 60 and self._tickers else fetch_tickers()
+            self._tickers, self._tickers_at = rows, time.time()
+            symbols = vm.scan_universe(rows, size)
+            results: list = []
+            lock = threading.Lock()
+            counter = [0]
+
+            def one(symbol: str) -> None:
+                try:
+                    signal = self._analyse_sync(symbol, timeframe)[2]
+                    with lock:
+                        results.append(signal)
+                except Exception:  # noqa: BLE001, S110
+                    pass
+                with lock:
+                    counter[0] += 1
+                    n = counter[0]
+                if token == self._scan_token:
+                    Clock.schedule_once(lambda _dt: progress(n, len(symbols)))
+
+            with ThreadPoolExecutor(max_workers=4) as inner:
+                list(inner.map(one, symbols))
+            if not results:
+                raise MarketError("دریافت داده ناموفق بود")
+            return results
+
+        def finished(results: list) -> None:
+            if token == self._scan_token:
+                done(results)
+
+        self._bg(work, finished, fail)
 
 
 if __name__ == "__main__":
