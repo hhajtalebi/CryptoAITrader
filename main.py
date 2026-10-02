@@ -172,6 +172,8 @@ def main() -> int:
         log_file=app_paths.logs_dir / "app.log",
         console=has_console,
         max_bytes=5 * 1024 * 1024,
+        # نسخهٔ ۲.۶.۰: لاگ دسته‌ای data/logs/<دسته>/ + مرکز لاگ (غیرمسدودکننده)
+        structured_dir=app_paths.logs_dir,
     )
     crash_log = install_crash_handlers(app_paths.logs_dir)
     logger.info("%s v%s starting (log: %s, crash log: %s)", APP_NAME, APP_VERSION,

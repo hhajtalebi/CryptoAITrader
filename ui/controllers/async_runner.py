@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import inspect
 import threading
 import time
 from collections import deque
@@ -57,7 +58,34 @@ def _log_loop_exception(loop: asyncio.AbstractEventLoop, context: dict[str, Any]
     message = context.get("message", "")
     if isinstance(exception, (asyncio.CancelledError, KeyboardInterrupt)):
         return
+    # نسخهٔ ۲.۶.۱: پایتون ۳.۱۳+ وقتی منتظرِ یک درخواستِ shield‌شده زمانش تمام
+    # شود، خطای شبکهٔ همان درخواست مشترک را «exception in shielded future»
+    # گزارش می‌کند. آن خطا به منتظرهای دیگر رسیده و بی‌صاحب نیست — فقط DEBUG.
+    if "shielded future" in str(message) and _is_network_error(exception):
+        logger.debug("Shared request failed after its waiter left: %r", exception)
+        return
     logger.error("Unhandled asyncio error: %s", message, exc_info=exception)
+
+
+def _is_network_error(exception: BaseException | None) -> bool:
+    """خطای عادی شبکه/مهلت (نه باگ برنامه)."""
+    if exception is None:
+        return False
+    if isinstance(exception, (TimeoutError, ConnectionError, OSError)):
+        return True
+    try:
+        import httpx
+
+        if isinstance(exception, httpx.HTTPError):
+            return True
+    except ImportError:  # pragma: no cover
+        pass
+    try:
+        from app.exceptions.errors import NetworkError, RateLimitError
+
+        return isinstance(exception, (NetworkError, RateLimitError))
+    except Exception:  # noqa: BLE001  # pragma: no cover
+        return False
 
 
 class TaskHandle(QObject):
@@ -205,11 +233,12 @@ class AsyncRunner(QObject):
                     # لغو کار قبلی. اگر هنوز شروع نشده باشد، پوششِ _wrap
                     # هرگز اجرا نمی‌شود و کوروتین اصلی باید بسته شود تا
                     # هشدار «never awaited» و نشت منبع ندهد.
+                    # نسخهٔ ۲.۶.۱: future.cancel() برای run_coroutine_threadsafe
+                    # حتی وقتی _wrap در حال اجراست True برمی‌گرداند؛ بستن
+                    # کوروتینِ در حال انتظار، خطای «cannot reuse already
+                    # awaited coroutine» می‌داد و کار قبلی وسط راه می‌مرد.
                     if old_future.cancel():
-                        try:
-                            old_coro.close()
-                        except (RuntimeError, AttributeError):
-                            logger.debug("Superseded coroutine already closed")
+                        self._close_if_unstarted(old_coro)
 
         if self._loop is None:
             # کار هرگز زمان‌بندی نمی‌شود: دستهٔ بی‌والد (مالکیت پایتون) و بدون
@@ -269,12 +298,39 @@ class AsyncRunner(QObject):
         handle, future, coroutine = current
         handle.cancel()
         if future.cancel():
-            # فقط وقتی لغو موفق بود می‌توان کوروتین را بست؛ وگرنه
-            # هشدار «coroutine was never awaited» می‌گیریم.
-            close = getattr(coroutine, "close", None)
-            if callable(close):
-                close()
+            # فقط کوروتینی که هرگز شروع نشده بسته می‌شود (نسخهٔ ۲.۶.۱).
+            self._close_if_unstarted(coroutine)
         return True
+
+    def _close_if_unstarted(self, coroutine: Any) -> None:
+        """
+        بستن کوروتینی که هرگز اجرا نشده — روی نخ حلقه، بدون رقابت.
+
+        اگر _wrap شروع شده باشد، لغوِ Task خودش CancelledError را به
+        کوروتین می‌رساند؛ بستنش از بیرون ممنوع است.
+        """
+        close = getattr(coroutine, "close", None)
+        if not callable(close):
+            return
+
+        def close_now() -> None:
+            try:
+                if inspect.iscoroutine(coroutine) and (
+                    inspect.getcoroutinestate(coroutine) != inspect.CORO_CREATED
+                ):
+                    return
+                close()
+            except (RuntimeError, AttributeError):
+                logger.debug("Superseded coroutine already closed")
+
+        loop = self._loop
+        if loop is not None and not loop.is_closed():
+            try:
+                loop.call_soon_threadsafe(close_now)
+                return
+            except RuntimeError:
+                pass
+        close_now()
 
     def _on_handle_finished(self, name: str, handle: TaskHandle) -> None:
         """پایان کار (در نخ رابط): آزادکردن کلید و سپردن دسته به صف نابودی."""
@@ -318,6 +374,15 @@ class AsyncRunner(QObject):
 
     async def _wrap(self, handle: TaskHandle, coroutine: Coroutine[Any, Any, Any]) -> None:
         """اجرای کوروتین و تبدیل نتیجه یا خطا به سیگنال."""
+        if handle.cancelled:
+            # نسخهٔ ۲.۶.۲: کارِ جایگزین‌شده پیش از شروع، اصلاً اجرا نشود
+            # (لغو Task از نخ دیگر دیرتر از گام اول آن می‌رسد).
+            try:
+                coroutine.close()
+            except (RuntimeError, AttributeError):
+                pass
+            handle.finished.emit()
+            return
         try:
             result = await coroutine
         except asyncio.CancelledError:
@@ -329,7 +394,7 @@ class AsyncRunner(QObject):
             if not handle.cancelled:
                 handle.failed.emit(str(exc), exc)
         except Exception as exc:  # noqa: BLE001 - آخرین سد دفاعی برنامه
-            logger.exception("Unexpected failure in task %s", handle.name)
+            logger.exception("Unexpected failure in task %s: %s: %s", handle.name, type(exc).__name__, exc)
             if not handle.cancelled:
                 handle.failed.emit(str(exc) or exc.__class__.__name__, exc)
         else:

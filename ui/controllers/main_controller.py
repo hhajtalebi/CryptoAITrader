@@ -264,6 +264,16 @@ class MainController(QObject):
         self.trades = window.pages["nav.trades"]
         self.wallet = window.pages["nav.wallet"]
         self.settings_page = window.pages["nav.settings"]
+        # نسخهٔ ۲.۶.۰: مرکز لاگ — مخزن ممیزی و پوشهٔ لاگ برنامه
+        self.log_center = window.pages.get("nav.logs")
+        if self.log_center is not None and hasattr(self.log_center, "set_sources"):
+            try:
+                self.log_center.set_sources(
+                    audit_repository=getattr(self.app, "audit_repository", None),
+                    logs_dir=getattr(getattr(self.app, "paths", None), "logs_dir", None),
+                )
+            except Exception:  # noqa: BLE001 - مرکز لاگ نباید راه‌اندازی را بشکند
+                logger.debug("Log center wiring failed", exc_info=True)
 
         #: ۲.۴.۲ — تازه‌سازی تنبل صفحهٔ عملکرد
         self._outcome_view_stale = True
@@ -750,7 +760,16 @@ class MainController(QObject):
         """
         try:
             # سرویس، نگاشت «نماد به به‌روزرسانی» می‌فرستد
-            items = updates.values() if isinstance(updates, dict) else updates
+            items = list(updates.values() if isinstance(updates, dict) else updates)
+            ticks = getattr(self, "_tick_engine", None)
+            observe = getattr(ticks, "observe_exchange_clock", None)
+            if callable(observe):
+                # نسخهٔ ۲.۶.۱: اختلاف ساعت از تازه‌ترین نماد دستهٔ REST
+                rest_items = [u for u in items if getattr(u, "source", "") == "rest"
+                              and getattr(u, "exchange_ts", 0)]
+                if len(rest_items) >= 20:
+                    freshest = max(rest_items, key=lambda u: float(u.exchange_ts or 0))
+                    observe(freshest.exchange_ts, freshest.updated_at.timestamp() * 1000)
             for update in items:
                 ticks = getattr(self, "_tick_engine", None)
                 if ticks is not None and getattr(update, "source", "") == "rest":
@@ -6214,7 +6233,9 @@ class MainController(QObject):
 
         async def ultra_tickers() -> list:
             market = bound_market
-            return await market.get_all_tickers(max_age_seconds=10) if market is not None else []
+            # نسخهٔ ۲.۶.۱: ۵ ثانیه (همان نظرسنجی بازار)؛ ۱۰ ثانیه عمر کش مشترک
+            # را دراز می‌کرد و تیک‌های REST مدام از آستانهٔ کهنگی رد می‌شدند.
+            return await market.get_all_tickers(max_age_seconds=5) if market is not None else []
 
         ultra_source = UltraScalpSource(
             lambda: getattr(self, "_tick_engine", None),
@@ -6256,7 +6277,12 @@ class MainController(QObject):
                 candidates = await confidence_source.scan(symbols=selected if engine_mode == "selected" else None)
             else:
                 candidates = await service.scan(symbols=selected if engine_mode == "selected" else None)
-                candidates = [c for c in candidates if service.feasibility(c)[0]]
+                feasible = [c for c in candidates if service.feasibility(c)[0]]
+                # نسخهٔ ۲.۶.۰ (فقط ثبت): نامزدهای حذف‌شده با هدف ناممکن در خلاصهٔ پویش
+                from app.logging import audit as _audit
+
+                _audit.note_scan(reasons={"target_infeasible": len(candidates) - len(feasible)})
+                candidates = feasible
             if engine_mode == "selected" and selected is not None:
                 candidates = [
                     c for c in candidates
@@ -6279,6 +6305,17 @@ class MainController(QObject):
             # نسخهٔ ۲.۵.۵: اجرای واقعی تا عبور از دروازهٔ اعتبارسنجی قفل است
             live_gate=self.app.validation_gate.live_allowed,
         )
+
+        async def book_source(symbol: str) -> bool:
+            """نسخهٔ ۲.۶.۱: پیش‌خوانی فقط دفتر سفارش (یک درخواست)."""
+            market = bound_market
+            ticks = getattr(self, "_tick_engine", None)
+            refresh = getattr(market, "refresh_execution_book", None)
+            if market is None or ticks is None or not callable(refresh):
+                return bool(await price_source(symbol))
+            return await refresh(symbol, ticks)
+
+        engine.set_book_source(book_source)
         # مسیر تیک: هر تیک وب‌سوکت بلافاصله TP/SL/سر‌به‌سر/تریلینگ را
         # می‌سنجد — پایش فقط fallback است (خواستهٔ §۶).
         engine.attach_tick_engine(self._ensure_tick_engine())
@@ -7179,6 +7216,7 @@ class MainController(QObject):
             "nav.wallet": self.refresh_wallet,
             "nav.signals": self._load_signal_history,
             "nav.reports": self._refresh_outcome_view,
+            "nav.logs": getattr(self.log_center, "refresh", None) if getattr(self, "log_center", None) else None,
         }
         handler = handlers.get(key)
         if handler is not None:
@@ -7580,6 +7618,13 @@ class MainController(QObject):
         symbols = list(dict.fromkeys(self._stream_symbols()))
         if not symbols:
             return
+        # نسخهٔ ۲.۶.۱: اگر دور قبلی هنوز تمام نشده، دور تازه آن را نکُشد —
+        # قبلاً هر ۵ ثانیه کار نیمه‌تمام لغو می‌شد و دفتر هیچ‌وقت ثبت نمی‌شد.
+        try:
+            if "terminal-orderbook" in self.runner.active_keys():
+                return
+        except Exception:  # noqa: BLE001
+            pass
 
         async def refresh() -> None:
             market = self.app.market
@@ -9067,6 +9112,7 @@ class MainController(QObject):
     def log_health(self, snapshot: dict[str, Any]) -> None:
         """ثبت ضربان در لاگ هر ده دقیقه (و فوراً اگر حافظه بالا رفت)."""
         self._health_beats = getattr(self, "_health_beats", 0) + 1
+        self._check_clock_skew()
         memory = float(snapshot.get("memory_mb", 0.0) or 0.0)
         if self._health_beats % self.HEALTH_LOG_EVERY == 1 or memory > 1500:
             logger.info(
@@ -9075,6 +9121,36 @@ class MainController(QObject):
                 float(snapshot.get("peak_memory_mb", 0.0) or 0.0),
                 snapshot.get("threads"), snapshot.get("extra"),
             )
+
+    def _check_clock_skew(self) -> None:
+        """
+        هشدار یک‌باره وقتی ساعت سیستم با صرافی بیش از یک دقیقه اختلاف دارد.
+
+        نسخهٔ ۲.۶.۲: ساعت/منطقهٔ زمانی اشتباه ویندوز همهٔ داده‌ها را «کهنه»
+        نشان می‌داد. داده اصلاح می‌شود، ولی کاربر باید علت را بداند چون
+        زمان سیگنال‌ها، کندل‌ها و گزارش‌ها هم به ساعت سیستم وابسته است.
+        """
+        try:
+            ticks = getattr(self, "_tick_engine", None)
+            offset_ms = float(getattr(ticks, "clock_offset_ms", 0.0) or 0.0)
+            if not offset_ms and self.app.market is not None:
+                offset_ms = float(getattr(self.app.market, "exchange_clock_offset_ms", 0.0) or 0.0)
+            if abs(offset_ms) < 60_000:
+                return
+            hours = offset_ms / 3_600_000.0
+            if abs(hours - float(getattr(self, "_clock_warned_hours", 0.0) or 0.0)) < 0.05:
+                return
+            self._clock_warned_hours = hours
+            logger.warning("System clock differs from exchange by %+.2f hours", hours)
+            message = self.tr_.tr(
+                "common.clock_skew_warning",
+                hours=f"{hours:+.1f}",
+                direction=self.tr_.tr("common.clock_ahead" if hours > 0 else "common.clock_behind"),
+            )
+            self.status(message)
+            self._toast(message, level="warning")
+        except Exception:  # noqa: BLE001 - هشدار نباید جریان را بشکند
+            logger.debug("Clock skew check failed", exc_info=True)
 
     def report_unclean_exit(self, previous: Any) -> None:
         """به کاربر بگو نشست قبلی ناگهان بسته شد و لاگش کجاست."""

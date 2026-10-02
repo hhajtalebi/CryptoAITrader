@@ -1,6 +1,41 @@
 # کار بعدی
 
-## وضعیت جاری ۲.۵.۹ — معاملهٔ دستی، اولامای کارا، APK روی WSL بدون توزیع (2026-10-01)
+## وضعیت جاری ۲.۶.۳ — طوفان تعویض دامنهٔ REST (2026-10-01)
+- رفع شد؛ آزمون `tests/test_v262_rest_rotation.py`. commit نشده (۲.۶.۰ تا ۲.۶.۳؛ آخرین commit: `bf68116`).
+- کار بعدی: کاربر خلاصهٔ پویش و تایم‌لاین دو معاملهٔ ضررده را بفرستد.
+
+## وضعیت قبلی ۲.۶.۲ — اختلاف ساعت ~۱۰٫۵ ساعته (2026-10-01)
+- سقف اصلاح ساعت ۴۸ ساعت، اصلاح در موتور بازار، هشدار UI. آزمون `tests/test_v262_clock_skew.py` (۱۱).
+- **commit نشده** (۲.۶.۰، ۲.۶.۱ و ۲.۶.۲؛ آخرین commit: `bf68116`).
+- کار بعدی: کاربر ساعت/منطقهٔ زمانی ویندوز را درست کند و خلاصهٔ پویش را دوباره بفرستد.
+
+## وضعیت قبلی ۲.۶.۱ — رفع اسکالپ (2026-10-01)
+- اختلاف ساعت صرافی، ثبت مستقل دفتر، رفع AsyncRunner، پیش‌خوانی یک‌درخواستی، کش گردش اولترا، حالت تشخیصی. جزئیات در
+  `AI_HANDOVER.md` و `docs/RELEASE_2.6.1_FA.md`. آزمون: `tests/test_v261_scalp_fix.py` (۳۱).
+- **commit نشده** (۲.۶.۰ و ۲.۶.۱ هر دو؛ آخرین commit: `bf68116`).
+- کار بعدی: اجرای کاربر روی بازار واقعی و بررسی خلاصهٔ پویش در «مرکز لاگ» (stale_data / no_orderbook باید کم شود).
+
+## وضعیت قبلی ۲.۶.۰ — سیستم لاگ و تشخیص معاملات (2026-10-01)
+- فقط ثبت؛ هیچ استراتژی/آستانه/فیلتری عوض نشده. پایه برای اصلاح اسکالپ در ۲.۶.۱.
+- `app/logging/categories.py` (۱۲ دسته، `category_for_logger`)، `structured.py` (`setup_structured_logging`، `SafeQueueHandler`
+  put_nowait، `CategoryRouterHandler` ← `data/logs/<دسته>/<دسته>-YYYY-MM-DD[.N].jsonl` ۱۰MB/۱۴ روز/۶۰ فایل، ERROR+ ← errors/،
+  audit ← audit/، `LogBuffer.since(seq)`، `read_log_files`)، `audit.py` (کدهای استاندارد رد + `normalize_reason`/`reason_bucket`،
+  `ScanDiagnostics`/`scan_scope`/`note_scan`، `reject` با حذف تکرار ۳۰ ثانیه، `scan_summary` تجمیعی هر ۱۰ ثانیه)،
+  `audit_store.py` (نوشتن دسته‌ای SQLite در رشتهٔ پس‌زمینه)، `query.py` (`LogFilter`، `timeline_stages`، `export_events`).
+- جدول `audit_events` (`AuditEventRecord`) + `AuditRepository` (`query`/`timeline`/`scan_summaries`/`recent_trade_ids`/`purge`).
+- قلاب‌ها: `TradeRepository.open_trade/close_trade/partial_close` (پس از commit)، `AutoTrader._open_trade_locked`
+  (`audit_id` در extra، `progress["stage"]`، `_audit_reject`/`_audit_accept`/`_audit_exit_decision`)، `_scan_for_entries` (scan_scope)،
+  `score_candidate(on_reject=)`، `scalp_service`/`ultra_scalp`/`confidence_source` ← `note_scan`، کنترلر ← `target_infeasible`.
+- لاگر `audit` وقتی لایهٔ ساختاریافته فعال است propagate=False (کنسول و app.log پر نمی‌شوند).
+- UI: `ui/pages/log_center_page.py` (`LogCenterPage`، `nav.logs` پس از گزارش‌ها، آیکون `logs`)، `localization/*/logs.json`.
+- آزمون: `tests/test_v260_logging.py` (۵۴). گزارش: `docs/RELEASE_2.6.0_FA.md`.
+
+**commit نشده** (آخرین commit: `bf68116`، نسخهٔ ۲.۵.۹).
+
+**کار بعدی ۲.۶.۱:** اصلاح Ultra/Fast Scalp با دادهٔ همین لاگ‌ها (چرا تعداد نامزد به صفر می‌رسد؛ min_cost_multiple، trend_conflict،
+target_unreachable، spread_eats_stop، negative_edge با حداقل نمونه، دفتر سفارش واقعی اولترا، حالت تشخیصی بدون سفارش).
+
+## وضعیت قبلی ۲.۵.۹ — معاملهٔ دستی، اولامای کارا، APK روی WSL بدون توزیع (2026-10-01)
 - معاملهٔ دستی: `trading/manual_order.py` (`plan_manual_order`، `prefill_from_signal`، `normalize_symbol` ← `BTC/USDT`، اهرم ۱..۱۰۰،
   اسپات بدون اهرم/شورت، خطا/هشدار با کلید ترجمه `trades.manual.*`) + `ui/dialogs/manual_trade_dialog.py` (`ManualTradeDialog`).
   ورودی‌ها: `TradesPage.manual_trade_requested` (سربرگ + کنار «بستن معامله»)، `SignalDetailDialog.manual_trade_requested` («ویرایش و باز کردن»).
@@ -13,7 +48,7 @@
   `run_streaming` حذف NUL + `WSL_UTF8=1`.
 - آزمون: `tests/test_v259_{manual_trade,ollama,wsl}.py` (۳۰+۲۱+۱۵). گزارش: `docs/RELEASE_2.5.9_FA.md`.
 
-**commit نشده** (آخرین commit: `97ff3a2`، شامل ۲.۵.۵ تا ۲.۵.۸).
+commit شد: `bf68116`.
 
 ## وضعیت قبلی ۲.۵.۸ — رفع باگ‌های موتور سیگنال (2026-09-26)
 - B1 `mean_reversion`: %B (۰..۱۰۰) با ۰٫۰۵/۰٫۹۵ مقایسه می‌شد ⇒ ۹۴٪ رأی SHORT. ثابت‌های `PERCENT_B_LOW=5`/`PERCENT_B_HIGH=95`.

@@ -10,7 +10,7 @@ from __future__ import annotations
 from enum import Enum
 
 APP_NAME = "Crypto AI Trader"
-APP_VERSION = "2.5.9"
+APP_VERSION = "2.6.3"
 
 #: نام فهرست دیده‌بانی پیش‌فرض.
 #:

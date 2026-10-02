@@ -28,6 +28,23 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+def _audit(kind: str, record: dict[str, Any] | None, **fields: Any) -> None:
+    """ممیزی ورود/خروج؛ فقط صف می‌گذارد و هرگز استثنا نمی‌دهد (نسخهٔ ۲.۶.۰)."""
+    if not record:
+        return
+    try:
+        from app.logging import audit
+
+        if kind == "entry":
+            audit.entry(record)
+        elif kind == "exit":
+            audit.exit_(record, **fields)
+        elif kind == "partial_exit":
+            audit.partial_exit(record, **fields)
+    except Exception:  # noqa: BLE001 - لاگ نباید ثبت معامله را خراب کند
+        pass
+
+
 def _to_dict(record: PaperTradeRecord) -> dict[str, Any]:
     """تبدیل رکورد معامله به دیکشنری برای لایهٔ رابط کاربری."""
     return {
@@ -111,7 +128,10 @@ class PaperTradeRepository(BaseRepository[PaperTradeRecord]):
                 record.quantity,
                 record.entry_price,
             )
-            return _to_dict(record)
+            result = _to_dict(record)
+        # نسخهٔ ۲.۶.۰: ممیزی ورود پس از commit — همهٔ مسیرها (خودکار، سیگنال، دستی)
+        _audit("entry", result)
+        return result
 
     def daily_realised_pnl(self, user_id: int | None = None) -> float:
         """UTC-day net realised P&L; survives engine/application restarts."""
@@ -214,7 +234,9 @@ class PaperTradeRepository(BaseRepository[PaperTradeRecord]):
             if note:
                 record.note = note
             logger.info("Paper trade closed: id=%s pnl=%.4f", trade_id, record.pnl)
-            return _to_dict(record)
+            result = _to_dict(record)
+        _audit("exit", result, exit_fee=float(fee or 0.0))
+        return result
 
     def partial_close(
         self,
@@ -272,7 +294,9 @@ class PaperTradeRepository(BaseRepository[PaperTradeRecord]):
                 "Paper trade partial close: id=%s qty=%s @ %s (target %s)",
                 trade_id, amount, price, target_index,
             )
-            return _to_dict(record)
+            result = _to_dict(record)
+        _audit("partial_exit", result, quantity=amount, price=price, target_index=target_index)
+        return result
 
     def cancel_trade(self, trade_id: int) -> bool:
         """لغو یک معاملهٔ باز بدون ثبت سود یا زیان."""

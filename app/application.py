@@ -101,6 +101,7 @@ class Application:
         self.settings_repository = SettingsRepository(self.database)
         self.settings = SettingsService(self.settings_repository, self.events)
         self.settings.initialize_defaults()
+        self._migrate_daily_loss_limit()
 
         self.symbol_repository = SymbolRepository(self.database)
         self.candle_repository = CandleRepository(self.database)
@@ -117,6 +118,18 @@ class Application:
         self.user_repository = UserRepository(self.database)
         self.exchange_account_repository = ExchangeAccountRepository(self.database)
         self.trade_repository = PaperTradeRepository(self.database)
+        # نسخهٔ ۲.۶.۰: رویدادهای ممیزی (رد/ورود/خروج/خلاصهٔ پویش) در همین SQLite،
+        # با نوشتن دسته‌ای در رشتهٔ پس‌زمینه؛ خطای آن هرگز برنامه را متوقف نمی‌کند.
+        from app.database.repositories.audit_repository import AuditRepository
+
+        self.audit_repository = AuditRepository(self.database)
+        self._audit_store = None
+        try:
+            from app.logging.audit_store import attach_audit_store
+
+            self._audit_store = attach_audit_store(self.audit_repository)
+        except Exception:  # noqa: BLE001
+            logger.warning("Audit store unavailable; audit events stay in log files only", exc_info=True)
 
         # ---- امنیت و پشتیبان ----
         self.secrets = get_secret_store()
@@ -179,6 +192,24 @@ class Application:
 
     # ------------------------------------------------------------------
     # تنظیمات
+    # ------------------------------------------------------------------
+    def _migrate_daily_loss_limit(self) -> None:
+        """
+        نسخهٔ ۲.۷.۰: سقف زیان روزانهٔ پیش‌فرضِ قدیمی (۲۰ دلار) یک بار خاموش می‌شود.
+
+        کاربر خواست این سقف در آزمون کاغذی جلوی معامله را نگیرد. فقط همان
+        مقدار پیش‌فرض قدیمی و فقط یک بار عوض می‌شود؛ عدد دلخواه کاربر می‌ماند.
+        """
+        flag = "scalp.daily_loss_limit_v270"
+        try:
+            if self.settings.get(flag, False):
+                return
+            if float(self.settings.get("scalp.daily_loss_limit", 0) or 0) == 20.0:
+                self.settings.set("scalp.daily_loss_limit", 0.0, notify=False)
+            self.settings.set(flag, True, notify=False)
+        except Exception:  # noqa: BLE001 - مهاجرت تنظیم نباید شروع برنامه را بشکند
+            pass
+
     # ------------------------------------------------------------------
     @property
     def prediction_engine(self) -> Any | None:
@@ -420,6 +451,13 @@ class Application:
         if self._ai_manager is not None:
             await self._ai_manager.close()
         logger.info("Application stopped")
+        store = getattr(self, "_audit_store", None)
+        if store is not None:
+            from app.logging.audit_store import audit_store, detach_audit_store
+
+            if audit_store() is store:
+                detach_audit_store()
+            self._audit_store = None
 
     # ------------------------------------------------------------------
     # استخر محاسبه و حذف ذخیرهٔ تکراری پویش (۲.۴.۲)

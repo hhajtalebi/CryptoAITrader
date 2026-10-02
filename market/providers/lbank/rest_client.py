@@ -18,9 +18,11 @@ import hashlib
 import hmac
 import random
 import string
+import asyncio
 import time
 from typing import Any
 
+import anyio
 import httpx
 
 from app.exceptions import (
@@ -121,6 +123,9 @@ class LBankRestClient:
         self._client: httpx.AsyncClient | None = None
         # کلاینت دامنهٔ قراردادها؛ جداست چون base_url متفاوتی دارد
         self._contract_http: httpx.AsyncClient | None = None
+        # نسخهٔ ۲.۶.۲: کلاینت‌های کنارگذاشته پس از تعویض دامنه. فوراً بسته
+        # نمی‌شوند چون درخواست‌های هم‌زمانِ دیگر هنوز رویشان در راه‌اند.
+        self._retired: list[httpx.AsyncClient] = []
 
     # ------------------------------------------------------------------
     # چرخه عمر
@@ -132,7 +137,7 @@ class LBankRestClient:
                 base_url=self._base_url,
                 timeout=httpx.Timeout(self._timeout),
                 headers={"User-Agent": "CryptoAITrader/1.0", "Accept": "application/json"},
-                limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+                limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
             )
             logger.debug("LBank REST client opened for %s", self._base_url)
 
@@ -142,6 +147,15 @@ class LBankRestClient:
             await self._client.aclose()
             logger.debug("LBank REST client closed")
         self._client = None
+        for task in list(getattr(self, "_close_tasks", ()) or ()):
+            task.cancel()
+        retired, self._retired = self._retired, []
+        for old in retired:
+            if not old.is_closed:
+                try:
+                    await old.aclose()
+                except Exception:  # noqa: BLE001
+                    pass
         if self._contract_http is not None and not self._contract_http.is_closed:
             await self._contract_http.aclose()
         self._contract_http = None
@@ -177,19 +191,26 @@ class LBankRestClient:
         async def _do_request() -> Any:
             await self._rate_limiter.acquire()
             await self.open()
-            assert self._client is not None
+            client, host = self._client, self._base_url
+            assert client is not None
             try:
-                response = await self._client.get(endpoint, params=params or {})
+                response = await client.get(endpoint, params=params or {})
             except httpx.ConnectTimeout as exc:
-                await self._rotate_base_url(exc)
+                await self._rotate_base_url(exc, failed_host=host)
                 raise TimeoutErrorApp(f"Connect timed out: {endpoint}") from exc
             except httpx.TimeoutException as exc:
                 raise TimeoutErrorApp(f"Request timed out: {endpoint}") from exc
             except httpx.ConnectError as exc:
-                await self._rotate_base_url(exc)
+                await self._rotate_base_url(exc, failed_host=host)
                 raise NetworkError(f"Could not connect while calling {endpoint}") from exc
             except httpx.HTTPError as exc:
                 raise NetworkError(f"Network error while calling {endpoint}") from exc
+            except (anyio.ClosedResourceError, anyio.BrokenResourceError, RuntimeError) as exc:
+                # کلاینت زیر پای درخواست بسته شد؛ خطای گذرای شبکه است و
+                # دامنه را عوض نمی‌کند (نسخهٔ ۲.۶.۲).
+                if isinstance(exc, RuntimeError) and "closed" not in str(exc).lower():
+                    raise
+                raise NetworkError(f"Connection closed while calling {endpoint}") from exc
             return self._handle_response(response, endpoint)
 
         return await retry_async(
@@ -205,7 +226,7 @@ class LBankRestClient:
         """دامنهٔ REST فعلی (برای عیب‌یابی)."""
         return self._base_url
 
-    async def _rotate_base_url(self, exc: BaseException) -> None:
+    async def _rotate_base_url(self, exc: BaseException, *, failed_host: str | None = None) -> None:
         """
         رفتن به دامنهٔ REST بعدی پس از خطای اتصال (DNS/TCP/TLS).
 
@@ -215,19 +236,44 @@ class LBankRestClient:
         """
         if len(self._base_urls) < 2:
             return
+        if failed_host is not None and failed_host != self._base_url:
+            # نسخهٔ ۲.۶.۲: درخواست‌های هم‌زمانی که روی دامنهٔ قبلی شکست
+            # خورده‌اند، دامنهٔ تازه‌انتخاب‌شده را دوباره عوض نکنند. قبلاً
+            # N خطای هم‌زمان N بار دامنه را می‌چرخاند و هر بار کلاینت مشترک
+            # را زیر پای بقیه می‌بست ← طوفان بی‌پایان ConnectError/ClosedResourceError.
+            return
         previous = self._base_url
         self._base_index = (self._base_index + 1) % len(self._base_urls)
         self._base_url = self._base_urls[self._base_index]
         client, self._client = self._client, None
         if client is not None and not client.is_closed:
-            try:
-                await client.aclose()
-            except Exception:  # noqa: BLE001
-                pass
+            self._retire(client)
         logger.warning(
             "LBank REST host %s unreachable (%s); switching to %s",
             previous, exc.__class__.__name__, self._base_url,
         )
+
+    def _retire(self, client: httpx.AsyncClient, delay: float = 30.0) -> None:
+        """بستن کلاینت قدیمی با تأخیر تا درخواست‌های در راهِ آن تمام شوند."""
+        self._retired.append(client)
+
+        async def _close_later() -> None:
+            await asyncio.sleep(delay)
+            if client in self._retired:
+                self._retired.remove(client)
+            if not client.is_closed:
+                try:
+                    await client.aclose()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        try:
+            task = asyncio.get_running_loop().create_task(_close_later())
+            self._close_tasks = getattr(self, "_close_tasks", set())
+            self._close_tasks.add(task)
+            task.add_done_callback(self._close_tasks.discard)
+        except RuntimeError:
+            pass  # بدون حلقه: در close() بسته می‌شود
 
     # ------------------------------------------------------------------
     # درخواست خصوصی (امضاشده)
@@ -272,9 +318,10 @@ class LBankRestClient:
         async def _do_request() -> Any:
             await self._rate_limiter.acquire()
             await self.open()
-            assert self._client is not None
+            client = self._client
+            assert client is not None
             try:
-                response = await self._client.post(
+                response = await client.post(
                     endpoint,
                     data=payload,
                     headers=headers,
@@ -283,6 +330,8 @@ class LBankRestClient:
                 raise TimeoutErrorApp(f"Signed request timed out: {endpoint}") from exc
             except httpx.HTTPError as exc:
                 raise NetworkError(f"Network error while calling {endpoint}") from exc
+            except (anyio.ClosedResourceError, anyio.BrokenResourceError) as exc:
+                raise NetworkError(f"Connection closed while calling {endpoint}") from exc
             return self._handle_response(response, endpoint)
 
         return await retry_async(

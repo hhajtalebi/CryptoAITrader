@@ -286,7 +286,7 @@ class SignalEngine:
                 continue
             if isinstance(analysis, BaseException):
                 notes.append(f"{timeframe}: {analysis.__class__.__name__}")
-                logger.warning("Timeframe %s crashed for %s: %s", timeframe, symbol, analysis)
+                logger.warning("Timeframe %s crashed for %s: %s: %s", timeframe, symbol, type(analysis).__name__, analysis)
                 continue
             analyses[timeframe] = analysis
 

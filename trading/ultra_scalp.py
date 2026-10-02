@@ -28,13 +28,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import math
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.logging import get_logger
+from app.logging import audit, get_logger
 
 logger = get_logger(__name__)
 
@@ -46,6 +47,11 @@ DEFAULT_MIN_MOVE_PERCENT = 0.04
 DEFAULT_MIN_CONSISTENCY = 0.35
 #: کمترین شمار نقطهٔ قیمت در پنجره
 MIN_POINTS = 3
+
+#: عمر کش گردش ۲۴ساعته (ثانیه) — نسخهٔ ۲.۶.۱
+TURNOVER_TTL_SECONDS = 30.0
+#: بیشینهٔ انتظار پویش برای نخستین دریافت گردش (ثانیه)
+TURNOVER_FIRST_WAIT_SECONDS = 3.0
 
 
 @dataclass
@@ -143,19 +149,48 @@ class UltraScalpSource:
         return value if math.isfinite(value) else default
 
     async def _turnovers(self) -> dict[str, float]:
+        """
+        گردش ۲۴ساعته از کش داخلی (نسخهٔ ۲.۶.۱).
+
+        قبلاً هر پویش (هر ثانیه) منتظر REST کل بازار می‌ماند و با کندی
+        شبکه یک پویش تا ۳۱ ثانیه طول می‌کشید. گردش ۲۴ساعته کند تغییر
+        می‌کند: بار اول حداکثر چند ثانیه صبر، سپس نوسازی در پس‌زمینه.
+        """
         if self._tickers_source is None:
             return {}
+        now = time.monotonic()
+        cache = getattr(self, "_turnover_cache", None)
+        fetched_at = float(getattr(self, "_turnover_at", 0.0) or 0.0)
+        task = getattr(self, "_turnover_task", None)
+        if cache is None:
+            if task is None or task.done():
+                task = self._turnover_task = asyncio.ensure_future(self._fetch_turnovers())
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=TURNOVER_FIRST_WAIT_SECONDS)
+            except Exception:  # noqa: BLE001 - نبود گردش نباید پویش را بکشد
+                logger.debug("Ultra scalp: tickers unavailable", exc_info=True)
+            return dict(getattr(self, "_turnover_cache", None) or {})
+        if now - fetched_at >= TURNOVER_TTL_SECONDS and (task is None or task.done()):
+            self._turnover_task = asyncio.ensure_future(self._fetch_turnovers())
+        return cache
+
+    async def _fetch_turnovers(self) -> None:
         try:
             tickers = await self._tickers_source()
-        except Exception:  # noqa: BLE001 - نبود گردش نباید پویش را بکشد
+        except Exception:  # noqa: BLE001
             logger.debug("Ultra scalp: tickers unavailable", exc_info=True)
-            return {}
+            # تلاش بعدی پس از مکث کوتاه، نه هر ثانیه
+            if getattr(self, "_turnover_cache", None) is not None:
+                self._turnover_at = time.monotonic() - TURNOVER_TTL_SECONDS + 5.0
+            return
         result: dict[str, float] = {}
         for ticker in tickers or []:
             symbol = str(getattr(ticker, "symbol", "") or "").upper()
             if symbol:
                 result[symbol] = float(getattr(ticker, "turnover_24h", 0.0) or 0.0)
-        return result
+        if result or getattr(self, "_turnover_cache", None) is None:
+            self._turnover_cache = result
+        self._turnover_at = time.monotonic()
 
     async def scan(
         self,
@@ -168,6 +203,7 @@ class UltraScalpSource:
         engine = self._tick_engine_source()
         if engine is None:
             self.last_stats = {"symbols": 0, "candidates": 0, "reason": "no_tick_engine"}
+            audit.note_scan(reasons={"no_tick_engine": 1})
             return []
         window_ms = max(5.0, self._float("scalp.ultra_window_seconds", DEFAULT_WINDOW_SECONDS)) * 1000.0
         min_move = max(0.0, self._float("scalp.ultra_min_move_percent", DEFAULT_MIN_MOVE_PERCENT))
@@ -178,16 +214,18 @@ class UltraScalpSource:
         excluded = {s.upper() for s in (exclude or set())}
         now_ms = self._clock_ms()
         candidates: list[UltraCandidate] = []
-        stale = quiet = illiquid = 0
+        stale = quiet = illiquid = errors = scanned = 0
         for symbol in universe:
             if symbol in excluded:
                 continue
+            scanned += 1
             try:
                 if engine.is_stale(symbol):
                     stale += 1
                     continue
                 points = engine.history(symbol, 0)
             except Exception:  # noqa: BLE001
+                errors += 1
                 continue
             turnover = turnovers.get(symbol)
             if turnover is not None and min_turnover > 0 and turnover < min_turnover:
@@ -216,6 +254,10 @@ class UltraScalpSource:
             "symbols": len(universe), "candidates": len(candidates),
             "stale": stale, "quiet": quiet, "illiquid": illiquid,
         }
+        # نسخهٔ ۲.۶.۰: همین شمارش‌ها در خلاصهٔ پویش (فقط ثبت)
+        audit.note_scan(scanned=scanned, raw=scanned - stale - errors,
+                        reasons={"stale_data": stale, "low_momentum": quiet,
+                                 "low_liquidity": illiquid, "data_error": errors})
         return candidates[: max(1, int(limit))]
 
     @staticmethod

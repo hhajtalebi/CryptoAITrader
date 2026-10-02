@@ -2,7 +2,7 @@
 صفحات اصلی برنامه.
 
 داشبورد، بازارها، تحلیل، سیگنال‌ها، چت هوشمند، تاریخچه معاملات، کیف پول،
-گزارش‌ها، تنظیمات و راهنما.
+گزارش‌ها، مرکز لاگ، تنظیمات و راهنما.
 """
 
 from ui.pages.analysis_page import AnalysisPage
@@ -10,6 +10,7 @@ from ui.pages.base_page import BasePage
 from ui.pages.chat_page import ChatBubble, ChatPage
 from ui.pages.dashboard_page import DashboardPage
 from ui.pages.help_page import HelpPage
+from ui.pages.log_center_page import LogCenterPage
 from ui.pages.markets_page import MarketsPage
 from ui.pages.prediction_page import PredictionPage
 from ui.pages.reports_page import ReportsPage
@@ -30,6 +31,7 @@ __all__ = [
     "TradesPage",
     "WalletPage",
     "ReportsPage",
+    "LogCenterPage",
     "SettingsPage",
     "HelpPage",
 ]

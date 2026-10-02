@@ -40,6 +40,7 @@ from ui.pages import (
     ChatPage,
     DashboardPage,
     HelpPage,
+    LogCenterPage,
     MarketsPage,
     PredictionPage,
     ReportsPage,
@@ -65,6 +66,7 @@ NAV_ICONS: dict[str, str] = {
     "nav.trades": "trades",
     "nav.wallet": "wallet",
     "nav.reports": "reports",
+    "nav.logs": "logs",
     "nav.settings": "settings",
     "nav.help": "help",
 }
@@ -113,6 +115,7 @@ class MainWindow(QMainWindow):
         ("nav.trades", TradesPage),
         ("nav.wallet", WalletPage),
         ("nav.reports", ReportsPage),
+        ("nav.logs", LogCenterPage),
         ("nav.settings", SettingsPage),
         ("nav.help", HelpPage),
     ]

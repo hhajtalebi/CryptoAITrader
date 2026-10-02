@@ -32,6 +32,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import math
 import time
 from collections import deque
@@ -40,7 +41,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-from app.logging import get_logger
+from app.logging import audit, get_logger
 
 logger = get_logger(__name__)
 
@@ -61,6 +62,8 @@ ENGINE_MODES = ("selected", "scan", "ai", "ultra")
 #: کف‌های حالت فوق‌سریع: پویش هر ۱ ثانیه، نگه‌داری از ۱۰ ثانیه
 ULTRA_MIN_SCAN_INTERVAL = 1.0
 ULTRA_MIN_HOLD_SECONDS = 10
+#: مکث پیش‌خوانی دوبارهٔ دفترِ یک نماد پس از شکست (ثانیه) — نسخهٔ ۲.۶.۱
+BOOK_PREFETCH_RETRY_SECONDS = 3.0
 #: فاصلهٔ کمینهٔ ذخیرهٔ سود/زیان زندهٔ هر معامله در پایگاه داده (ثانیه)
 PERSIST_INTERVAL_SECONDS = 2.0
 
@@ -144,7 +147,7 @@ class AutoTradeConfig:
     #: وب‌سوکت خاموش است نجات می‌دهد (خواستهٔ §۵/§۶)
     poll_seconds: float = 5.0
     #: سقف زیان روزانه؛ با رسیدن به آن، موتور خودش می‌ایستد
-    daily_loss_limit: float = 20.0
+    daily_loss_limit: float = 0.0  # ۲.۷.۰: صفر = بدون سقف زیان روزانه
     #: `paper` یا `live`
     mode: str = "paper"
     #: عبارت تأیید معاملهٔ واقعی
@@ -202,6 +205,9 @@ class AutoTradeConfig:
     reach_ratio: float = 0.5
     #: نسخهٔ ۲.۵.۷ — اسپرد نباید بیش از این کسر از فاصلهٔ حد ضرر را بخورد
     max_spread_stop_fraction: float = 0.33
+    #: نسخهٔ ۲.۶.۱ — حالت تشخیصی/اشکال‌زدایی: کل مسیر نامزد→دروازه‌ها→قیمت
+    #: اجرا و ثبت می‌شود ولی هیچ معامله‌ای (کاغذی یا واقعی) باز نمی‌شود.
+    diagnostic_only: bool = False
 
     def validated(self) -> AutoTradeConfig:
         """
@@ -750,7 +756,11 @@ class AutoTrader:
             else:
                 total = float(persisted(self._user_id))
                 self._daily_cache = (clock, total)
-        if total <= -abs(self.config.daily_loss_limit):
+        # نسخهٔ ۲.۷.۰: صفر یا منفی یعنی «بدون سقف» (درخواست کاربر برای آزمون کاغذی).
+        limit = float(self.config.daily_loss_limit or 0.0)
+        if limit <= 0:
+            return True
+        if total <= -limit:
             self._halted_reason = (
                 f"سقف زیان روزانه ({self.config.daily_loss_limit} دلار) رد شد"
             )
@@ -810,18 +820,37 @@ class AutoTrader:
             return False
         return bool(getattr(quote, "book_fresh", False)) and float(getattr(quote, "spread", 0.0) or 0.0) > 0
 
+    def set_book_source(self, source: Callable[[str], Awaitable[Any]] | None) -> None:
+        """
+        منبع «فقط دفتر سفارش» برای پیش‌خوانی (نسخهٔ ۲.۶.۱).
+
+        یک درخواست به‌جای دو (تیکر + دفتر)؛ فشار REST و PoolTimeout کم
+        می‌شود و شکست تیکر دیگر دفترِ سالم را دور نمی‌ریزد.
+        """
+        self._book_source = source
+
     def _prefetch_book(self, symbol: str) -> None:
         """خواندن دفتر در پس‌زمینه (حداکثر ۸ هم‌زمان، هر نماد یک‌بار)."""
         pending = getattr(self, "_book_prefetch", None)
         if pending is None:
             pending = self._book_prefetch = set()
-        if symbol in pending or len(pending) >= 8 or self._price_source is None:
+        source = getattr(self, "_book_source", None) or self._price_source
+        if symbol in pending or len(pending) >= 8 or source is None:
+            return
+        # نسخهٔ ۲.۶.۱: پس از شکست، چند ثانیه همان نماد دوباره خوانده نشود
+        failures = getattr(self, "_book_prefetch_failed", None)
+        if failures is None:
+            failures = self._book_prefetch_failed = {}
+        now = time.monotonic()
+        if now - failures.get(symbol, -1e9) < BOOK_PREFETCH_RETRY_SECONDS:
             return
 
         async def fetch() -> None:
             try:
-                await asyncio.wait_for(self._price_source(symbol), timeout=5.0)
+                await asyncio.wait_for(source(symbol), timeout=5.0)
+                failures.pop(symbol, None)
             except Exception:  # noqa: BLE001
+                failures[symbol] = time.monotonic()
                 logger.debug("Book prefetch failed for %s", symbol, exc_info=True)
             finally:
                 pending.discard(symbol)
@@ -1017,6 +1046,7 @@ class AutoTrader:
                 self._count_rejection(reason)
                 self._emit("rejected", {"symbol": symbol, "reason": reason})
                 self._record_opportunity(candidate, decision="skip", reason=reason)
+                self._audit_reject(candidate, symbol, reason, "freshness", "")
                 return None
         async with self._entry_lock:
             return await self._open_trade_locked(candidate)
@@ -1033,12 +1063,16 @@ class AutoTrader:
         direction = str(getattr(candidate, "direction", "LONG")).upper()
         side = "long" if direction == "LONG" else "short"
         confidence = float(getattr(candidate, "score", 0.0) or 0.0)
+        # نسخهٔ ۲.۶.۰ (فقط ثبت): مرحلهٔ جاری دروازه‌ها برای نقشهٔ «کدام فیلتر گذشت»
+        progress = {"stage": "precheck"}
+        audit_id = audit.new_correlation_id()
 
         def reject(reason: str) -> None:
             self._last_rejections[symbol.upper()] = reason
             self._count_rejection(reason)
             self._emit("rejected", {"symbol": symbol, "reason": reason})
             self._record_opportunity(candidate, decision="skip", reason=reason)
+            self._audit_reject(candidate, symbol, reason, progress["stage"], audit_id)
 
         if not symbol or direction not in {"LONG", "SHORT"} or not math.isfinite(confidence):
             reject("invalid_candidate")
@@ -1072,10 +1106,12 @@ class AutoTrader:
             reject("symbol_not_selected")
             return None
 
+        progress["stage"] = "market_guards"
         ok, reason = self._check_entry_guards(candidate, side)
         if not ok:
             reject(reason)
             return None
+        progress["stage"] = "orderbook"
         if self.config.engine_mode == "ultra" and not self._book_ready(symbol):
             # نسخهٔ ۲.۵.۷: فید کل بازار Bid/Ask ندارد. قبلاً ورود روی «آخرین
             # معامله» ثبت می‌شد و خروج بعداً روی Bid/Ask (پس از رسیدن دفتر) —
@@ -1086,6 +1122,7 @@ class AutoTrader:
             reject("no_orderbook")
             return None
 
+        progress["stage"] = "sizing"
         margin = self._resolve_margin(candidate, confidence, portfolio)
         # نسخهٔ ۲.۵.۵: کیفیت سیگنال اندازه را تعدیل می‌کند (STRONG 1.0 /
         # NORMAL 0.75 / WEAK 0.5). نامزد بدون این فیلد (اسکالپ/اولترا) → ۱٫۰.
@@ -1096,6 +1133,7 @@ class AutoTrader:
             reject("no_available_margin")
             return None
 
+        progress["stage"] = "pricing"
         entry, execution = await self._price_for_entry(symbol, side)
         if not math.isfinite(entry) or entry <= 0:
             reject("no_price")
@@ -1113,6 +1151,7 @@ class AutoTrader:
 
         from trading.micro_plan import plan_levels
 
+        progress["stage"] = "risk_levels"
         plan = plan_levels(
             margin,
             leverage,
@@ -1190,9 +1229,19 @@ class AutoTrader:
             reject("no_available_margin")
             return None
         # Revalidate freshness/spread after awaited I/O.
+        progress["stage"] = "revalidation"
         ok, reason = self._check_entry_guards(candidate, side)
         if not ok:
             reject(reason)
+            return None
+        if getattr(config, "diagnostic_only", False):
+            # نسخهٔ ۲.۶.۱: همهٔ دروازه‌ها گذشتند؛ در حالت تشخیصی فقط ثبت می‌شود
+            progress["stage"] = "diagnostic"
+            reject("diagnostic_only")
+            self._emit("diagnostic_pass", {
+                "symbol": symbol, "direction": direction, "entry": entry,
+                "stop": stop, "target": target, "spread_percent": spread_now,
+            })
             return None
         if config.mode == "live" and not config.is_live:
             raise LiveTradingNotEnabledError("تأیید معامله واقعی کامل نیست")
@@ -1205,6 +1254,9 @@ class AutoTrader:
                 symbol=symbol, side=side, quantity=quantity, leverage=leverage
             )
 
+        progress["stage"] = "passed"
+        self._audit_accept(candidate, symbol, direction, audit_id, entry=entry, execution=execution,
+                           stop=stop, target=target, quantity=quantity, margin=margin, leverage=leverage)
         record = self._repo.open_trade(
             symbol=symbol,
             side=side,
@@ -1236,6 +1288,8 @@ class AutoTrader:
                 "quality": str(getattr(candidate, "quality", "") or ""),
                 # عکس لحظه‌ای تصمیم هوشمند برای یادگیری از نتیجه
                 "intelligence": dict(getattr(candidate, "intelligence", None) or {}),
+                # نسخهٔ ۲.۶.۰: پیوند سیگنال/نامزد/اعتبارسنجی به خط زمانی این معامله
+                "audit_id": audit_id,
             },
         )
 
@@ -1298,6 +1352,7 @@ class AutoTrader:
             managed.quantity * price,
             float(managed.extra.get("fee_rate", self.config.fee_rate)),
         )
+        self._audit_exit_decision(managed, reason, price)
         record = self._repo.close_trade(
             managed.trade_id,
             exit_price=price,
@@ -1397,6 +1452,147 @@ class AutoTrader:
         return results
 
     # ---- پویش و ثبت فرصت‌ها ------------------------------------------
+
+    # ------------------------------------------------------------------
+    # ممیزی (نسخهٔ ۲.۶.۰) — فقط ثبت؛ هیچ تصمیمی این‌جا گرفته نمی‌شود
+    # ------------------------------------------------------------------
+    #: ترتیب مراحل دروازهٔ ورود (برای نقشهٔ pass/fail/not_run)
+    AUDIT_STAGES: tuple[str, ...] = (
+        "precheck", "market_guards", "orderbook", "sizing", "pricing", "risk_levels", "revalidation",
+    )
+
+    @classmethod
+    def _audit_filter_map(cls, failed_stage: str) -> dict[str, str]:
+        result: dict[str, str] = {}
+        state = "pass"
+        for stage in cls.AUDIT_STAGES:
+            if stage == failed_stage:
+                result[stage] = "fail"
+                state = "not_run"
+            else:
+                result[stage] = state
+        return result
+
+    def _audit_snapshot(self, candidate: Any, symbol: str) -> dict[str, Any]:
+        """عکس بازار/سیگنال نامزد — فقط getattr و حافظه (بدون I/O)."""
+        try:
+            def num(name: str) -> float | None:
+                value = getattr(candidate, name, None)
+                try:
+                    number = float(value)
+                except (TypeError, ValueError):
+                    return None
+                return number if math.isfinite(number) else None
+
+            snapshot: dict[str, Any] = {
+                "price": num("entry_price") or num("last_price") or num("price"),
+                "liquidity_24h": num("turnover_24h"),
+                "volatility_per_second": num("volatility_per_second"),
+                "technical_confidence": num("score"),
+                "probability": num("probability"),
+                "expected_move_percent": num("expected_move_percent"),
+                "risk_reward": num("risk_reward"),
+                "mtf": str(getattr(candidate, "mtf", "") or "") or None,
+                "orderflow": getattr(candidate, "orderflow", None) or getattr(candidate, "order_flow", None),
+                "strategy": str(getattr(candidate, "strategy", "") or getattr(candidate, "source", "") or "") or None,
+                "quality": str(getattr(candidate, "quality", "") or "") or None,
+                "prediction": str(getattr(candidate, "prediction", "") or "") or None,
+                "take_profit": num("take_profit"),
+                "stop_loss": num("stop_loss"),
+            }
+            intelligence = getattr(candidate, "intelligence", None)
+            if isinstance(intelligence, dict) and intelligence:
+                for key in ("final_confidence", "prediction_probability", "mtf_alignment", "regime_score", "quality"):
+                    if intelligence.get(key) is not None:
+                        snapshot[f"ai_{key}"] = intelligence.get(key)
+            ladder = getattr(candidate, "trend_ladder", None)
+            if ladder is not None:
+                summary = getattr(ladder, "summary", None)
+                snapshot["trend"] = summary() if callable(summary) else str(ladder)
+            tick_engine = getattr(self, "_tick_engine", None)
+            quote = tick_engine.get(symbol) if tick_engine is not None else None
+            if quote is not None:
+                snapshot["bid"] = float(getattr(quote, "bid", 0.0) or 0.0) or None
+                snapshot["ask"] = float(getattr(quote, "ask", 0.0) or 0.0) or None
+                snapshot["last"] = float(getattr(quote, "last", 0.0) or getattr(quote, "price", 0.0) or 0.0) or None
+                snapshot["spread_percent"] = float(getattr(quote, "spread_percent", 0.0) or 0.0) or None
+            config = self.config
+            spread = float(snapshot.get("spread_percent") or 0.0)
+            snapshot["round_trip_cost_percent"] = round(
+                config.fee_rate * 200.0 + spread + config.slippage_percent * 2.0, 5
+            )
+            return {k: v for k, v in snapshot.items() if v is not None}
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def _audit_reject(self, candidate: Any, symbol: str, reason: str, stage: str, audit_id: str) -> None:
+        try:
+            scan = audit.current_scan()
+            if scan is not None:
+                scan.reject(reason)
+            direction = str(getattr(candidate, "direction", "") or "").upper()
+            audit.reject(
+                symbol, reason, stage=stage, engine_mode=self.config.engine_mode,
+                correlation_id=audit_id or None, scan_id=scan.scan_id if scan is not None else None,
+                filters=self._audit_filter_map(stage), direction=direction or None,
+                decision="skip", **self._audit_snapshot(candidate, symbol),
+            )
+        except Exception:  # noqa: BLE001 - لاگ هرگز ورود را متوقف نمی‌کند
+            pass
+
+    def _audit_accept(self, candidate: Any, symbol: str, direction: str, audit_id: str, **plan: Any) -> None:
+        """سیگنال → نامزد → اعتبارسنجی برای نامزدی که از همهٔ دروازه‌ها گذشت."""
+        try:
+            scan = audit.current_scan()
+            scan_id = None
+            if scan is not None:
+                scan.final_candidates += 1
+                scan_id = scan.scan_id
+            snapshot = self._audit_snapshot(candidate, symbol)
+            mode = self.config.engine_mode
+            intelligence = getattr(candidate, "intelligence", None)
+            audit.emit(
+                "signal", f"Signal {direction} {symbol} ({mode})", category=audit.LogCategory.SIGNALS,
+                symbol=symbol, correlation_id=audit_id, scan_id=scan_id, direction=direction,
+                source=snapshot.get("strategy") or mode,
+                technical_confidence=snapshot.get("technical_confidence"),
+                intelligence=dict(intelligence) if isinstance(intelligence, dict) and intelligence else None,
+            )
+            audit.candidate(symbol, direction, engine_mode=mode, correlation_id=audit_id, scan_id=scan_id,
+                            **snapshot)
+            execution = dict(plan.pop("execution", None) or {})
+            audit.emit(
+                "validation", f"All entry gates passed {symbol}", category=audit.domain_category(mode),
+                symbol=symbol, correlation_id=audit_id, scan_id=scan_id,
+                filters={stage: "pass" for stage in self.AUDIT_STAGES}, decision="enter",
+                bid=execution.get("bid"), ask=execution.get("ask"),
+                spread_percent=execution.get("spread_percent"), **plan,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _audit_exit_decision(self, managed: ManagedTrade, reason: str, price: float) -> None:
+        """وضعیت بازار و سیگنال لحظهٔ تصمیم خروج (گام Monitoring خط زمانی)."""
+        try:
+            fields: dict[str, Any] = {"exit_reason": reason, "decision_price": price,
+                                      "target": managed.target_price, "stop": managed.stop_price}
+            tick_engine = getattr(self, "_tick_engine", None)
+            quote = tick_engine.get(managed.symbol) if tick_engine is not None else None
+            if quote is not None:
+                fields["bid"] = float(getattr(quote, "bid", 0.0) or 0.0) or None
+                fields["ask"] = float(getattr(quote, "ask", 0.0) or 0.0) or None
+                fields["spread_percent"] = float(getattr(quote, "spread_percent", 0.0) or 0.0) or None
+            source = getattr(self, "_invalidation_source", None)
+            if source is not None and self.config.engine_mode != "ultra":
+                try:
+                    fields["signal_direction_at_exit"] = str(source(managed.symbol) or "").upper() or None
+                except Exception:  # noqa: BLE001
+                    pass
+            fields["trade_direction"] = "LONG" if managed.is_long else "SHORT"
+            audit.timeline(managed.trade_id, "exit_decision", f"Exit decision #{managed.trade_id}: {reason}",
+                           symbol=managed.symbol, **fields)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _record_opportunity(
         self, candidate: Any, *, decision: str, reason: str
@@ -1520,19 +1716,50 @@ class AutoTrader:
         allowed = self._allowed_symbols()
         started = time.monotonic()
         self._round_rejections = {}
-        candidates = await self._candidate_source()
-        held = {trade.symbol for trade in self._open.values()}
-        opened = 0
-        for candidate in candidates:
-            if len(self._open) >= self.config.max_concurrent:
-                break
-            # هرگز دو معامله روی یک نماد.
-            if getattr(candidate, "symbol", "") in held:
-                continue
-            if allowed is not None and getattr(candidate, "symbol", "") not in allowed:
-                continue
-            if await self.open_trade(candidate) is not None:
-                opened += 1
+        # نسخهٔ ۲.۶.۰: منبع نامزد و دروازه‌ها در همین شیء می‌شمارند (فقط ثبت)
+        # خرابی لایهٔ ممیزی هرگز پویش را متوقف نمی‌کند.
+        try:
+            diagnostics = audit.ScanDiagnostics(engine=str(getattr(self.config, "engine_mode", "") or ""))
+            scope = audit.scan_scope(diagnostics)
+        except Exception:  # noqa: BLE001
+            diagnostics, scope = None, contextlib.nullcontext()
+
+        def note(reason: str, count: int = 1) -> None:
+            if diagnostics is not None:
+                try:
+                    diagnostics.reject(reason, count)
+                except Exception:  # noqa: BLE001
+                    pass
+
+        with scope:
+            candidates = await self._candidate_source()
+            source_seconds = time.monotonic() - started
+            if diagnostics is not None:
+                diagnostics.source_candidates = len(candidates)
+            held = {trade.symbol for trade in self._open.values()}
+            opened = 0
+            for index, candidate in enumerate(candidates):
+                if len(self._open) >= self.config.max_concurrent:
+                    note("max_concurrent", len(candidates) - index)
+                    break
+                # هرگز دو معامله روی یک نماد.
+                if getattr(candidate, "symbol", "") in held:
+                    note("symbol_already_open")
+                    continue
+                if allowed is not None and getattr(candidate, "symbol", "") not in allowed:
+                    note("symbol_not_selected")
+                    continue
+                if await self.open_trade(candidate) is not None:
+                    opened += 1
+        if diagnostics is not None:
+            try:
+                diagnostics.opened_trades = opened
+                diagnostics.seconds = time.monotonic() - started
+                audit.scan_summary(diagnostics)
+                audit.performance("scan_source", source_seconds, engine=diagnostics.engine,
+                                  candidates=len(candidates), slow_seconds=2.0)
+            except Exception:  # noqa: BLE001
+                pass
         rejections = sorted(self._round_rejections.items(), key=lambda item: -item[1])
         self.last_scan = {
             "at": time.time(),

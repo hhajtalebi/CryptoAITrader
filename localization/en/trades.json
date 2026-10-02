@@ -303,7 +303,9 @@
       "stale_candidate": "stale candidate",
       "symbol_not_selected": "not selected",
       "no_price": "no price"
-    }
+    },
+    "daily_limit": "Daily loss limit ($)",
+    "daily_limit_off": "Off"
   },
   "history_cols": {
     "opened": "Opened",

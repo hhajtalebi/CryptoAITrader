@@ -1146,6 +1146,14 @@ class TradesPage(BasePage):
         self.auto_hold_input.setSuffix(" s")
         self.auto_hold_input.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
+        # نسخهٔ ۲.۷.۰: سقف زیان روزانه (دلار)؛ صفر = خاموش
+        self.auto_daily_limit_input = QDoubleSpinBox()
+        self.auto_daily_limit_input.setRange(0.0, 1_000_000.0)
+        self.auto_daily_limit_input.setSingleStep(5.0)
+        self.auto_daily_limit_input.setDecimals(2)
+        self.auto_daily_limit_input.setSpecialValueText(self.tr_.tr("trades.auto.daily_limit_off"))
+        self.auto_daily_limit_input.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
         self.auto_confidence_input = QSpinBox()
         self.auto_confidence_input.setRange(50, 99)
         self.auto_confidence_input.setSuffix("٪")
@@ -1162,6 +1170,7 @@ class TradesPage(BasePage):
             ("trades.auto.leverage", self.auto_leverage_input),
             ("trades.auto.concurrent", self.auto_concurrent_input),
             ("trades.auto.max_hold", self.auto_hold_input),
+            ("trades.auto.daily_limit", self.auto_daily_limit_input),
             ("trades.auto.min_confidence", self.auto_confidence_input),
             ("trades.auto.source", self.auto_source_combo),
             ("trades.auto.poll", self.auto_poll_input),
@@ -1199,6 +1208,7 @@ class TradesPage(BasePage):
         self.auto_leverage_input.setValue(int(values.get("scalp.leverage", 10)))
         self.auto_concurrent_input.setValue(int(values.get("scalp.max_concurrent", 3)))
         self.auto_hold_input.setValue(int(float(values.get("scalp.max_hold_seconds", 900) or 900)))
+        self._set_spin(self.auto_daily_limit_input, values, "scalp.daily_loss_limit", 0.0)
         self.auto_confidence_input.setValue(int(values.get("scalp.min_confidence", 75)))
         index = self.auto_source_combo.findData(
             str(values.get("scalp.candidate_source", "confidence"))
@@ -1266,6 +1276,7 @@ class TradesPage(BasePage):
             "scalp.leverage": self.auto_leverage_input.value(),
             "scalp.max_concurrent": self.auto_concurrent_input.value(),
             "scalp.max_hold_seconds": self.auto_hold_input.value(),
+            "scalp.daily_loss_limit": self.auto_daily_limit_input.value(),
             "scalp.min_confidence": self.auto_confidence_input.value(),
             "scalp.candidate_source": self.auto_source_combo.currentData(),
             "scalp.poll_seconds": self.auto_poll_input.value(),

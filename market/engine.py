@@ -146,6 +146,8 @@ class MarketDataEngine:
         self._rest_failures = 0
         self._symbols: dict[str, SymbolInfo] = {}
         self._inflight: dict[str, asyncio.Task[Any]] = {}
+        # نسخهٔ ۲.۶.۲: اختلاف ساعت محلی با صرافی (ms، مثبت = محلی جلوتر)
+        self.exchange_clock_offset_ms = 0.0
         self._lock = asyncio.Lock()
         self._watchlist_subscriptions: set[str] = set()
         self._explicit_subscriptions: set[str] = set()
@@ -510,7 +512,7 @@ class MarketDataEngine:
         می‌شود و نتیجه برای مدت کوتاهی در حافظه نهان می‌ماند.
         """
         live = self._live_tickers.get(symbol)
-        if max_age_seconds > 0 and live is not None and self._ticker_is_fresh(live, max_age_seconds):
+        if max_age_seconds > 0 and live is not None and self._ticker_is_fresh(live, max_age_seconds, self._offset_seconds()):
             return live
 
         cache_key = MarketCache.make_key("ticker", self._provider.name, symbol)
@@ -529,16 +531,46 @@ class MarketDataEngine:
         return await self._deduplicated(cache_key, _fetch)
 
 
+    def _observe_clock(self, tickers: list[Ticker]) -> None:
+        """اختلاف ساعت از تازه‌ترین مهر دستهٔ کامل (نسخهٔ ۲.۶.۲)."""
+        import time
+
+        try:
+            stamps = [int(getattr(t, "timestamp", 0) or 0) for t in tickers or []]
+            stamps = [s if s > 10_000_000_000 else s * 1000 for s in stamps if s > 0]
+            if len(stamps) < 20:
+                return
+            sample = time.time() * 1000.0 - max(stamps)
+            if abs(sample) > 48 * 3600 * 1000.0:
+                return
+            self.exchange_clock_offset_ms = sample if abs(sample) >= 2000.0 else 0.0
+        except Exception:  # noqa: BLE001
+            logger.debug("Clock offset estimation failed", exc_info=True)
+
+    def _offset_seconds(self) -> float:
+        return float(getattr(self, "exchange_clock_offset_ms", 0.0) or 0.0) / 1000.0
+
     @staticmethod
-    def _ticker_is_fresh(ticker: Ticker, max_age: float = 15.0) -> bool:
-        """تیکر بدون زمان دیده‌شدن کهنه حساب نمی‌شود."""
+    def _ticker_is_fresh(ticker: Ticker, max_age: float = 15.0, clock_offset_seconds: float = 0.0) -> bool:
+        """تیکر بدون زمان دیده‌شدن کهنه حساب نمی‌شود؛ اختلاف ساعت محلی اصلاح می‌شود."""
         import time
 
         seen = int(getattr(ticker, "timestamp", 0) or 0)
         if seen <= 0:
             return True
         stamp = seen / 1000.0 if seen > 10_000_000_000 else float(seen)
+        stamp += float(clock_offset_seconds or 0.0)
         return -5 <= time.time() - stamp <= max_age
+
+    async def refresh_execution_book(self, symbol: str, tick_engine: Any) -> bool:
+        """
+        فقط دفتر سفارش (یک درخواست) → کش تیک. نسخهٔ ۲.۶.۱.
+
+        پیش‌خوانی اسکالپ فقط Bid/Ask لازم دارد؛ قبلاً همراهش تیکر هم
+        خوانده می‌شد و با شکست/کهنگیِ تیکر، دفترِ سالم دور ریخته می‌شد.
+        """
+        book = await asyncio.wait_for(self._provider.get_orderbook(symbol, depth=5), timeout=3.0)
+        return tick_engine.record_book(symbol, book) is not None
 
     async def refresh_execution_quote(self, symbol: str, tick_engine: Any) -> float:
         """REST واقعی، بدون کش؛ روی همان صرافی و در نخ asyncio وارد کش تیک می‌شود."""
@@ -547,13 +579,20 @@ class MarketDataEngine:
             asyncio.wait_for(self._provider.get_orderbook(symbol, depth=5), timeout=3.0),
             return_exceptions=True,
         )
+        # نسخهٔ ۲.۶.۱: دفتر سالم مستقل از نتیجهٔ تیکر ثبت می‌شود.
+        if not isinstance(book, BaseException) and book is not None:
+            try:
+                tick_engine.record_book(symbol, book)
+            except Exception:  # noqa: BLE001
+                logger.debug("record_book failed for %s", symbol, exc_info=True)
         if isinstance(ticker, BaseException):
             raise ticker
-        if not self._ticker_is_fresh(ticker, tick_engine.stale_after_ms / 1000):
+        offset_s = float(getattr(tick_engine, "clock_offset_ms", 0.0) or 0.0) / 1000.0 or self._offset_seconds()
+        if not self._ticker_is_fresh(ticker, tick_engine.stale_after_ms / 1000, offset_s):
             return 0.0
         tick_engine.record(symbol, ticker.last_price, source="rest",
                            exchange_ts=ticker.timestamp, change_percent=ticker.change_percent)
-        if not isinstance(book, BaseException):
+        if not isinstance(book, BaseException) and book is not None:
             tick_engine.record_book(symbol, book)
         return float(ticker.last_price)
 
@@ -565,7 +604,7 @@ class MarketDataEngine:
         هرگز قیمت حدسی برگردانده نمی‌شود.
         """
         live = self._live_tickers.get(symbol)
-        if live is not None and live.last_price > 0 and self._ticker_is_fresh(live):
+        if live is not None and live.last_price > 0 and self._ticker_is_fresh(live, 15.0, self._offset_seconds()):
             return live.last_price
 
         cache_key = MarketCache.make_key("price", self._provider.name, symbol)
@@ -614,6 +653,7 @@ class MarketDataEngine:
             tickers = await self._provider.get_all_tickers()
             # موفقیت REST یعنی واقعاً آنلاین هستیم، حتی اگر WebSocket افتاده باشد
             self._mark_rest_alive(True)
+            self._observe_clock(tickers)
             self.all_tickers_fetched_at = datetime.now(UTC)
             self._cache.set(cache_key, tickers, ttl_seconds=max(max_age_seconds, MIN_SHARED_CACHE_SECONDS))
             now = time.monotonic()

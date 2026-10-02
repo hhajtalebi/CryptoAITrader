@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from trading.universe import RotatingUniverse
 from typing import Any
 
-from app.logging import get_logger
+from app.logging import audit, get_logger
 
 logger = get_logger(__name__)
 
@@ -141,6 +141,19 @@ class ConfidenceCandidateSource:
                 candidates.append(candidate)
 
         candidates.sort(key=lambda item: item.score, reverse=True)
+        # نسخهٔ ۲.۶.۰ (فقط ثبت): پویش فقط سیگنال‌های بالای حد اطمینان را برمی‌گرداند،
+        # پس بقیهٔ نمادهای سالم «زیر حد اطمینان یا بدون جهت» شمرده می‌شوند.
+        try:
+            signal_count = len(getattr(result, "signals", []) or [])
+            scanned = int(getattr(result, "scanned", 0) or 0) or len(symbols or [])
+            failed = int(getattr(result, "failed", 0) or 0)
+            raw = max(0, scanned - failed)
+            audit.note_scan(scanned=scanned, raw=raw, reasons={
+                "data_error": failed,
+                "low_confidence": max(0, raw - signal_count) + max(0, signal_count - len(candidates)),
+            })
+        except Exception:  # noqa: BLE001
+            pass
         logger.info(
             "Confidence scan: %d signals, %d above %d%%",
             len(getattr(result, "signals", []) or []),

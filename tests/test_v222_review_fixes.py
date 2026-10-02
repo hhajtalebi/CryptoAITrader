@@ -57,6 +57,7 @@ CONFIG_VALUES = dict(
     max_total_margin_percent=20.0,
     edge_guard_enabled=False, edge_guard_min_trades=75,
     break_even_lock=0.3, reach_ratio=0.7, max_spread_stop_fraction=0.25,
+    diagnostic_only=True,
 )
 
 

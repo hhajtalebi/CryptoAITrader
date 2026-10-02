@@ -6,6 +6,7 @@
 (Mask) شوند.
 """
 
+from app.logging.categories import LogCategory
 from app.logging.logger import (
     LOG_LEVELS,
     SensitiveDataFilter,
@@ -13,4 +14,4 @@ from app.logging.logger import (
     get_logger,
 )
 
-__all__ = ["configure_logging", "get_logger", "SensitiveDataFilter", "LOG_LEVELS"]
+__all__ = ["configure_logging", "get_logger", "SensitiveDataFilter", "LOG_LEVELS", "LogCategory"]

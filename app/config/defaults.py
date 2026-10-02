@@ -190,6 +190,8 @@ class SettingKey(str, Enum):
     AUTOTRADE_BREAK_EVEN_LOCK = "scalp.break_even_lock"
     AUTOTRADE_REACH_RATIO = "scalp.reach_ratio"
     AUTOTRADE_MAX_SPREAD_STOP_FRACTION = "scalp.max_spread_stop_fraction"
+    #: نسخهٔ ۲.۶.۱ — حالت تشخیصی: همهٔ دروازه‌ها اجرا، هیچ معامله‌ای باز نمی‌شود
+    AUTOTRADE_DIAGNOSTIC_ONLY = "scalp.diagnostic_only"
     UI_TIMEZONE = "ui.timezone"
     EXCHANGE_ACTIVE = "exchange.active"
     MARKET_MANUAL_TOMAN_RATE = "market.manual_toman_rate"
@@ -397,7 +399,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     SettingKey.SCALP_MAX_CONCURRENT.value: 3,
     SettingKey.SCALP_MAX_HOLD.value: 900,
     SettingKey.SCALP_POLL_SECONDS.value: 5.0,
-    SettingKey.SCALP_DAILY_LOSS_LIMIT.value: 20.0,
+    SettingKey.SCALP_DAILY_LOSS_LIMIT.value: 0.0,  # ۲.۷.۰: صفر = خاموش
     SettingKey.SCALP_MIN_TURNOVER.value: 2000000.0,
     SettingKey.SCALP_MAX_SPREAD.value: 0.25,
     SettingKey.SCALP_SCAN_LIMIT.value: 25,
@@ -435,6 +437,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     SettingKey.AUTOTRADE_BREAK_EVEN_LOCK.value: 0.1,
     SettingKey.AUTOTRADE_REACH_RATIO.value: 0.5,
     SettingKey.AUTOTRADE_MAX_SPREAD_STOP_FRACTION.value: 0.33,
+    SettingKey.AUTOTRADE_DIAGNOSTIC_ONLY.value: False,
     # --- v2.2: پویش دائمی فرصت‌ها (مستقل از موتور معامله) ---
     SettingKey.AUTOTRADE_WATCH_SCAN_ENABLED.value: True,
     SettingKey.AUTOTRADE_WATCH_SCAN_INTERVAL.value: 20,

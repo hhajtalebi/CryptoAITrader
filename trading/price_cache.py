@@ -195,6 +195,18 @@ class TickQuote:
         }
 
 
+#: تحمل اختلاف ساعت؛ کمتر از این همان تأخیر عادی شبکه است (ms)
+CLOCK_SKEW_TOLERANCE_MS = 2000.0
+#: اختلاف ساعت بیش از این نامعقول است و نادیده گرفته می‌شود (۴۸ ساعت). نسخهٔ ۲.۶.۲:
+#: قبلاً ۶ ساعت بود؛ منطقهٔ زمانی اشتباه ویندوز (مثلاً ساعت ایران با منطقهٔ
+#: Pacific) ~۱۰٫۵ ساعت اختلاف می‌سازد و اصلاح هرگز اعمال نمی‌شد.
+MAX_CLOCK_OFFSET_MS = 48 * 3600 * 1000.0
+#: شمار نمونه‌های اختلاف ساعت برای میانه
+CLOCK_SAMPLES = 7
+#: دفتری که مهر صرافی‌اش (پس از اصلاح ساعت) از این قدیمی‌تر است رد می‌شود
+MAX_BOOK_SNAPSHOT_AGE_MS = 30_000.0
+
+
 class TickEngine:
     """
     انبار تیک زنده + پخش فوری به شنوندگان.
@@ -212,6 +224,54 @@ class TickEngine:
         self._ws_tick_count = 0
         self._last_tick_at_ms = 0.0
         self._latency_samples: deque[float] = deque(maxlen=200)
+        # نسخهٔ ۲.۶.۱: اختلاف ساعت سیستم کاربر با ساعت صرافی (ms؛ مثبت یعنی
+        # ساعت محلی جلوتر است). بدون این اصلاح، چند ثانیه اختلاف ساعت ویندوز
+        # همهٔ تیک‌های REST را «کهنه» و همهٔ دفترهای سفارش را رد می‌کرد.
+        self._clock_samples: deque[float] = deque(maxlen=CLOCK_SAMPLES)
+        self._clock_offset_ms = 0.0
+
+    # ------------------------------------------------------------------
+    # ساعت صرافی
+    # ------------------------------------------------------------------
+    @property
+    def clock_offset_ms(self) -> float:
+        """اختلاف اعمال‌شدهٔ ساعت محلی با صرافی (صفر یعنی هم‌گام)."""
+        return self._clock_offset_ms
+
+    def observe_exchange_clock(self, freshest_exchange_ts: Any, received_at_ms: float | None = None) -> float:
+        """
+        تخمین اختلاف ساعت از تازه‌ترین مهر زمانی یک دستهٔ REST.
+
+        تازه‌ترین نماد یک دستهٔ کامل تقریباً «همین حالا»ی صرافی است؛
+        فاصلهٔ آن با زمان دریافت = اختلاف ساعت + تأخیر شبکه. میانهٔ چند
+        نمونهٔ آخر استفاده می‌شود و زیر تحمل (۲ ثانیه) صفر می‌ماند تا
+        رفتار سیستم‌های هم‌گام هیچ تغییری نکند.
+        """
+        exchange_ms = _parse_exchange_ms(freshest_exchange_ts)
+        if exchange_ms is None:
+            return self._clock_offset_ms
+        received = float(received_at_ms) if received_at_ms is not None else _now_ms()
+        sample = received - exchange_ms
+        if abs(sample) > MAX_CLOCK_OFFSET_MS:
+            return self._clock_offset_ms
+        self._clock_samples.append(sample)
+        ordered = sorted(self._clock_samples)
+        median = ordered[len(ordered) // 2]
+        applied = median if abs(median) >= CLOCK_SKEW_TOLERANCE_MS else 0.0
+        if abs(applied - self._clock_offset_ms) >= 1000.0:
+            # یک خط در هر تغییر محسوس — کاربر در «مرکز لاگ» علت را می‌بیند
+            logger.warning(
+                "Exchange clock offset %+.1fs (local %s exchange); REST ticks/books corrected",
+                applied / 1000.0, "ahead of" if applied > 0 else "behind" if applied < 0 else "in sync with",
+            )
+        self._clock_offset_ms = applied
+        return self._clock_offset_ms
+
+    def _corrected_exchange_ms(self, exchange_ts: Any) -> float | None:
+        value = _parse_exchange_ms(exchange_ts)
+        if value is None:
+            return None
+        return value + self._clock_offset_ms
 
     # ------------------------------------------------------------------
     # ثبت داده
@@ -243,7 +303,7 @@ class TickEngine:
 
         received = received_at_ms if received_at_ms is not None else _now_ms()
         processed = _now_ms()
-        exchange_ms = _parse_exchange_ms(exchange_ts)
+        exchange_ms = self._corrected_exchange_ms(exchange_ts)
 
         previous = self._quotes.get(symbol)
         if exchange_ms is not None and exchange_ms > processed + 5000:
@@ -321,10 +381,15 @@ class TickEngine:
             # دفتر بدون تیک قبلی: قیمت میانی را به‌عنوان Last ثبت نکن —
             # عدد جعلی نیست. فقط ذخیرهٔ لایه‌ای بی‌معناست؛ رد می‌شود.
             return None
-        stamp = _parse_exchange_ms(getattr(book, "timestamp", None)) or _now_ms()
-        if bid <= 0 or ask < bid or not all(math.isfinite(v) for v in (bid, ask)) or _now_ms() - stamp > 10_000:
+        # نسخهٔ ۲.۶.۱: دفتری که همین حالا رسیده تازه است؛ مهر صرافی (پس از
+        # اصلاح اختلاف ساعت) فقط برای رد عکسِ واقعاً کهنه به کار می‌رود.
+        now = _now_ms()
+        exchange_stamp = self._corrected_exchange_ms(getattr(book, "timestamp", None))
+        if bid <= 0 or ask < bid or not all(math.isfinite(v) for v in (bid, ask)):
             return quote
-        quote.book_ts_ms = stamp
+        if exchange_stamp is not None and now - exchange_stamp > MAX_BOOK_SNAPSHOT_AGE_MS:
+            return quote
+        quote.book_ts_ms = now
         quote.bid = bid
         quote.ask = ask
         quote.bid_depth = bid_depth
@@ -431,6 +496,7 @@ class TickEngine:
             ),
             "last_tick_symbol": last.symbol if last else None,
             "stale_after_seconds": self.stale_after_ms / 1000.0,
+            "clock_offset_ms": round(self._clock_offset_ms, 0),
         }
 
 

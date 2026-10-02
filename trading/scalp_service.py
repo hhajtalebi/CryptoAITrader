@@ -26,7 +26,7 @@ import asyncio
 import json
 from typing import Any
 
-from app.logging import get_logger
+from app.logging import audit, get_logger
 from trading.scalp_scanner import (
     DEFAULT_MIN_COST_MULTIPLE,
     ScalpCandidate,
@@ -106,8 +106,15 @@ class ScalpService:
         except (TypeError, ValueError):
             cost_multiple = DEFAULT_MIN_COST_MULTIPLE
         semaphore = asyncio.Semaphore(FETCH_CONCURRENCY)
+        # نسخهٔ ۲.۶.۰: شمارش دلیل رد هر نماد برای خلاصهٔ پویش (فقط ثبت)
+        reject_counts: dict[str, int] = {}
+        evaluated = 0
+
+        def count_reject(code: str) -> None:
+            reject_counts[code] = reject_counts.get(code, 0) + 1
 
         async def evaluate(ticker: Any) -> ScalpCandidate | None:
+            nonlocal evaluated
             async with semaphore:
                 try:
                     candles = await self._app.market.get_candles(ticker.symbol, "5m", 60)
@@ -115,13 +122,16 @@ class ScalpService:
                 except Exception:  # noqa: BLE001
                     # یک نماد خراب نباید کل پویش را متوقف کند.
                     logger.debug("Scalp data fetch failed for %s", ticker.symbol)
+                    count_reject("data_error")
                     return None
+                evaluated += 1
                 return score_candidate(
                     ticker,
                     candles,
                     spread=spread_from_orderbook(book),
                     max_spread=max_spread,
                     min_cost_multiple=cost_multiple,
+                    on_reject=count_reject,
                 )
 
         results = await asyncio.gather(
@@ -130,6 +140,7 @@ class ScalpService:
         candidates = [
             item for item in results if isinstance(item, ScalpCandidate)
         ]
+        audit.note_scan(scanned=len(shortlist), raw=evaluated, reasons=reject_counts)
         ranked = rank_candidates(candidates, limit=10)
         # نسخهٔ ۲.۵.۵: اسکنر نامزد پیدا می‌کند؛ جهت با شواهد چندتایم‌فریمی
         # (۱m/۵m/۱۵m/۱h/۴h + دفتر سفارش) تعیین می‌شود، نه فقط مومنتوم.
@@ -344,12 +355,13 @@ class ScalpService:
             max_concurrent=int(self._setting("scalp.max_concurrent", 3)),
             max_hold_seconds=int(self._setting("scalp.max_hold_seconds", 900)),
             poll_seconds=float(self._setting("scalp.poll_seconds", 5.0)),
-            daily_loss_limit=float(self._setting("scalp.daily_loss_limit", 20.0)),
+            daily_loss_limit=float(self._setting("scalp.daily_loss_limit", 0.0) or 0.0),
             edge_guard_enabled=self._bool_setting("scalp.edge_guard_enabled", True),
             edge_guard_min_trades=int(self._setting("scalp.edge_guard_min_trades", 50) or 50),
             break_even_lock=float(self._setting("scalp.break_even_lock", 0.1)),
             reach_ratio=float(self._setting("scalp.reach_ratio", 0.5)),
             max_spread_stop_fraction=float(self._setting("scalp.max_spread_stop_fraction", 0.33)),
+            diagnostic_only=self._bool_setting("scalp.diagnostic_only", False),
             mode=str(self._setting("scalp.mode", "paper")),
             live_confirmation=str(self._setting("scalp.live_confirmation", "")),
             fee_rate=float(0.0006 if fee_rate is None else fee_rate),

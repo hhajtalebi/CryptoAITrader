@@ -3162,6 +3162,61 @@ OpenAI پس بدون کلاس تازه. ۸ مدل پیشنهادی از کاتا
 - ابزارها: `tools/scalp_diagnostics.py`، `tools/signal_diagnostics.py`. گزارش: `docs/RELEASE_2.5.6_FA.md`.
 
 
+## نسخهٔ 2.6.3 — طوفان تعویض دامنهٔ REST (2026-10-01)
+- لاگ کاربر پس از ۲.۶.۲ (ساعت درست شده بود، ‎+03:30): همهٔ درخواست‌های REST با ConnectError روی هر سه دامنه، هر ~۰٫۳ ثانیه
+  یک «switching»، و ClosedResourceError در ping/کندل؛ WebSocket وصل؛ ۱۰۳۷ نماد stale.
+- علت: `LBankRestClient._rotate_base_url` کلاینت مشترک را فوراً `aclose` می‌کرد و هر شکست هم‌زمان دوباره دامنه را می‌چرخاند.
+  شبیه‌سازی (۳۰ درخواست هم‌زمان، فقط یک دامنه خراب): قدیم ۳۵ تعویض و ۳ شکست؛ جدید ۱ تعویض و ۳۰/۳۰ موفق.
+- اصلاح: چرخش فقط اگر `failed_host == base_url`؛ کلاینت قدیمی در `_retired` و ۳۰ ثانیه بعد بسته می‌شود (و در `close()`)؛
+  `anyio.ClosedResourceError`/`BrokenResourceError` ← NetworkError قابل تکرار بدون تعویض دامنه.
+- لاگ‌ها: «Timeframe crashed» و «Unexpected failure in task» حالا نام کلاس و متن خطا را دارند.
+- آزمون: `tests/test_v262_rest_rotation.py` (۵). گزارش: `docs/RELEASE_2.6.3_FA.md`.
+
+## نسخهٔ 2.6.2 — ساعت ویندوز ~۱۰٫۵ ساعت جلوتر (2026-10-01)
+- لاگ کاربر پس از ۲.۶.۱ هنوز ۱۰۳۸ stale و no_orderbook. مقایسه با زمان واقعی LBank (`fetch_page` روی
+  `api.lbkex.com/v2/timestamp.do`): لاگ `20:44 -07:00` = 03:44 UTC، زمان واقعی ~17:14 UTC ← ساعت محلی ~۱۰٫۴ ساعت جلوتر
+  (ساعت ایران با منطقهٔ Pacific). `MAX_CLOCK_OFFSET_MS` ۶ ساعت بود و نمونه رد می‌شد. مهرهای LBank (حتی `symbol=all` و
+  نمادهای بی‌حجم) همه ~۱ ثانیه تازه‌اند؛ پس REST سالم بود.
+- `MAX_CLOCK_OFFSET_MS` = ۴۸ ساعت؛ `MarketDataEngine._observe_clock` (از دستهٔ کامل، ≥۲۰ مهر) ←
+  `exchange_clock_offset_ms`، `_offset_seconds()` در همهٔ `_ticker_is_fresh`ها و fallback در `refresh_execution_quote`.
+- `MainController._check_clock_skew` (در `log_health`، بیش از ۶۰ ثانیه، یک‌بار برای هر مقدار) ← toast و status با
+  کلیدهای `common.clock_skew_warning` / `clock_ahead` / `clock_behind`.
+- آزمون: `tests/test_v262_clock_skew.py` (۱۱). گزارش: `docs/RELEASE_2.6.2_FA.md`.
+- هشدار: سایر بخش‌های وابسته به ساعت (زمان سیگنال، کندل جاری، پیگیری نتیجهٔ سیگنال) فقط با درست کردن ساعت ویندوز
+  کاملاً درست می‌شوند.
+
+## نسخهٔ 2.6.1 — رفع «اسکالپ معامله باز نمی‌کند» (2026-10-01)
+- علت از لاگ کاربر: ۱۰۳۶/۱۰۴۳ نماد stale و no_orderbook دائمی. (۱) تیک REST مهر ساعت صرافی دارد و تیک WS ندارد
+  (parser خط ۲۴۵ timestamp=0)، پس اختلاف ساعت ویندوز همهٔ REST را کهنه و همهٔ دفترها را رد می‌کرد. (۲) `refresh_execution_quote`
+  با شکست/کهنگی تیکر دفتر سالم را دور می‌ریخت. (۳) `AsyncRunner` کوروتینِ در حال اجرا را close می‌کرد
+  («cannot reuse already awaited coroutine») و نوسازی دفتر ترمینال هر ۵ ثانیه کشته می‌شد. (۴) پیش‌خوانی دو درخواستی بود
+  (PoolTimeout). (۵) `_turnovers` اولترا هر ثانیه منتظر REST بود.
+- `TickEngine.observe_exchange_clock(freshest_ts, received_ms)` (میانهٔ ۷ نمونه، تحمل ۲ ثانیه، سقف ۶ ساعت)،
+  `clock_offset_ms`، `_corrected_exchange_ms`؛ `record_book`: book_ts = زمان دریافت، رد فقط اگر عکس اصلاح‌شده >۳۰ ثانیه.
+  کنترلر `_on_price_update` با هر دستهٔ REST (≥۲۰ نماد) کالیبره می‌کند.
+- `MarketDataEngine.refresh_execution_book` (فقط دفتر)؛ `refresh_execution_quote` دفتر را مستقل ثبت می‌کند.
+- `AutoTrader.set_book_source` + `BOOK_PREFETCH_RETRY_SECONDS=3`؛ `AutoTradeConfig.diagnostic_only` (تنظیم
+  `scalp.diagnostic_only`، کد ممیزی `diagnostic_only`، رویداد `diagnostic_pass`).
+- `AsyncRunner._close_if_unstarted` (روی نخ حلقه، فقط CORO_CREATED)؛ «shielded future» + خطای شبکه → DEBUG.
+- `_refresh_orderbooks` اگر `terminal-orderbook` فعال است رد می‌شود؛ `ultra_tickers` با max_age=5؛ کش گردش اولترا
+  (`TURNOVER_TTL_SECONDS=30`، انتظار اول ۳ ثانیه)؛ استخر httpx ‏۲۰/۱۰.
+- هیچ آستانه‌ای عوض نشده. آزمون: `tests/test_v261_scalp_fix.py` (۳۱). گزارش: `docs/RELEASE_2.6.1_FA.md`.
+
+## نسخهٔ 2.6.0 — سیستم لاگ و تشخیص معاملات (2026-10-01)
+- فقط ثبت؛ هیچ استراتژی/آستانه/فیلتری عوض نشده. پایه برای اصلاح اسکالپ در ۲.۶.۱.
+- `app/logging/categories.py` (۱۲ دسته، `category_for_logger`)، `structured.py` (`setup_structured_logging`، `SafeQueueHandler`
+  put_nowait، `CategoryRouterHandler` ← `data/logs/<دسته>/<دسته>-YYYY-MM-DD[.N].jsonl` ۱۰MB/۱۴ روز/۶۰ فایل، ERROR+ ← errors/،
+  audit ← audit/، `LogBuffer.since(seq)`، `read_log_files`)، `audit.py` (کدهای استاندارد رد + `normalize_reason`/`reason_bucket`،
+  `ScanDiagnostics`/`scan_scope`/`note_scan`، `reject` با حذف تکرار ۳۰ ثانیه، `scan_summary` تجمیعی هر ۱۰ ثانیه)،
+  `audit_store.py` (نوشتن دسته‌ای SQLite در رشتهٔ پس‌زمینه)، `query.py` (`LogFilter`، `timeline_stages`، `export_events`).
+- جدول `audit_events` (`AuditEventRecord`) + `AuditRepository` (`query`/`timeline`/`scan_summaries`/`recent_trade_ids`/`purge`).
+- قلاب‌ها: `TradeRepository.open_trade/close_trade/partial_close` (پس از commit)، `AutoTrader._open_trade_locked`
+  (`audit_id` در extra، `progress["stage"]`، `_audit_reject`/`_audit_accept`/`_audit_exit_decision`)، `_scan_for_entries` (scan_scope)،
+  `score_candidate(on_reject=)`، `scalp_service`/`ultra_scalp`/`confidence_source` ← `note_scan`، کنترلر ← `target_infeasible`.
+- لاگر `audit` وقتی لایهٔ ساختاریافته فعال است propagate=False (کنسول و app.log پر نمی‌شوند).
+- UI: `ui/pages/log_center_page.py` (`LogCenterPage`، `nav.logs` پس از گزارش‌ها، آیکون `logs`)، `localization/*/logs.json`.
+- آزمون: `tests/test_v260_logging.py` (۵۴). گزارش: `docs/RELEASE_2.6.0_FA.md`.
+
 ## نسخهٔ 2.5.9 — معاملهٔ دستی، اولامای کارا، APK روی WSL بدون توزیع (2026-10-01)
 - معاملهٔ دستی: `trading/manual_order.py` (`plan_manual_order`، `prefill_from_signal`، `normalize_symbol` ← `BTC/USDT`، اهرم ۱..۱۰۰،
   اسپات بدون اهرم/شورت، خطا/هشدار با کلید ترجمه `trades.manual.*`) + `ui/dialogs/manual_trade_dialog.py` (`ManualTradeDialog`).

@@ -303,7 +303,9 @@
       "stale_candidate": "نامزد کهنه",
       "symbol_not_selected": "نماد انتخاب نشده",
       "no_price": "بدون قیمت"
-    }
+    },
+    "daily_limit": "سقف زیان روزانه ($)",
+    "daily_limit_off": "خاموش"
   },
   "history_cols": {
     "opened": "زمان باز شدن",

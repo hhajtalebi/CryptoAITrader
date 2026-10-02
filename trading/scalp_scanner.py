@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import math
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from typing import Any
@@ -217,29 +218,41 @@ def score_candidate(
     max_volatility: float = DEFAULT_MAX_VOLATILITY,
     max_spread: float = DEFAULT_MAX_SPREAD,
     min_cost_multiple: float = DEFAULT_MIN_COST_MULTIPLE,
+    on_reject: Callable[[str], None] | None = None,
 ) -> ScalpCandidate | None:
     """
     امتیازدهی یک نماد. `None` یعنی برای اسکلپ مناسب نیست.
 
     رد کردن یک نماد یک نتیجهٔ درست است، نه شکست — درست مثل «منتظر» در
     موتور سیگنال اصلی.
+
+    `on_reject` (نسخهٔ ۲.۶.۰، اختیاری): کد استاندارد دلیل رد را می‌گیرد تا
+    خلاصهٔ پویش بداند هر نماد کجا افتاد. منطق و آستانه‌ها تغییری نکرده‌اند.
     """
+    def rejected(code: str) -> None:
+        if on_reject is not None:
+            try:
+                on_reject(code)
+            except Exception:  # noqa: BLE001 - شمارش نباید امتیازدهی را بشکند
+                pass
+        return None
+
     volatility = recent_volatility(candles)
     if volatility < min_volatility:
-        return None  # آرام‌تر از آن است که سودی بدهد
+        return rejected("low_volatility")  # آرام‌تر از آن است که سودی بدهد
     if volatility > max_volatility:
-        return None  # آشفته‌تر از آن است که حد ضرر معنا داشته باشد
+        return rejected("high_volatility")  # آشفته‌تر از آن است که حد ضرر معنا داشته باشد
 
     if spread > max_spread:
-        return None  # اسپرد سود را می‌بلعد
+        return rejected("wide_spread")  # اسپرد سود را می‌بلعد
 
     cost = ROUND_TRIP_FEE_PERCENT + spread
     if min_cost_multiple > 0 and volatility < min_cost_multiple * cost:
-        return None  # نوسان نسبت به هزینه کوچک است؛ هزینه بر نتیجه غالب می‌شود
+        return rejected("cost_too_high")  # نوسان نسبت به هزینه کوچک است؛ هزینه بر نتیجه غالب می‌شود
 
     move = momentum_percent(candles)
     if abs(move) < 0.05:
-        return None  # بدون جهت روشن
+        return rejected("no_direction")  # بدون جهت روشن
 
     direction = "LONG" if move > 0 else "SHORT"
 
@@ -257,7 +270,7 @@ def score_candidate(
 
     if expected_net <= 0:
         reasons.append("پس از کارمزد سودی نمی‌ماند")
-        return None
+        return rejected("negative_expectancy")
     breakeven = (volatility * 0.6 + cost) / (2.0 * volatility * 0.6) * 100.0
     reasons.append(f"هزینهٔ رفت‌وبرگشت {cost:.2f}٪ — برد لازم برای سربه‌سر: {breakeven:.0f}٪")
 

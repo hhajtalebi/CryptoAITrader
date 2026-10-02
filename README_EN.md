@@ -2,11 +2,30 @@
 
 **Professional desktop app for crypto market analysis and futures signal generation**
 
-Version 2.5.9 · Windows 10/11 · Python 3.11+ (tested up to 3.13) · Persian & English
+Version 2.6.3 · Windows 10/11 · Python 3.11+ (tested up to 3.13) · Persian & English
 
 [راهنمای فارسی](README.md)
 
-> **Current delivery 2.5.9:** manual "Open trade" window (symbol, amount from balance, spot/futures, leverage 1–100,
+> **Current delivery 2.6.3:** REST host-rotation storm fixed — one connect error used to close the shared HTTP client
+> under every concurrent request, each of which rotated the host again (endless ConnectError/ClosedResourceError while the
+> WebSocket stayed up). Now one rotation per failing host, old clients closed after 30 s. [Report](docs/RELEASE_2.6.3_FA.md).
+>
+> **Previous delivery 2.6.2:** the user's Windows clock was ~10.5 h ahead of the exchange (wrong time zone). The 2.6.1
+> clock correction ignored offsets above 6 h, so every REST tick/book still looked 10 hours old. Cap raised to 48 h, the
+> market engine corrects too, and the app shows a one-time warning. [Report](docs/RELEASE_2.6.2_FA.md).
+>
+> **Previous delivery 2.6.1:** scalp fix — the user's log showed 1036 of 1043 symbols "stale" and every order book
+> rejected. Causes: local clock vs exchange clock offset (now measured and corrected), a good order book discarded whenever
+> the ticker request failed, a background-runner bug ("cannot reuse already awaited coroutine") that killed every order-book
+> refresh, two REST calls per prefetch (pool timeouts), and Ultra waiting on a full-market REST call every second.
+> New paper-only diagnostic mode (`scalp.diagnostic_only`). No threshold lowered. [Report](docs/RELEASE_2.6.1_FA.md).
+>
+> **Previous delivery 2.6.0:** logging & trading diagnostics — structured logs in 12 categories (`data/logs/<category>/`,
+> daily + size rotation), audit of every signal/candidate/rejection (standard reason code + market snapshot)/entry/exit,
+> per-scan summary (Scanned/Raw/Rejected/Final/Opened), per-trade timeline in the existing SQLite, and a "Log Center" page
+> with filters, search, copy and export. No strategy or threshold changed. [Report](docs/RELEASE_2.6.0_FA.md).
+>
+> **Previous delivery 2.5.9:** manual "Open trade" window (symbol, amount from balance, spot/futures, leverage 1–100,
 > TP/SL) from the Trades page, trade history and signal details; local Ollama that actually answers (reasoning models,
 > auto-start, real generation test); APK build guidance and Ubuntu auto-install when WSL has no distro. [Report](docs/RELEASE_2.5.9_FA.md).
 >

@@ -90,5 +90,8 @@
   "updated_at": "آخرین به‌روزرسانی",
   "volume": "حجم",
   "yes": "بله",
-  "unclean_exit": "نشست قبلی برنامه پس از {hours} ساعت ناگهان بسته شد (حافظه: {memory} مگابایت). علت در فایل‌های app.log و crash.log در {path} ثبت شده است؛ لطفاً آن‌ها را بفرستید."
+  "unclean_exit": "نشست قبلی برنامه پس از {hours} ساعت ناگهان بسته شد (حافظه: {memory} مگابایت). علت در فایل‌های app.log و crash.log در {path} ثبت شده است؛ لطفاً آن‌ها را بفرستید.",
+  "clock_skew_warning": "ساعت ویندوز شما {hours} ساعت با زمان صرافی اختلاف دارد ({direction}). داده‌های بازار اصلاح می‌شوند، ولی لطفاً منطقهٔ زمانی و ساعت ویندوز را درست کنید (Settings ← Time & language ← Set time zone و Sync now).",
+  "clock_ahead": "جلوتر",
+  "clock_behind": "عقب‌تر"
 }
