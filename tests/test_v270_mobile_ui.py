@@ -145,8 +145,19 @@ def test_new_modules_stay_light() -> None:
         assert "kivymd" not in src  # بدون دستور ساخت اضافه روی اندروید
 
 
-def test_mobile_version_bumped() -> None:
-    assert '"2.7.0"' in (ROOT / "mobile" / "version.py").read_text(encoding="utf-8")
+def test_mobile_version_matches_the_app() -> None:
+    """
+    نسخهٔ موبایل باید با نسخهٔ برنامه یکی باشد.
+
+    پیش‌تر این آزمون رشتهٔ ثابت «2.7.0» را می‌خواست؛ یعنی با هر ارتقای
+    نسخه، آزمون شکست می‌خورد و کسی باید دستی عدد را عوض می‌کرد. حالا
+    منبع حقیقت همان `APP_VERSION` است، پس آزمون با هر نسخه‌ای درست است
+    و در عوض **ناهماهنگیِ واقعی** را می‌گیرد (مثلاً موبایل جا بماند).
+    """
+    from app.core.constants import APP_VERSION
+
+    text = (ROOT / "mobile" / "version.py").read_text(encoding="utf-8")
+    assert f'"{APP_VERSION}"' in text, f"نسخهٔ موبایل با {APP_VERSION} یکی نیست"
 
 
 # ---------------------------------------------------------------- اجرای کامل رابط (بی‌سر)

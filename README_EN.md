@@ -2,11 +2,22 @@
 
 **Professional desktop app for crypto market analysis and futures signal generation**
 
-Version 2.7.0 · Windows 10/11 · Python 3.11+ (tested up to 3.13) · Persian & English
+Version 2.7.1 · Windows 10/11 · Python 3.11+ (tested up to 3.13) · Persian & English
 
 [راهنمای فارسی](README.md)
 
-> **Current delivery 2.7.0:** new 5-screen mobile UI + cloud APK build; configurable daily loss limit (0 = off);
+> **Current delivery 2.7.1 (debug, fixes, optimisation):**
+> A real financial-risk bug is fixed — the autonomous agent's “time is up” branch used to store the model's
+> output **without running the validator**, bypassing the leverage cap, stop-loss side and confidence range.
+> Ollama stability: changing settings or the timeout is no longer silently ignored, a service that disappears
+> mid-probe reports a readable message, and half-streamed text is no longer printed twice. End-to-end tracing:
+> every signal run gets a correlation id and logs data/indicators/voting/risk and the final accept-or-reject
+> reason under the SIGNALS category. On the signal page the **real origin** of the result (model or math
+> engine) is now shown, and engine output is never labelled as AI. Backtest: anti-look-ahead integrity tests.
+> Test suite: **2,938 passed, 0 failures, 0 errors** (72 new tests; 5 standing errors fixed). No new
+> dependencies. [Full report](docs/RELEASE_2.7.1_FA.md).
+>
+> **Previous delivery 2.7.0:** new 5-screen mobile UI + cloud APK build; configurable daily loss limit (0 = off);
 > Windows-log fixes: R/R 1.50 < 1.5 rounding rejection, BBANDS crash on flat markets, websockets TLS-cleanup noise,
 > REST circuit breaker (proxy/direct fallback, pause instead of endless host rotation, real error text logged).
 > [Report](docs/RELEASE_2.7.0_FA.md).
