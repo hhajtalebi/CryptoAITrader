@@ -3215,6 +3215,7 @@ class MainController(QObject):
             self.signals.show_signal(payload)
             self._save_agent_signal(outcome, symbol, timeframe)
             self._load_signal_history()
+            self._announce_signal_origin(outcome)
 
             if outcome.direction == "WAIT":
                 self.status(self.tr_.tr("signals.wait_result", symbol=symbol))
@@ -4002,6 +4003,33 @@ class MainController(QObject):
             ),
         )
 
+    def _announce_signal_origin(self, outcome: Any) -> None:
+        """
+        نشان دادن **منبع واقعی** نتیجه روی نوارِ مسیر عامل.
+
+        چرا لازم است؟ کاربر حق دارد بداند این سیگنال را مدل زبانی ساخته یا
+        موتور ریاضی. اگر عامل خودمختار به هر دلیل پاسخ مدل را رد کرده و از
+        شاهدِ آمادهٔ موتور استفاده کرده باشد، برچسب «هوش مصنوعی» روی آن
+        دروغ است — حتی اگر کاربر تیک هوش مصنوعی را زده باشد. پیام همیشه
+        نام مدل را می‌گوید تا تشخیص «کدام مدل واقعاً جواب داد» ممکن باشد.
+        """
+
+        source = str(getattr(outcome, "source", "") or "").lower()
+        model = str(getattr(outcome, "model", "") or "").strip()
+        provider = str(getattr(outcome, "provider", "") or "").strip()
+        trail = getattr(self.signals, "agent_trail", None)
+        if trail is None:
+            return
+        previous = str(trail.text() or "").strip()
+        if source == "ai" and model:
+            label = self.tr_.tr("signals.origin_ai", model=model)
+            if provider:
+                label = f"{provider} · {label}"
+        else:
+            label = self.tr_.tr("signals.origin_engine")
+        trail.setText(f"{previous} · {label}".strip(" ·") if previous else label)
+        trail.show()
+
     def _agent_outcome_to_signal(self, outcome: Any, symbol: str, timeframe: str) -> dict[str, Any]:
         """تبدیل خروجی عامل به قالبی که کارت سیگنال می‌فهمد."""
         decision = dict(outcome.decision or {})
@@ -4023,6 +4051,11 @@ class MainController(QObject):
             **self._analysis_payload(outcome.narrative),
             "ai_provider": outcome.provider,
             "ai_model": outcome.model,
+            # نسخهٔ ۲.۷.۱: منبع واقعی نتیجه. «fallback» یعنی موتور ریاضی
+            # (هوش مصنوعی شکست خورده یا پاسخش رد شده)؛ هرگز نباید با
+            # برچسب خروجی هوش مصنوعی نمایش داده شود.
+            "source": str(getattr(outcome, "source", "") or ""),
+            "trace_id": str(getattr(outcome, "trace_id", "") or ""),
             "created_at": format_datetime(now_local()),
         }
 

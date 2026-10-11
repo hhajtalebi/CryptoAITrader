@@ -34,9 +34,10 @@ from ai.providers.base import AIMessage
 from ai.recommendation import parse_recommendation, strip_recommendation_line
 from ai.providers.manager import AIProviderManager
 from ai.tools import MarketToolset, ToolResult
+from ai.trace import AITrace
 from app.core.constants import MIN_CANDLES_FOR_ANALYSIS, AnalysisStatus, Language
 from app.core.models import RiskParameters
-from app.exceptions import AIError, InsufficientDataError
+from app.exceptions import InsufficientDataError
 from app.logging import get_logger
 
 logger = get_logger(__name__)
@@ -91,6 +92,10 @@ class AnalysisResult:
     warnings: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     duration_seconds: float = 0.0
+    #: شناسهٔ ردیابی این اجرا در لاگ ساختاریافته (۲.۷.۱)
+    trace_id: str = ""
+    #: منبع نتیجه: `ai` اگر مدل پاسخ داد، وگرنه علتِ نبود پاسخ
+    source: str = "ai"
     #: توصیهٔ صریح خرید/فروش/انتظار که از آخرین خط پاسخ استخراج شده.
     #: `None` یعنی مدل آن را ننوشت — حدس نمی‌زنیم.
     recommendation: dict[str, Any] | None = None
@@ -117,6 +122,8 @@ class AnalysisResult:
             "warnings": self.warnings,
             "errors": self.errors,
             "duration_seconds": round(self.duration_seconds, 3),
+            "trace_id": self.trace_id,
+            "source": self.source,
             "created_at": self.created_at.isoformat(),
         }
 
@@ -294,17 +301,34 @@ class AIAnalyst:
         started = time.perf_counter()
         # وضعیت اولیه FAILED است تا هر مسیر خروج ناقص، به‌اشتباه موفق تلقی نشود
         result = AnalysisResult(symbol=request.symbol, status=AnalysisStatus.FAILED)
+        # ردیاب: شناسه‌ای که همهٔ رویدادهای این اجرا را در لاگ به هم وصل می‌کند
+        trace = AITrace("analysis", symbol=request.symbol)
+        result.trace_id = trace.trace_id
 
         market_data, tool_results = await self.collect_market_data(request)
         result.market_data = market_data
         result.tools_used = [r.tool for r in tool_results if r.ok]
         result.failed_tools = [f"{r.tool}: {r.error}" for r in tool_results if not r.ok]
+        trace.stage(
+            "data",
+            "market tools executed",
+            tools_ok=len(result.tools_used),
+            tools_failed=len(result.failed_tools),
+            timeframes=len(market_data.get("timeframes") or {}),
+        )
 
         if not market_data.get("timeframes"):
             result.status = AnalysisStatus.INSUFFICIENT_DATA
             result.errors.append("INSUFFICIENT_DATA: no timeframe could be analysed")
             result.duration_seconds = time.perf_counter() - started
+            result.source = "no_data"
             logger.warning("Analysis aborted for %s: no usable market data", request.symbol)
+            trace.warning(
+                "ai_insufficient_data",
+                "No timeframe could be analysed",
+                failed_tools=len(result.failed_tools),
+            )
+            trace.finish(False, "insufficient market data", status="INSUFFICIENT_DATA")
             return result
 
         fitted_data, completeness_note = self._fit_for_model(
@@ -326,6 +350,7 @@ class AIAnalyst:
         )
         result.prompt_version = template.identifier
 
+        trace.stage("prompt", "prompt built", prompt_chars=len(prompt))
         try:
             response = await self._providers.generate(
                 [
@@ -336,12 +361,30 @@ class AIAnalyst:
             )
         except Exception as exc:  # noqa: BLE001 - شکست مدل نباید برنامه را ببندد
             result.status = AnalysisStatus.FAILED
-            result.errors.append(f"{exc.__class__.__name__}: {getattr(exc, 'message', str(exc))}")
+            message = getattr(exc, "message", str(exc))
+            result.errors.append(f"{exc.__class__.__name__}: {message}")
             result.duration_seconds = time.perf_counter() - started
+            result.source = "ai_unavailable"
+            trace.error(
+                "ai_provider_failed",
+                f"{exc.__class__.__name__}: {message}"[:400],
+                stage="model",
+            )
             # سطح WARNING است نه ERROR: نبود سرویس هوش مصنوعی یک حالت
             # کاملاً پشتیبانی‌شده است و برنامه بدون آن هم کار می‌کند.
             logger.warning("AI analysis unavailable for %s: %s", request.symbol, exc.__class__.__name__)
+            trace.finish(False, "provider failed", status="FAILED")
             return result
+
+        trace.note(provider=response.provider, model=response.model)
+        trace.stage(
+            "model",
+            "model answered",
+            seconds=response.latency_seconds,
+            prompt_tokens=response.prompt_tokens,
+            completion_tokens=response.completion_tokens,
+        )
+        trace.raw("model_response", response.content, level="DEBUG")
 
         raw_content = strip_reasoning_block(response.content).strip()
 
@@ -366,6 +409,12 @@ class AIAnalyst:
         logger.info(
             "Analysis completed for %s via %s in %.2fs", request.symbol, response.provider, result.duration_seconds
         )
+        trace.finish(
+            True,
+            "analysis completed",
+            recommendation=bool(result.recommendation),
+            content_chars=len(result.content),
+        )
         return result
 
     # ------------------------------------------------------------------
@@ -387,11 +436,19 @@ class AIAnalyst:
         started = time.perf_counter()
         # وضعیت اولیه FAILED است تا هر مسیر خروج ناقص، به‌اشتباه موفق تلقی نشود
         result = AnalysisResult(symbol=request.symbol, status=AnalysisStatus.FAILED)
+        trace = AITrace("signal_json", symbol=request.symbol)
+        result.trace_id = trace.trace_id
 
         market_data, tool_results = await self.collect_market_data(request)
         result.market_data = market_data
         result.tools_used = [r.tool for r in tool_results if r.ok]
         result.failed_tools = [f"{r.tool}: {r.error}" for r in tool_results if not r.ok]
+        trace.stage(
+            "data",
+            "market tools executed",
+            tools_ok=len(result.tools_used),
+            tools_failed=len(result.failed_tools),
+        )
 
         usable = [
             tf for tf, payload in market_data.get("timeframes", {}).items() if payload.get("indicators")
@@ -402,6 +459,9 @@ class AIAnalyst:
                 f"INSUFFICIENT_DATA: fewer than {MIN_CANDLES_FOR_ANALYSIS} candles on every requested timeframe"
             )
             result.duration_seconds = time.perf_counter() - started
+            result.source = "no_data"
+            trace.warning("ai_insufficient_data", "No timeframe produced indicators")
+            trace.finish(False, "insufficient market data", status="INSUFFICIENT_DATA")
             return result
 
         fitted_data, completeness_note = self._fit_for_model(market_data, usable[-1])
@@ -428,6 +488,7 @@ class AIAnalyst:
             AIMessage("user", prompt),
         ]
 
+        trace.stage("prompt", "prompt built", prompt_chars=len(prompt))
         outcome: ValidationOutcome | None = None
         for attempt in range(self._max_repair_attempts + 1):
             try:
@@ -436,16 +497,40 @@ class AIAnalyst:
                 )
             except Exception as exc:  # noqa: BLE001
                 result.status = AnalysisStatus.FAILED
-                result.errors.append(f"{exc.__class__.__name__}: {getattr(exc, 'message', str(exc))}")
+                message = getattr(exc, "message", str(exc))
+                result.errors.append(f"{exc.__class__.__name__}: {message}")
                 result.duration_seconds = time.perf_counter() - started
+                result.source = "ai_unavailable"
+                trace.error(
+                    "ai_provider_failed",
+                    f"{exc.__class__.__name__}: {message}"[:400],
+                    stage="model",
+                    attempt=attempt + 1,
+                )
+                trace.finish(False, "provider failed", status="FAILED")
                 return result
 
             result.provider = response.provider
             result.model = response.model
             result.content = response.content.strip()
+            trace.note(provider=response.provider, model=response.model)
+            trace.stage(
+                "model",
+                f"model call {attempt + 1}",
+                attempt=attempt + 1,
+                seconds=response.latency_seconds,
+            )
+            trace.raw("model_response", response.content, level="DEBUG")
 
             outcome = self._validator.validate_signal(response.content, symbol=request.symbol)
             if outcome.valid:
+                trace.emit(
+                    "ai_validation",
+                    "signal JSON accepted",
+                    stage="validation",
+                    attempt=attempt + 1,
+                    signal=(outcome.data or {}).get("signal"),
+                )
                 break
 
             logger.warning(
@@ -453,6 +538,13 @@ class AIAnalyst:
                 response.provider,
                 attempt + 1,
                 outcome.error_text,
+            )
+            trace.warning(
+                "ai_validation",
+                f"invalid signal JSON: {outcome.error_text}"[:400],
+                stage="validation",
+                attempt=attempt + 1,
+                errors=len(outcome.errors),
             )
             if attempt >= self._max_repair_attempts:
                 break
@@ -471,6 +563,12 @@ class AIAnalyst:
             result.status = AnalysisStatus.FAILED
             result.errors.extend(outcome.errors if outcome else ["No response produced"])
             result.duration_seconds = time.perf_counter() - started
+            result.source = "invalid_output"
+            trace.finish(
+                False,
+                "the model never produced a valid signal object",
+                status="FAILED",
+            )
             return result
 
         result.structured = outcome.data
@@ -482,6 +580,12 @@ class AIAnalyst:
             request.symbol,
             outcome.data.get("signal"),
             outcome.data.get("confidence"),
+        )
+        trace.finish(
+            True,
+            f"signal {outcome.data.get('signal')} accepted",
+            signal=outcome.data.get("signal"),
+            confidence=outcome.data.get("confidence"),
         )
         return result
 

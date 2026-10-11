@@ -168,11 +168,38 @@ def tr():
     return Translator(language="fa")
 
 
-def test_dialog_prefill_payload_and_open(qtbot, tr) -> None:
+@pytest.fixture()
+def add_widget(qt_application):
+    """
+    ثبت یک ویجت برای پاک‌سازی پس از آزمون.
+
+    این پوشش جایگزین فیکسچر `qtbot` از بستهٔ pytest-qt است که هیچ‌گاه به
+    وابستگی‌های پروژه اضافه نشده بود؛ در نتیجه این پنج آزمون در هر اجرا
+    با خطای «fixture not found» از کار می‌افتادند و هرگز اجرا نمی‌شدند.
+    پاک‌سازی همان `destroy_window` سراسری را به کار می‌گیرد تا درخت
+    ویجت‌ها بین آزمون‌ها انباشته نشود.
+    """
+    created: list = []
+
+    def _add(widget):
+        created.append(widget)
+        return widget
+
+    yield _add
+    from tests.conftest import destroy_window
+
+    for widget in created:
+        try:
+            destroy_window(widget, qt_application)
+        except Exception:  # noqa: BLE001 - پاک‌سازی نباید آزمون را ببازد
+            pass
+
+
+def test_dialog_prefill_payload_and_open(add_widget, tr) -> None:
     from ui.dialogs.manual_trade_dialog import ManualTradeDialog
 
     dialog = ManualTradeDialog(tr, symbols=["BTC/USDT", "ETH/USDT"], available=500.0, fee_rate=0.0)
-    qtbot.addWidget(dialog)
+    add_widget(dialog)
     dialog.prefill({"symbol": "ETH/USDT", "direction": "SHORT", "entry": 2000.0,
                     "take_profit": 1900.0, "stop_loss": 2050.0, "leverage": 5})
     assert dialog.symbol() == "ETH/USDT"
@@ -190,11 +217,11 @@ def test_dialog_prefill_payload_and_open(qtbot, tr) -> None:
     assert received and received[0]["symbol"] == "ETH/USDT"
 
 
-def test_dialog_blocks_invalid_order(qtbot, tr) -> None:
+def test_dialog_blocks_invalid_order(add_widget, tr) -> None:
     from ui.dialogs.manual_trade_dialog import ManualTradeDialog
 
     dialog = ManualTradeDialog(tr, symbols=["BTC/USDT"], available=100.0, fee_rate=0.0)
-    qtbot.addWidget(dialog)
+    add_widget(dialog)
     dialog.prefill({"symbol": "BTC/USDT", "direction": "LONG", "entry": 100.0,
                     "take_profit": 90.0, "stop_loss": 95.0, "leverage": 10})
     dialog.apply_amount_percent(50)
@@ -205,11 +232,11 @@ def test_dialog_blocks_invalid_order(qtbot, tr) -> None:
     assert not dialog.plan().valid
 
 
-def test_dialog_set_price_fills_entry(qtbot, tr) -> None:
+def test_dialog_set_price_fills_entry(add_widget, tr) -> None:
     from ui.dialogs.manual_trade_dialog import ManualTradeDialog
 
     dialog = ManualTradeDialog(tr, symbols=["BTC/USDT"], available=100.0)
-    qtbot.addWidget(dialog)
+    add_widget(dialog)
     dialog.prefill({"symbol": "BTC/USDT"})
     dialog.set_price("BTC/USDT", 65000.5)
     assert dialog.payload()["entry"] == pytest.approx(65000.5)
@@ -218,11 +245,11 @@ def test_dialog_set_price_fills_entry(qtbot, tr) -> None:
     assert dialog.payload()["entry"] == pytest.approx(65000.5)
 
 
-def test_trades_page_has_open_trade_buttons(qtbot, tr) -> None:
+def test_trades_page_has_open_trade_buttons(add_widget, tr) -> None:
     from ui.pages.trades_page import TradesPage
 
     page = TradesPage(tr)
-    qtbot.addWidget(page)
+    add_widget(page)
     hits: list[bool] = []
     page.manual_trade_requested.connect(lambda: hits.append(True))
     page.manual_trade_button.click()
@@ -230,7 +257,7 @@ def test_trades_page_has_open_trade_buttons(qtbot, tr) -> None:
     assert len(hits) == 2
 
 
-def test_signal_detail_dialog_emits_manual_prefill(qtbot, tr) -> None:
+def test_signal_detail_dialog_emits_manual_prefill(add_widget, tr) -> None:
     from ui.dialogs.signal_detail_dialog import SignalDetailDialog
 
     signal = {
@@ -238,7 +265,7 @@ def test_signal_detail_dialog_emits_manual_prefill(qtbot, tr) -> None:
         "entry_max": 100.0, "stop_loss": 95.0, "take_profits": [105.0, 110.0], "leverage": 3,
     }
     dialog = SignalDetailDialog(signal, tr)
-    qtbot.addWidget(dialog)
+    add_widget(dialog)
     received: list[dict] = []
     dialog.manual_trade_requested.connect(received.append)
     dialog.manual_trade_button.click()

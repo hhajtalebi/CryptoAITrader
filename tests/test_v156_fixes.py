@@ -345,7 +345,9 @@ class TestDuplicateToolCalls:
         agent._max_iterations = 6
         agent._risk = type("R", (), {"max_leverage": 5, "min_risk_reward": 1.5})()
         agent._emit = lambda step: None
-        agent._finalise = lambda final, outcome: setattr(outcome, "decision", final)
+        # `_finalise` از نسخهٔ ۲.۷.۱ یک پارامتر `trace` اختیاری می‌گیرد؛
+        # این جایگزین باید هر دو امضا را بپذیرد.
+        agent._finalise = lambda final, outcome, **kwargs: setattr(outcome, "decision", final)
 
         outcome = AgentOutcome(symbol="BTC/USDT")
         asyncio.run(agent._loop("BTC/USDT", "4h", outcome))

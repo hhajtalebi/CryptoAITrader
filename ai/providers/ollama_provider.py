@@ -396,12 +396,25 @@ class OllamaProvider(AIProvider):
         )
 
     async def _get_client(self) -> httpx.AsyncClient:
-        """ساخت یا استفاده مجدد از کلاینت HTTP روی نشانی حل‌شده."""
+        """
+        ساخت یا استفاده مجدد از کلاینت HTTP روی نشانی حل‌شده.
+
+        نسخهٔ ۲.۷.۱: مهلتِ خواندن هم بخشی از هویتِ کلاینت است. پیش از این
+        فقط نشانی مقایسه می‌شد، پس کلاینتی که با مهلت ۱۲۰ ثانیه ساخته شده
+        بود پس از تغییر مهلت در تنظیمات همچنان همان عدد قدیمی را استفاده
+        می‌کرد و کاربر عملاً نمی‌توانست مهلت را کم یا زیاد کند.
+        """
         base_url = await self._resolve_base_url()
-        if self._client is None or self._client.is_closed or str(self._client.base_url).rstrip("/") != base_url:
+        read_timeout = max(float(self._config.timeout), MIN_READ_TIMEOUT)
+        stale = (
+            self._client is None
+            or self._client.is_closed
+            or str(self._client.base_url).rstrip("/") != base_url
+            or float(self._client.timeout.read or 0) != read_timeout
+        )
+        if stale:
             if self._client is not None and not self._client.is_closed:
                 await self._client.aclose()
-            read_timeout = max(float(self._config.timeout), MIN_READ_TIMEOUT)
             self._client = httpx.AsyncClient(
                 base_url=base_url,
                 # اتصال باید سریع باشد ولی تولید پاسخ می‌تواند طول بکشد
@@ -461,12 +474,31 @@ class OllamaProvider(AIProvider):
         return fallback
 
     def update_config(self, config: AIProviderConfig) -> None:
-        """با تغییر پیکربندی، نتایج کش‌شده باید دور ریخته شوند."""
+        """
+        با تغییر پیکربندی، نتایج کش‌شده باید دور ریخته شوند.
+
+        نسخهٔ ۲.۷.۱: دو کش دیگر هم باید پاک می‌شدند و نمی‌شدند.
+
+        • `_session_ctx` پنجرهٔ متن «چسبنده» است. اگر کاربر مدلش را عوض
+          کند، پنجرهٔ مدل قبلی همچنان فرستاده می‌شد و اولاما مدل تازه را
+          با پنجره‌ای بارگذاری می‌کرد که برایش انتخاب نشده بود.
+        • `_thinking_off` / `_think_unsupported` نام مدل‌ها را به خاطر
+          می‌سپارند. نشانی یا مدل که عوض شود، این آموخته‌ها به مدل دیگری
+          نسبت داده می‌شدند و رفتار استدلالی نادرست اعمال می‌گشت.
+
+        این تابع همان‌جا که لازم است صدا زده نمی‌شد (تغییر تنظیمات کل
+        نمونه را دور می‌اندازد)، ولی هر مسیر دیگری که پیکربندی را درجا
+        عوض کند باید نتیجهٔ درست بگیرد.
+        """
         super().update_config(config)
         self._resolved_url = ""
         self._resolved_model = ""
         self._context_ceiling = 0
         self._launch_attempted = False
+        self._session_ctx = 0
+        self._thinking_off.clear()
+        self._think_unsupported.clear()
+        self.launch_note = ""
 
     @property
     def active_model(self) -> str:
@@ -763,6 +795,15 @@ class OllamaProvider(AIProvider):
         except ValueError as exc:
             raise AIProviderError("Ollama returned invalid JSON") from exc
 
+        latency = round(time.monotonic() - started_at, 3)
+        logger.info(
+            "Ollama reply from '%s' in %.2fs (prompt %s tokens, completion %s tokens)",
+            data.get("model") or model,
+            latency,
+            int(data.get("prompt_eval_count") or 0),
+            int(data.get("eval_count") or 0),
+        )
+
         message = data.get("message") or {}
         raw_content = str(message.get("content") or "")
         # مدل‌های استدلالی (deepseek-r1 و هم‌خانواده) پاسخ را داخل
@@ -785,7 +826,7 @@ class OllamaProvider(AIProvider):
             finish_reason="stop" if data.get("done") else "",
             prompt_tokens=int(data.get("prompt_eval_count") or 0),
             completion_tokens=int(data.get("eval_count") or 0),
-            latency_seconds=round(time.monotonic() - started_at, 3),
+            latency_seconds=latency,
         )
 
     def _fit_messages(
@@ -1118,9 +1159,18 @@ class OllamaProvider(AIProvider):
         `generate()` با همهٔ تلاش‌های نجاتش برمی‌گردد.
         """
         fallback = False
+        emitted: list[str] = []
+
+        def forward(chunk: str) -> None:
+            """یادداشت تکه‌ها تا در صورت شکست بدانیم چه‌قدر نشان داده شده است."""
+            if not chunk:
+                return
+            emitted.append(chunk)
+            on_chunk(chunk)
+
         async with self._request_lock:
             try:
-                response = await self._stream_once(messages, on_chunk, temperature)
+                response = await self._stream_once(messages, forward, temperature)
                 if response is not None:
                     return response
                 fallback = True
@@ -1131,11 +1181,28 @@ class OllamaProvider(AIProvider):
             except httpx.HTTPError:
                 fallback = True
         if fallback:
+            # نسخهٔ ۲.۷.۱: اگر ارتباط وسط جریان قطع شود، بخشی از پاسخ همین
+            # حالا روی صفحه نشسته است. تلاشِ دوباره همان پاسخ را از سر می‌گیرد
+            # و بدون بازنشانی، کاربر متن را **دو بار** می‌بیند — نیمهٔ اول از
+            # جریان قطع‌شده و سپس همان نیمه به‌همراه ادامه‌اش. قراردادِ
+            # بازنشانیِ مدیر سرویس‌ها (فرستادن رشتهٔ خالی) اینجا هم اعمال
+            # می‌شود تا آنچه نشان داده شده پیش از جایگزینی پاک گردد.
+            if emitted:
+                self._reset_stream(on_chunk)
+                emitted.clear()
             response = await self.generate(messages, temperature=temperature)
             if response.content:
                 on_chunk(response.content)
             return response
         raise AIProviderError("Ollama stream ended unexpectedly")  # pragma: no cover
+
+    @staticmethod
+    def _reset_stream(on_chunk: Any) -> None:
+        """اعلام «آنچه تا حالا فرستادم را دور بریز» به مصرف‌کننده."""
+        try:
+            on_chunk("")
+        except Exception:  # noqa: BLE001 - نمایش نباید تولید را ببندد
+            logger.debug("Stream reset callback failed")
 
     async def _stream_once(
         self, messages: list[AIMessage], on_chunk: Any, temperature: float | None
@@ -1217,6 +1284,15 @@ class OllamaProvider(AIProvider):
             )
         except AIProviderError as exc:
             return False, f"Ollama is running but model '{model}' failed: {exc.message}"
+        except (httpx.HTTPError, OSError) as exc:
+            # سرویس میانِ فهرست‌کردنِ مدل‌ها و تولید پاسخ از دست رفته است.
+            # این یک حالت کاملاً عادی است (اولاما بسته شده، مدل در حال
+            # بارگذاری است، سیستم خوابیده) و نباید به‌صورت استثنا بیرون برود
+            # و کل «آزمایش اتصال» را با خطای ناخوانا بشکند.
+            return False, (
+                f"Ollama stopped responding while generating with '{model}': "
+                f"{exc.__class__.__name__}"
+            )
         seconds = time.monotonic() - started
         answer = response.content.strip().replace("\n", " ")[:40]
         if not answer:
@@ -1230,7 +1306,7 @@ class OllamaProvider(AIProvider):
         try:
             base_url = await self._resolve_base_url()
             model = await self.resolve_model()
-        except (AIProviderError, httpx.HTTPError) as exc:
+        except (AIProviderError, httpx.HTTPError, OSError) as exc:
             return False, getattr(exc, "message", exc.__class__.__name__)
         ok, seconds, reason = await _warm_up(base_url, model)
         if ok:

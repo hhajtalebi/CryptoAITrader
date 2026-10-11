@@ -11,6 +11,8 @@
   "analysis": "Analysis",
   "analysis_absent": "No AI analysis has been saved for this signal yet. Press “Re-run AI analysis” to generate one now.",
   "analysis_by_ai": "Written by AI",
+  "origin_ai": "Source: AI (model {model})",
+  "origin_engine": "Source: the math analysis engine (not a model output)",
   "analysis_by_template": "Generated from computed data",
   "analysis_empty": "No written analysis stored for this signal.",
   "analysis_title": "{symbol} analysis",

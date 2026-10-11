@@ -72,13 +72,23 @@ class IndicatorRegistry:
 indicator_registry = IndicatorRegistry()
 
 
-def register_builtin_indicators() -> None:
+def register_builtin_indicators(*, force: bool = False) -> None:
     """
     ثبت تمام اندیکاتورهای داخلی نرم‌افزار.
 
     این تابع در Bootstrap فراخوانی می‌شود. برای افزودن اندیکاتور جدید کافی
     است کلاس آن ساخته و یک خط register اینجا اضافه شود.
+
+    نسخهٔ ۲.۷.۱ — بایدار (idempotent): فراخوانی وقتی که اندیکاتورها قبلاً
+    ثبت شده‌اند کاری انجام نمی‌دهد. چرا مهم است؟ این تابع در سازندهٔ
+    `BacktestEngine` هم صدا زده می‌شد؛ در بک‌تست چندنمادی یعنی ۱۹ هشدارِ
+    «re-registered» و ۳۸ نمونه‌سازیِ بی‌فایده برای هر نماد، و شلوغ شدن
+    لاگ‌ها به جایی که خطاهای واقعی در آن گم می‌شوند. `force=True` برای
+    تست‌هایی است که می‌خواهند از حالت تمیز شروع کنند.
     """
+    if indicator_registry.available() and not force:
+        return
+
     from indicators.momentum import (  # noqa: PLC0415
         CCIIndicator, MACDIndicator, MFIIndicator, ROCIndicator,
         RSIIndicator, StochasticIndicator, WilliamsRIndicator,

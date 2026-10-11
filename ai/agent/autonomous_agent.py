@@ -39,6 +39,7 @@ from ai.agent.validator import ResponseValidator
 from ai.providers.base import AIMessage
 from ai.providers.manager import AIProviderManager
 from ai.tools.market_tools import MarketToolset, ToolResult
+from ai.trace import AITrace
 
 logger = get_logger(__name__)
 
@@ -86,6 +87,10 @@ class AgentOutcome:
     elapsed_seconds: float = 0.0
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    #: شناسهٔ ردیابی این اجرا؛ همهٔ رویدادهای لاگ آن را دارند (۲.۷.۱)
+    trace_id: str = ""
+    #: آیا نتیجه از مدل آمده یا از مسیر جایگزین (موتور ریاضی/پاسخ امن)
+    source: str = "ai"
 
     @property
     def direction(self) -> str:
@@ -118,6 +123,8 @@ class AgentOutcome:
             "elapsed_seconds": round(self.elapsed_seconds, 2),
             "errors": self.errors,
             "warnings": self.warnings,
+            "trace_id": self.trace_id,
+            "source": self.source,
             "generated_at": now_utc().isoformat(),
         }
 
@@ -295,26 +302,44 @@ class AutonomousAgent:
         """
         started = time.monotonic()
         outcome = AgentOutcome(symbol=symbol)
+        trace = AITrace("agent_signal", symbol=symbol)
+        outcome.trace_id = trace.trace_id
 
         if not self._providers.has_providers:
             outcome.errors.append("No AI provider is configured")
+            trace.error("ai_no_provider", "No AI provider is configured")
+            trace.finish(False, "no provider configured")
             return outcome
 
         try:
             await asyncio.wait_for(
-                self._loop(symbol, timeframe, outcome, baseline), timeout=self._timeout
+                self._loop(symbol, timeframe, outcome, baseline, trace=trace),
+                timeout=self._timeout,
             )
         except TimeoutError:
             outcome.errors.append(f"Analysis exceeded the {self._timeout:.0f}s time limit")
             logger.warning("Agent timed out for %s after %d steps", symbol, len(outcome.steps))
+            trace.error(
+                "ai_timeout",
+                f"Analysis exceeded the {self._timeout:.0f}s time limit",
+                steps=len(outcome.steps),
+            )
         except AIError as exc:
             outcome.errors.append(getattr(exc, "message", str(exc)))
             logger.warning("Agent failed for %s: %s", symbol, exc)
+            trace.error("ai_error", getattr(exc, "message", str(exc))[:300])
         except Exception as exc:  # noqa: BLE001 - آخرین سد دفاعی
             outcome.errors.append(f"{exc.__class__.__name__}: {exc}")
             logger.exception("Unexpected agent failure for %s", symbol)
+            trace.error("ai_crash", f"{exc.__class__.__name__}: {exc}")
 
         outcome.elapsed_seconds = time.monotonic() - started
+        trace.note(
+            provider=outcome.provider,
+            model=outcome.model,
+            steps=len(outcome.steps),
+            tools=len(outcome.tools_used),
+        )
 
         # اگر عامل به نتیجه نرسید، خروجی امن و صادقانه بده
         if not outcome.succeeded and not outcome.decision:
@@ -325,10 +350,34 @@ class AutonomousAgent:
                 "trend": "NEUTRAL",
                 "market_structure": "UNDEFINED",
             }
+            # این خروجی تحلیلِ مدل نیست؛ رابط کاربری باید آن را شکست بداند
+            # و سراغ موتور ریاضی برود، نه اینکه «صبرِ صفر درصد» نشان دهد.
+            outcome.source = "fallback"
+            trace.warning(
+                "ai_no_decision",
+                "The agent produced no decision; an empty WAIT was returned",
+                reason=outcome.errors[0] if outcome.errors else "",
+            )
+
+        trace.finish(
+            outcome.succeeded,
+            f"agent {outcome.direction} (confidence {outcome.confidence})"
+            if outcome.succeeded
+            else "agent did not produce a usable decision",
+            direction=outcome.direction,
+            confidence=outcome.confidence,
+            succeeded=outcome.succeeded,
+            source=outcome.source,
+        )
         return outcome
 
     async def _loop(
-        self, symbol: str, timeframe: str, outcome: AgentOutcome, baseline: Any = None
+        self,
+        symbol: str,
+        timeframe: str,
+        outcome: AgentOutcome,
+        baseline: Any = None,
+        trace: AITrace | None = None,
     ) -> None:
         """حلقه اصلی اندیشه/ابزار."""
         definitions = self._tools.get_definitions()
@@ -346,6 +395,12 @@ class AutonomousAgent:
             baseline=self._format_baseline(baseline),
         )
 
+        # ردیاب: وقتی `_loop` مستقیماً صدا زده شود (مثلاً در آزمون‌ها)
+        # هیچ ردیابی نیست، پس اینجا یکی ساخته می‌شود تا لاگ بی‌صدا گم نشود.
+        trace = trace or AITrace("agent_signal", symbol=symbol)
+        if not outcome.trace_id:
+            outcome.trace_id = trace.trace_id
+
         # شواهد پایه **پیش از** شروع حلقه و به‌صورت موازی گرفته می‌شوند.
         #
         # چرا: هر دور حلقه یک رفت‌وبرگشت کامل به مدل است. مدل محلی روی
@@ -356,7 +411,15 @@ class AutonomousAgent:
         #
         # با آماده‌کردن شواهد، مدل معمولاً در **یک** فراخوانی تصمیم
         # می‌گیرد. ابزارها همچنان در دسترس‌اند اگر چیز بیشتری خواست.
+        evidence_started = time.monotonic()
         evidence = await self._preload_evidence(symbol, timeframe)
+        trace.stage(
+            "data",
+            "market evidence collected",
+            evidence_chars=len(evidence),
+            seconds=round(time.monotonic() - evidence_started, 3),
+            has_baseline=baseline is not None,
+        )
 
         user_content = (
             f"Analyse {symbol}. Focus timeframe: {timeframe}. "
@@ -410,6 +473,15 @@ class AutonomousAgent:
             call_durations.append(time.monotonic() - call_started)
             outcome.provider = response.provider or outcome.provider
             outcome.model = response.model or outcome.model
+            trace.note(provider=outcome.provider, model=outcome.model)
+            trace.emit(
+                "ai_model_call",
+                f"model call {index}/{self._max_iterations}",
+                step=index,
+                seconds=round(time.monotonic() - call_started, 3),
+                response_chars=len(response.content or ""),
+            )
+            trace.raw("model_response", response.content, level="DEBUG")
 
             payload = self._parse(response.content)
             if payload is None:
@@ -432,7 +504,17 @@ class AutonomousAgent:
                     s.observation == "Response was not valid JSON" for s in recent[-2:]
                 ):
                     outcome.errors.append("The model did not return valid JSON twice in a row")
+                    trace.error(
+                        "ai_invalid_json",
+                        "The model did not return valid JSON twice in a row",
+                        step=index,
+                    )
                     return
+                trace.warning(
+                    "ai_invalid_json",
+                    "Model response was not valid JSON; asking once more",
+                    step=index,
+                )
                 continue
 
             thought = str(payload.get("thought", "")).strip()
@@ -442,7 +524,7 @@ class AutonomousAgent:
                 step = AgentStep(index=index, thought=thought, tool="", ok=True)
                 outcome.steps.append(step)
                 self._emit(step)
-                self._finalise(payload["final"], outcome)
+                self._finalise(payload["final"], outcome, trace=trace)
                 return
 
             # ---- مدل ابزار می‌خواهد ----
@@ -510,12 +592,27 @@ class AutonomousAgent:
                 final_response = await self._providers.generate(
                     messages, preferred=self._preferred, temperature=0.2
                 )
+                outcome.provider = final_response.provider or outcome.provider
+                outcome.model = final_response.model or outcome.model
+                trace.note(provider=outcome.provider, model=outcome.model)
+                trace.raw("model_response", final_response.content, level="DEBUG")
                 final_payload = self._parse(final_response.content)
                 if isinstance(final_payload, dict) and final_payload.get("final"):
-                    outcome.decision = final_payload["final"]
-                    outcome.succeeded = True
-                    outcome.provider = final_response.provider or outcome.provider
-                    outcome.model = final_response.model or outcome.model
+                    # نسخهٔ ۲.۷.۱: این شاخه پیش از این خروجی خام مدل را بدون
+                    # هیچ بررسی‌ای به‌عنوان تصمیم نهایی می‌پذیرفت. یعنی اهرمی
+                    # بالاتر از سقف کاربر، حد ضرر در سمت اشتباه یا اطمینان
+                    # خارج از بازه می‌توانست مستقیم به رابط کاربری و پایگاه
+                    # داده برسد — دقیقاً همان ریسکی که اعتبارسنج برای جلوگیری
+                    # از آن ساخته شده است. حالا همان مسیر `_finalise` طی
+                    # می‌شود: اعتبارسنجی، قلم‌کردن اهرم، و در صورت رد شدن،
+                    # تبدیل صادقانه به «صبر» با علت.
+                    self._finalise(final_payload["final"], outcome, trace=trace)
+                    trace.stage("validation", "timeout-path decision validated")
+                else:
+                    trace.warning(
+                        "ai_timeout_no_final",
+                        "The closing request produced no 'final' object",
+                    )
                 return
 
             # نزدیک سقف: مدل را به جمع‌بندی وادار کن
@@ -533,12 +630,22 @@ class AutonomousAgent:
         # سقف تمام شد ولی داده‌ها جمع شده‌اند؛ یک درخواست آخر فقط برای
         # جمع‌بندی می‌فرستیم. مدل‌های استدلالی تمام بودجه را صرف فکر کردن
         # می‌کنند و هرگز به JSON نمی‌رسند — این مرحله آن حالت را نجات می‌دهد.
-        if await self._force_final(messages, outcome):
+        if await self._force_final(messages, outcome, trace=trace):
             return
 
         outcome.errors.append("The agent used all its steps without reaching a decision")
+        trace.warning(
+            "ai_step_limit",
+            "The agent used all its steps without reaching a decision",
+            steps=len(outcome.steps),
+        )
 
-    async def _force_final(self, messages: list[AIMessage], outcome: AgentOutcome) -> bool:
+    async def _force_final(
+        self,
+        messages: list[AIMessage],
+        outcome: AgentOutcome,
+        trace: AITrace | None = None,
+    ) -> bool:
         """
         آخرین تلاش برای گرفتن تصمیم نهایی از مدل.
 
@@ -570,10 +677,20 @@ class AutonomousAgent:
             )
         except Exception as exc:  # noqa: BLE001
             outcome.errors.append(f"Final summary request failed: {exc}")
+            if trace is not None:
+                trace.error("ai_closing_failed", f"Final summary request failed: {exc}")
             return False
+
+        if trace is not None:
+            outcome.provider = response.provider or outcome.provider
+            outcome.model = response.model or outcome.model
+            trace.note(provider=outcome.provider, model=outcome.model)
+            trace.raw("model_response", response.content, level="DEBUG")
 
         payload = self._parse(response.content)
         if not isinstance(payload, dict) or "final" not in payload:
+            if trace is not None:
+                trace.warning("ai_closing_unparsed", "The closing request was not valid JSON")
             return False
 
         step = AgentStep(
@@ -584,7 +701,7 @@ class AutonomousAgent:
         )
         outcome.steps.append(step)
         self._emit(step)
-        self._finalise(payload["final"], outcome)
+        self._finalise(payload["final"], outcome, trace=trace)
         return outcome.succeeded
 
     # ------------------------------------------------------------------
@@ -884,15 +1001,22 @@ class AutonomousAgent:
 
         return decision
 
-    def _finalise(self, final: Any, outcome: AgentOutcome) -> None:
+    def _finalise(
+        self, final: Any, outcome: AgentOutcome, trace: AITrace | None = None
+    ) -> None:
         """
         اعتبارسنجی و ثبت تصمیم نهایی.
 
         خروجی مدل مستقیم پذیرفته نمی‌شود: اهرم، ترتیب اهداف، سمت حد ضرر و
         بازه اطمینان همگی بررسی و در صورت نیاز اصلاح می‌شوند.
+
+        `trace` اختیاری است تا فراخواننده‌های قدیمی (و آزمون‌ها) بدون تغییر
+        کار کنند؛ نبودش فقط یعنی رویدادهای این مرحله شناسهٔ ردیابی ندارند.
         """
         if not isinstance(final, dict):
             outcome.errors.append("The 'final' field was not an object")
+            if trace is not None:
+                trace.error("ai_bad_final", "The 'final' field was not an object")
             return
 
         # مدل‌های کوچک‌تر گاهی WAIT را بدون دلیل برمی‌گردانند و اعتبارسنج
@@ -915,7 +1039,23 @@ class AutonomousAgent:
         if validation.valid and validation.data:
             outcome.decision = self._from_validator_schema(validation.data)
             outcome.succeeded = True
+            if trace is not None:
+                trace.emit(
+                    "ai_validation",
+                    "decision accepted",
+                    stage="validation",
+                    direction=outcome.decision.get("direction"),
+                    confidence=outcome.decision.get("confidence"),
+                    warnings=len(validation.warnings),
+                )
         else:
+            if trace is not None:
+                trace.warning(
+                    "ai_validation",
+                    f"proposal rejected: {validation.error_text}"[:400],
+                    stage="validation",
+                    errors=len(validation.errors),
+                )
             # اعتبارسنجی رد کرد: به‌جای دور انداختن، به WAIT امن تبدیل کن
             outcome.decision = {
                 **{k: v for k, v in final.items() if k in ("trend", "market_structure", "reason")},

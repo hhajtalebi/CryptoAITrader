@@ -157,11 +157,9 @@ def simulate_trade(
         realized += remaining * sign * (price - entry)
         remaining = 0.0
         exit_time = last.timestamp
-    if remaining > 1e-9:
-        last = future[min(len(future), max_bars) - 1]
-        price = model.exit_price(direction, last.close, stop=False)
-        realized += remaining * sign * (price - entry)
-        exit_time = last.timestamp
+    # نکتهٔ نگه‌داری: بلوک بالا (else حلقه) تنها راه خروج با باقی‌ماندهٔ
+    # پوزیشن است؛ هر مسیر breakـی remaining را صفر کرده است. یک بلوک تکراری
+    # در اینجا در نسخه‌های قبل بود که هرگز اجرا نمی‌شد و حذف شد.
 
     fees = 2 * model.fee_percent  # ورود + خروج روی ارزش اسمی (درصد)
     gross_percent = realized / entry * 100.0

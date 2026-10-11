@@ -33,6 +33,14 @@ _SENSITIVE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(sign\"?\s*[:=]\s*\"?)([A-Za-z0-9\-_./+=]{16,})", re.IGNORECASE),
     re.compile(r"(Bearer\s+)([A-Za-z0-9\-_.]{10,})", re.IGNORECASE),
     re.compile(r"(sk-)([A-Za-z0-9\-_]{10,})"),
+    # نسخهٔ ۲.۷.۱ — صرافی‌هایی که به‌جای «secret» از passphrase استفاده
+    # می‌کنند (OKX، Coinbase و مشابه‌ها) و سرویس‌هایی که کلید را با نام
+    # token یا x-api-key می‌فرستند. آستانهٔ طول بالا گذاشته شده تا متن‌های
+    # عادی برنامه (مثل max_tokens یا prompt_tokens که پس از token بلافاصله
+    # «:» ندارند) هرگز ماسک نشوند.
+    re.compile(r"(passphrase\"?\s*[:=]\s*\"?)([A-Za-z0-9\-_./+]{6,})", re.IGNORECASE),
+    re.compile(r"(x-api-key\"?\s*[:=]\s*\"?)([A-Za-z0-9\-_./+]{6,})", re.IGNORECASE),
+    re.compile(r"(token\"?\s*[:=]\s*\"?)([A-Za-z0-9\-_.]{16,})", re.IGNORECASE),
 )
 
 _MASK = "***REDACTED***"

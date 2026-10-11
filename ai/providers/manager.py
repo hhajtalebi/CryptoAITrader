@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 
 from ai.providers.base import AIMessage, AIProvider, AIProviderConfig, AIResponse
@@ -200,8 +201,10 @@ class AIProviderManager:
         if not self._fallback_enabled:
             providers = providers[:1]
 
+        started = time.monotonic()
         errors: list[str] = []
         for provider in providers:
+            call_started = time.monotonic()
             try:
                 logger.debug("Trying AI provider: %s", provider.name)
                 response = await provider.generate(
@@ -227,7 +230,18 @@ class AIProviderManager:
                 message = getattr(exc, "message", str(exc))
                 self._last_errors[provider.name] = message
                 errors.append(f"{provider.name}: {exc.__class__.__name__}: {message}")
-                logger.warning("AI provider '%s' failed: %s", provider.name, exc.__class__.__name__)
+                # نسخهٔ ۲.۷.۱: پیش از این فقط نام کلاس استثنا لاگ می‌شد، پس
+                # «چرا نشد؟» در لاگ نبود و کاربر باید حدس می‌زد. پیامِ خود
+                # خطا (که لایهٔ لاگ آن را ماسک می‌کند) همراه با مدت تلاش
+                # ثبت می‌شود؛ بدون این، تشخیص تفاوتِ «سرویس خاموش است»،
+                # «مدل نصب نیست» و «مدل هنگام تولید مُرد» ممکن نبود.
+                logger.warning(
+                    "AI provider '%s' failed after %.2fs: %s: %s",
+                    provider.name,
+                    time.monotonic() - call_started,
+                    exc.__class__.__name__,
+                    message,
+                )
                 if self._event_bus is not None:
                     self._event_bus.publish(
                         EventType.AI_ERROR,
@@ -240,6 +254,12 @@ class AIProviderManager:
         summary = "; ".join(
             f"{name}: {reason}" for name, reason in self._last_errors.items()
         ) or "no provider responded"
+        logger.error(
+            "All %d AI providers failed after %.2fs: %s",
+            len(providers),
+            time.monotonic() - started,
+            summary,
+        )
         raise AIProviderError(
             f"All AI providers failed ({summary})",
             details={"attempts": errors, "tried": [p.name for p in providers]},
