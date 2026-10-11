@@ -1,0 +1,81 @@
+# ================================================================
+#  Crypto AI Trader 2.7.1 — فایل قفلِ نسخه‌ها (requirements.lock.txt)
+# ================================================================
+#
+#  این فایل نسخهٔ **دقیقِ** هر بسته‌ای است که در محیط مجازیِ ساخته‌شده
+#  و آزموده‌شده نصب بوده است. برخلاف requirements.txt (که بازه‌ای است)
+#  این فایل یک نصبِ کاملاً بازتولیدپذیر می‌دهد: همان نسخه‌ها، هر بار.
+#
+#  ساخت محیط با این فایل:
+#      python -m venv venv
+#      venv\Scripts\activate          (ویندوز)
+#      pip install --upgrade pip
+#      pip install -r requirements.lock.txt
+#
+#  تفاوت با requirements.txt:
+#      • requirements.txt  ← برای نصبِ همیشگی (بازه‌ای، همیشه موفق)
+#      • requirements.lock.txt ← برای بازتولیدِ دقیقِ همین محیطِ آزموده‌شده
+#
+#  تولیدشده در محیط: لینوکس x86_64 · پایتون 3.11.2
+#  وضعیت: مجموعهٔ آزمون با این نسخه‌ها اجرا شده است.
+# ================================================================
+
+Mako==1.4.3
+MarkupSafe==3.0.4
+PySide6_Essentials==6.12.0
+Pygments==2.21.0
+SQLAlchemy==2.1.4
+SecretStorage==3.5.0
+alembic==1.20.0
+altgraph==0.17.5
+annotated-types==0.8.0
+anyio==4.15.1
+arabic-reshaper==3.0.1
+backports.tarfile==1.2.0
+certifi==2026.7.22
+cffi==2.1.1
+charset-normalizer==3.5.2
+colorama==0.4.6
+cryptography==50.0.2
+et_xmlfile==2.0.0
+h11==0.16.0
+httpcore==1.0.9
+httpx==0.28.1
+idna==3.20
+importlib_metadata==9.0.1
+iniconfig==2.3.1
+jaraco.classes==3.4.0
+jaraco.context==6.1.2
+jaraco.functools==4.6.0
+jeepney==0.9.0
+keyring==25.7.0
+more-itertools==11.1.0
+numpy==2.4.6
+openpyxl==3.1.5
+packaging==26.3
+pandas==2.3.3
+pillow==12.3.0
+pluggy==1.6.0
+pycparser==3.11
+pydantic-settings==2.15.0
+pydantic==2.14.0
+pydantic_core==2.50.0
+pyflakes==4.0.3
+pyinstaller-hooks-contrib==2026.8
+pyinstaller==6.22.3
+pyqtgraph==0.14.0
+pytest-asyncio==1.4.0
+pytest==9.1.1
+python-bidi==0.6.11
+python-dateutil==2.9.0.post0
+python-dotenv==1.2.4
+pytz==2026.5
+reportlab==4.5.1
+ruff==0.17.0
+shiboken6==6.12.0
+six==1.17.0
+typing-inspection==0.4.4
+typing_extensions==4.16.0
+tzdata==2026.5
+websockets==15.0.1
+zipp==4.1.1

@@ -30,13 +30,35 @@ logger = get_logger(__name__)
 
 
 async def run_check() -> int:
-    """بررسی سلامت اجزای اصلی بدون رابط گرافیکی."""
+    """
+    بررسی سلامت اجزای اصلی بدون رابط گرافیکی.
+
+    نسخهٔ ۲.۷.۱ — چرا این تابع بازنویسی شد؟
+        پیش‌تر هر دو فراخوانِ صرافی (`get_symbols` و `get_current_price`)
+        بی‌محافظ بودند. کافی بود اینترنت قطع باشد، VPN خاموش باشد، یا صرافی
+        دسترسی شما را مسدود کند — یعنی دقیقاً همان وضعیتی که کاربر برای
+        تشخیصش دستور `--check` را می‌زند — تا برنامه با یک ردپای خطای
+        مدیریت‌نشده از کار بیفتد؛ و بدتر، چون `application.stop()` در انتهای
+        مسیر بود، موتور بازار و اتصال‌های شبکه هرگز بسته نمی‌شدند.
+
+        ابزارِ تشخیص نباید خودش زیرِ همان مشکلی که قرار است تشخیص بدهد
+        بشکند. حالا هر بخش جداگانه سنجیده می‌شود، وضعیتِ صرافی به‌عنوان
+        «هشدار» گزارش می‌شود (برنامه با دادهٔ ذخیره‌شده کار می‌کند، پس عدم
+        دسترسی به صرافی شکستِ سلامت نیست) و خاموشیِ تمیز همیشه انجام می‌گردد.
+    """
     application = Application()
+    failures: list[str] = []
+    warnings: list[str] = []
+
     print(f"{APP_NAME} v{APP_VERSION}")
-    print(f"  data dir      : {application.paths.data_dir}")
-    print(f"  database      : {application.paths.database_file.name}")
-    print(f"  settings      : {len(application.settings_repository.get_all())} keys")
-    print(f"  indicators    : {len(application.indicators.available_indicators())}")
+    try:
+        print(f"  data dir      : {application.paths.data_dir}")
+        print(f"  database      : {application.paths.database_file.name}")
+        print(f"  settings      : {len(application.settings_repository.get_all())} keys")
+        print(f"  indicators    : {len(application.indicators.available_indicators())}")
+    except Exception as exc:  # noqa: BLE001 - ابزار تشخیص نباید خودش بشکند
+        failures.append(f"local configuration: {exc.__class__.__name__}: {exc}")
+        print(f"  local state   : FAILED ({exc})")
 
     from signals.strategies.registry import strategy_registry
 
@@ -44,19 +66,52 @@ async def run_check() -> int:
     print(f"  ai enabled    : {application.ai_enabled()}")
 
     await application.start()
-    assert application.market is not None
-    symbols = await application.market.get_symbols()
-    print(f"  exchange      : {application.market.exchange_name} ({len(symbols)} symbols)")
+    try:
+        market = application.market
+        if market is None:
+            failures.append("market engine was not created")
+            print("  exchange      : FAILED (market engine missing)")
+        else:
+            try:
+                symbols = await market.get_symbols()
+                print(f"  exchange      : {market.exchange_name} ({len(symbols)} symbols)")
+            except Exception as exc:  # noqa: BLE001
+                warnings.append(f"exchange symbol list: {exc.__class__.__name__}: {exc}")
+                print(f"  exchange      : {market.exchange_name} — unreachable "
+                      f"({exc.__class__.__name__}: {str(exc)[:120]})")
 
-    price = await application.market.get_current_price("BTC/USDT")
-    print(f"  BTC/USDT      : {price}")
-    await application.stop()
+            try:
+                price = await market.get_current_price("BTC/USDT")
+                print(f"  BTC/USDT      : {price}")
+            except Exception as exc:  # noqa: BLE001
+                warnings.append(f"price lookup: {exc.__class__.__name__}: {exc}")
+                print(f"  BTC/USDT      : unavailable ({exc.__class__.__name__}: {str(exc)[:120]})")
+    finally:
+        # خاموشیِ تمیز همیشه — حتی اگر یکی از گام‌های بالا شکست خورده باشد.
+        try:
+            await application.stop()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Clean shutdown during health check failed: %s", exc)
+
+    if failures:
+        print(f"Health check FAILED: {'; '.join(failures)}")
+        return 1
+    if warnings:
+        print(f"Health check passed with {len(warnings)} warning(s) "
+              f"— the app still works with stored data; check internet/VPN/proxy.")
+        return 0
     print("Health check passed.")
     return 0
 
 
 async def run_signal(symbol: str) -> int:
-    """تولید یک سیگنال در خط فرمان."""
+    """
+    تولید یک سیگنال در خط فرمان.
+
+    نسخهٔ ۲.۷.۱: شکستِ تولید سیگنال (نبود داده، قطعی شبکه، مسدودی صرافی)
+    حالا یک پیامِ خوانا می‌دهد و کد خروج ۱ برمی‌گرداند، نه ردپای استثنا؛
+    و خاموشیِ تمیز در هر صورت انجام می‌شود.
+    """
     application = Application()
     await application.start()
     try:
@@ -70,6 +125,11 @@ async def run_signal(symbol: str) -> int:
             print(f"  R/R        : {signal.risk_reward} | leverage ×{signal.leverage}")
         print(f"  reason     : {signal.reason[:300]}")
         print("\n  Note: confidence is factor alignment, not a probability of profit.")
+    except Exception as exc:  # noqa: BLE001 - کاربر باید علت را ببیند نه ردپا
+        print(f"\n{symbol} → signal could not be generated")
+        print(f"  reason: {exc.__class__.__name__}: {exc}")
+        print("  Check internet/VPN/proxy, then try again. No signal is fabricated.")
+        return 1
     finally:
         await application.stop()
     return 0
