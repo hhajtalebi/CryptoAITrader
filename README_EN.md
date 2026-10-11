@@ -14,8 +14,10 @@ Version 2.7.1 · Windows 10/11 · Python 3.11+ (tested up to 3.13) · Persian & 
 > every signal run gets a correlation id and logs data/indicators/voting/risk and the final accept-or-reject
 > reason under the SIGNALS category. On the signal page the **real origin** of the result (model or math
 > engine) is now shown, and engine output is never labelled as AI. Backtest: anti-look-ahead integrity tests.
-> Test suite: **2,938 passed, 0 failures, 0 errors** (72 new tests; 5 standing errors fixed). No new
-> dependencies. [Full report](docs/RELEASE_2.7.1_FA.md).
+> Test suite: **2,952 collected, 2,943 passed, 0 failures, 0 errors, 9 skipped** (83 new tests;
+> 5 standing errors fixed). Six of the new tests run against a **real Ollama service** and are
+> *skipped* — never reported as passed — when Ollama is not running. No new dependencies.
+> [Full report](docs/RELEASE_2.7.1_FA.md).
 >
 > **Previous delivery 2.7.0:** new 5-screen mobile UI + cloud APK build; configurable daily loss limit (0 = off);
 > Windows-log fixes: R/R 1.50 < 1.5 rounding rejection, BBANDS crash on flat markets, websockets TLS-cleanup noise,
@@ -180,6 +182,24 @@ python -m venv .venv
 source .venv/bin/activate     # Linux/macOS
 
 pip install -r requirements.txt
+python main.py
+```
+
+One command (2.7.1 and later) — checks the Python version, creates the environment and installs
+exactly the package versions this release was tested with:
+
+```bat
+setup_env.bat                  :: Windows
+```
+
+```bash
+bash setup_env.sh              # Linux and macOS
+```
+
+Then:
+
+```bat
+venv\Scripts\activate          :: Windows
 python main.py
 ```
 
