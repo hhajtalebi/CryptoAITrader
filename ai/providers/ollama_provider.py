@@ -41,6 +41,7 @@ from app.exceptions import AIProviderError, TimeoutErrorApp
 from app.logging import get_logger
 
 from ai.prompt_budget import (
+    available_prompt_tokens,
     choose_context_window,
     detect_total_memory_gb,
     estimate_tokens,
@@ -326,6 +327,16 @@ class OllamaProvider(AIProvider):
         self._thinking_off: set[str] = set()
         #: مدل‌هایی که اولاما پارامتر think را برایشان نمی‌پذیرد
         self._think_unsupported: set[str] = set()
+        #: مدل‌هایی که اولاما پارامتر format=json را برایشان رد می‌کند.
+        #:
+        #: ۲٫۷٫۲: پیش از این این ردشدن **به‌خاطر سپرده نمی‌شد**، برخلاف
+        #: `think`. نتیجه‌اش این بود که هر تک‌درخواستِ تحلیل، نخست با
+        #: `format=json` فرستاده می‌شد، با خطای سرور رد می‌شد و دوباره
+        #: به‌صورت متن ساده پرسیده می‌شد — یعنی یک رفت‌وبرگتِ کاملِ
+        #: چندثانیه‌ایِ هدررفته روی **هر** سیگنال. روی مدلی که خودش
+        #: زیر بار می‌میرد، همین رفت‌وبرگتِ اضافی تفاوتِ «پاسخ گرفتیم»
+        #: با «۴۰ ثانیه صبر کردیم و شکست خوردیم» است.
+        self._json_unsupported: set[str] = set()
         #: راه‌اندازی خودکار سرویس فقط یک بار در هر نمونه تلاش می‌شود
         self._launch_attempted = False
         #: آخرین نتیجهٔ راه‌اندازی خودکار (برای پیام وضعیت)
@@ -498,6 +509,10 @@ class OllamaProvider(AIProvider):
         self._session_ctx = 0
         self._thinking_off.clear()
         self._think_unsupported.clear()
+        # آموخته‌های مربوط به مدل‌ها باید با تغییر تنظیمات پاک شوند،
+        # وگرنه رفتاری که برای یک مدل/نشانی آموخته‌ایم به مدل دیگری
+        # نسبت داده می‌شود (همان باگی که برای think رفع شده بود).
+        self._json_unsupported.clear()
         self.launch_note = ""
 
     @property
@@ -625,7 +640,7 @@ class OllamaProvider(AIProvider):
             "keep_alive": KEEP_ALIVE,
             "options": options,
         }
-        if json_mode:
+        if json_mode and model not in self._json_unsupported:
             payload["format"] = "json"
         self._apply_think(payload, model)
         return payload
@@ -678,12 +693,54 @@ class OllamaProvider(AIProvider):
                 # پس هر تلاش، پرامپت را هم به‌شکل محسوس کوچک می‌کند. این
                 # تفاوت «پاسخ می‌گیرم ولی خلاصه‌تر» با «هیچ پاسخی نمی‌گیرم»
                 # است — و روی کارت‌های کم‌حافظه همین تفاوت همه‌چیز است.
+                # ۲٫۷٫۲: پنجره‌ای که در تلاشِ پیشین واقعاً به کار رفت.
+                # نردبان تا وقتی معنا دارد که هر پله چیزی را کوچک‌تر کند؛
+                # اگر پله‌ای عملاً هم‌اندازهٔ پلهٔ قبل باشد، ادامه دادنش
+                # فقط زمان و فشارِ بیشتر روی مدلی است که از پیش در حال
+                # فروپاشی است.
+                window_used = self._effective_window()
+                needed_tokens = sum(
+                    estimate_tokens(str(getattr(m, "content", "") or ""))
+                    for m in messages
+                )
                 for attempt in range(RUNNER_CRASH_RETRIES):
                     delay = RUNNER_CRASH_BACKOFF * (attempt + 1)
+                    effective = self._effective_window()
                     shrunk_window = max(
-                        CRASH_MIN_CONTEXT,
-                        self._effective_window() // (2 ** (attempt + 1)),
+                        CRASH_MIN_CONTEXT, effective // (2 ** (attempt + 1))
                     )
+                    # هرگز پرامپت را قیچی نمی‌کنیم.
+                    #
+                    # اگر پنجرهٔ هدف از نیازِ واقعیِ پرامپت کوچک‌تر باشد،
+                    # «کوچک‌سازی» در عمل یعنی حذفِ بی‌صدای بخشی از دادهٔ
+                    # بازار و گرفتنِ پاسخی که دیگر بر پایهٔ تصویر کامل
+                    # نیست — و روی یک تصمیم معاملاتی این از خطا خوردن بدتر
+                    # است، چون کاربر نمی‌فهمد چه چیزی را ندیده است.
+                    # پس پنجره را فقط تا مرزِ «جا شدنِ کاملِ پرامپت»
+                    # کوچک می‌کنیم، نه بیشتر.
+                    while (
+                        shrunk_window < effective
+                        and available_prompt_tokens(shrunk_window) < needed_tokens
+                    ):
+                        shrunk_window *= 2
+                    shrunk_window = min(shrunk_window, effective)
+
+                    if shrunk_window >= window_used:
+                        logger.error(
+                            "Ollama rescue ladder cannot shrink further for '%s': "
+                            "the prompt needs %s tokens but the next window would "
+                            "only hold %s, so retrying would silently trim the "
+                            "market data. The runner is crashing because this "
+                            "machine cannot hold the model, not because the prompt "
+                            "is too long. Fix: use a smaller/quantised model, close "
+                            "other apps, or raise ai.ollama_max_context only if the "
+                            "hardware really has room.",
+                            model,
+                            needed_tokens,
+                            available_prompt_tokens(shrunk_window),
+                        )
+                        break
+                    window_used = shrunk_window
                     logger.warning(
                         "Ollama runner crashed (attempt %s/%s); retrying in %.1fs "
                         "with the prompt fitted to %s tokens",
@@ -694,9 +751,12 @@ class OllamaProvider(AIProvider):
                     )
                     await asyncio.sleep(delay)
 
-                    payload["messages"] = self._fit_messages(
-                        messages, shrunk_window, protect_system=False
-                    )
+                    # ۲٫۷٫۲: پیامِ سامانه (قالب خروجی و قواعد تصمیم‌گیری)
+                    # دیگر بریده نمی‌شود. پیش از این با protect_system=False
+                    # صدا زده می‌شد، یعنی نخستین چیزی که قیچی می‌شد همان
+                    # دستوری بود که به مدل می‌گفت چه شکلی جواب بدهد — درست
+                    # چیزی که باید حفظ شود وقتی مدل در آستانهٔ فروپاشی است.
+                    payload["messages"] = self._fit_messages(messages, shrunk_window)
                     current = int(
                         payload["options"].get("num_predict", self._config.max_tokens)
                     )
@@ -745,8 +805,11 @@ class OllamaProvider(AIProvider):
                 # JSON را از متن بیرون می‌کشیم؛ لایهٔ بالاتر این کار را
                 # بلد است.
                 logger.warning(
-                    "Ollama rejected format=json for '%s'; retrying as plain text", model
+                    "Ollama rejected format=json for '%s'; retrying as plain text "
+                    "and remembering it for this model",
+                    model,
                 )
+                self._json_unsupported.add(model)
                 payload.pop("format", None)
                 response = await client.post("/api/chat", json=payload)
             if response.status_code == 404:

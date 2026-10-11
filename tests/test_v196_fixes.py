@@ -1065,9 +1065,25 @@ class TestTheAppSurvivesADyingRunner:
         return Client()
 
     @pytest.mark.asyncio
-    async def test_a_crash_is_survived_by_shrinking_the_prompt(self) -> None:
+    async def test_a_prompt_that_cannot_be_shrunk_is_reported_not_gutted(self) -> None:
         """
-        مهم‌ترین آزمون این نسخه: کاربر باید پاسخ بگیرد، نه پیام خطا.
+        ۲٫۷٫۲ — پاسخِ بریده بهتر از بی‌پاسخی نیست.
+
+        رفتارِ پیشین در این سناریو پرامپت را پله‌پله می‌برید تا سرانجام در
+        کوچک‌ترین پنجره جا شود و «پاسخ» بدهد. مشکل این بود که آن پاسخ دیگر
+        بر پایهٔ دادهٔ کامل نبود و هیچ نشانی از بریده‌شدن به کاربر نمی‌رسید؛
+        یعنی تحلیلِ ناقص درست شبیه تحلیلِ کامل نمایش داده می‌شد — روی یک
+        تصمیم معاملاتی، از خطا خوردن خطرناک‌تر است چون کسی نمی‌فهمد چه
+        چیزی را ندیده است.
+
+        سناریوی واقعی که این را به من نشان داد: پرامپت ۱۱۷۰ توکن، نردبان
+        پنجره را به ۱۰۲۴ می‌رساند (گنجایش ۶۶۵ توکن) و حدود ۵۰۵ توکن از
+        دادهٔ بازار را بی‌صدا حذف می‌کرد، آن هم پس از دو تلاشی که هر دو
+        پیش‌تر شکست خورده بودند. کاربر فقط می‌دید «تحلیل ناموجود است».
+
+        قراردادِ تازه: اگر کوچک‌سازی مستلزم بریدنِ پرامپت باشد، نردبان
+        همان‌جا متوقف می‌شود و علتِ واقعی (کمبود حافظهٔ سخت‌افزار) گزارش
+        می‌گردد.
         """
         from ai.providers.base import AIMessage
 
@@ -1078,24 +1094,29 @@ class TestTheAppSurvivesADyingRunner:
         )
         provider.resolve_model = lambda: _async("llama3.1:8b")  # noqa: SLF001
 
-        response = await provider.generate(
-            [
-                AIMessage("system", "S" * 3643),
-                AIMessage("user", "D" * 9000),
-            ]
-        )
+        with pytest.raises(Exception):  # noqa: B017, PT011
+            await provider.generate(
+                [
+                    AIMessage("system", "S" * 3643),
+                    AIMessage("user", "D" * 9000),
+                ]
+            )
 
-        assert response.content == "پاسخ"
-        assert sizes[-1] <= 4000, f"پرامپت واقعاً کوچک نشد: {sizes}"
+        # فقط یک تلاش: پله‌های بعدی چیزی را کوچک نمی‌کردند، فقط داده می‌بریدند.
+        assert len(sizes) == 1, f"نردبان باید همان ابتدا متوقف می‌شد: {sizes}"
+        assert sizes[0] > 4000, "پرامپت باید دست‌نخورده فرستاده می‌شد"
 
     @pytest.mark.asyncio
-    async def test_the_prompt_actually_gets_smaller_each_attempt(self) -> None:
+    async def test_the_ladder_still_runs_when_shrinking_is_meaningful(self) -> None:
         """
-        نقصی که اندازه‌گیری پیدا کرد.
+        نردبان حذف نشده، فقط مرزبندی شده است.
 
-        نسخهٔ اول این رفع، فقط `num_predict` را نصف می‌کرد و پرامپت روی
-        ۴٬۴۱۱ نویسه ثابت می‌ماند — چون پیام سیستمیِ ۱۲۲۲ توکنی هرگز
-        کوتاه نمی‌شد و به‌تنهایی از پنجرهٔ نجات بزرگ‌تر بود.
+        آزمونِ پیشین («پرامپت هر بار کوچک‌تر می‌شود») در واقع چیزی را
+        تأیید می‌کرد که حالا ممنوع است: کوچک‌شدنِ پرامپت در آن سناریو فقط
+        با **بریدنِ داده** به دست می‌آمد. این آزمون همان نیت را بدون بریدن
+        نگه می‌دارد: وقتی پرامپت آن‌قدر هست که در کوچک‌ترین پنجرهٔ نجات هم
+        جا شود، کوچک‌سازی واقعی است (سقف پاسخ و پنجره پایین می‌آیند،
+        خودِ داده دست‌نخورده می‌ماند) و نردبان باید کامل اجرا شود.
         """
         from ai.providers.base import AIMessage
 
@@ -1107,14 +1128,16 @@ class TestTheAppSurvivesADyingRunner:
         )
         provider.resolve_model = lambda: _async("llama3.1:8b")  # noqa: SLF001
 
+        # ۶۰۰ توکن: از گنجایشِ کوچک‌ترین پنجرهٔ نجات (۶۶۵) هم کمتر،
+        # پس هیچ بریدنی لازم نیست و هر دو پلهٔ نجات مجازند.
         with pytest.raises(Exception):  # noqa: B017, PT011
             await provider.generate(
-                [AIMessage("system", "S" * 3643), AIMessage("user", "D" * 9000)]
+                [AIMessage("system", "S" * 300), AIMessage("user", "D" * 1500)]
             )
 
-        assert len(sizes) >= 3, sizes
-        assert sizes[1] < sizes[0], f"تلاش دوم کوچک‌تر نشد: {sizes}"
-        assert sizes[2] < sizes[1], f"تلاش سوم کوچک‌تر نشد: {sizes}"
+        assert len(sizes) == 3, f"نردبان باید کامل اجرا می‌شد: {sizes}"
+        # دادهٔ واقعی دست‌نخورده مانده است.
+        assert sizes[0] == sizes[-1] == 1800, f"پرامپت بریده شد: {sizes}"
 
     def test_the_normal_path_still_protects_the_system_prompt(self) -> None:
         """
