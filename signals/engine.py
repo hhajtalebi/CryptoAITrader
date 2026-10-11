@@ -38,6 +38,8 @@ from app.core.models import (
 )
 from app.exceptions import AppError, InsufficientDataError
 from app.logging import get_logger
+from app.logging.audit import emit as audit_emit, new_correlation_id
+from app.logging.categories import LogCategory
 from indicators.engine import IndicatorEngine
 from indicators.support_resistance import (
     analyze_market_structure,
@@ -269,13 +271,28 @@ class SignalEngine:
         analyses: dict[str, dict[str, Any]] = {}
         notes: list[str] = []
 
+        # نسخهٔ ۲.۷.۱ — شناسهٔ ردیابی یک اجرا (الزام ۸).
+        # هر اجرای تولید سیگنال یک شناسه دارد تا همهٔ مراحلش (دریافت داده،
+        # اندیکاتورها، رأی‌گیری، ریسک، غنی‌سازی هوش مصنوعی) در لاگ به هم
+        # وصل شوند و بشود بعداً علت یک سیگنالِ خاص را بازسازی کرد.
+        correlation_id = new_correlation_id()
+        started = time.perf_counter()
+        self._emit_signal_trace(
+            "signal_run_start", f"Signal run started for {symbol}",
+            correlation_id=correlation_id, symbol=symbol,
+            requested_timeframes=",".join(frames), primary_timeframe=primary,
+            intelligence=bool(self._intelligence),
+        )
+
         # تحلیل همه تایم‌فریم‌ها به‌صورت موازی انجام می‌شود.
         # قبلاً حلقه ترتیبی بود و زمان کل، جمع زمان تک‌تک تایم‌فریم‌ها می‌شد؛
         # حالا زمان کل تقریباً برابر کندترین تایم‌فریم است (حدود ۳ برابر سریع‌تر).
+        stage_started = time.perf_counter()
         results = await asyncio.gather(
             *(self._analyze_timeframe(symbol, timeframe) for timeframe in frames),
             return_exceptions=True,
         )
+        data_seconds = time.perf_counter() - stage_started
         for timeframe, analysis in zip(frames, results, strict=True):
             if isinstance(analysis, InsufficientDataError):
                 notes.append(f"{timeframe}: {analysis.message}")
@@ -290,8 +307,23 @@ class SignalEngine:
                 continue
             analyses[timeframe] = analysis
 
+        self._emit_signal_trace(
+            "signal_data", f"Market data: {len(analyses)}/{len(frames)} timeframes usable",
+            correlation_id=correlation_id, symbol=symbol,
+            data_seconds=round(data_seconds, 3),
+            ok_timeframes=",".join(sorted(analyses)),
+            failed_timeframes="; ".join(notes) or "",
+        )
+
         if not analyses:
             logger.info("No usable timeframe for %s; returning WAIT", symbol)
+            self._emit_signal_trace(
+                "signal_result", "No usable timeframe; WAIT with INSUFFICIENT_DATA",
+                correlation_id=correlation_id, symbol=symbol, level="WARNING",
+                direction="WAIT", status="INSUFFICIENT_DATA",
+                failed_timeframes="; ".join(notes),
+                total_seconds=round(time.perf_counter() - started, 3),
+            )
             return self._wait_signal(
                 symbol,
                 frames,
@@ -341,6 +373,14 @@ class SignalEngine:
         atr = self._atr_of(primary_analysis)
 
         if direction == SignalDirection.WAIT:
+            self._emit_signal_trace(
+                "signal_result", "Factors not aligned; WAIT",
+                correlation_id=correlation_id, symbol=symbol,
+                direction="WAIT", total_score=round(total_score, 3),
+                alignment=round(alignment, 3), threshold=DECISION_THRESHOLD,
+                regime=(regime_info or {}).get("regime") if isinstance(regime_info, dict) else None,
+                total_seconds=round(time.perf_counter() - started, 3),
+            )
             waiting = self._wait_signal(
                 symbol,
                 list(analyses),
@@ -384,6 +424,16 @@ class SignalEngine:
         # موتور ریسک حق وتو دارد
         if not assessment.approved:
             logger.info("Risk engine rejected %s setup for %s: %s", direction.value, symbol, assessment.rejection_reason)
+            self._emit_signal_trace(
+                "signal_rejected", "Risk engine vetoed the setup; WAIT returned instead",
+                correlation_id=correlation_id, symbol=symbol,
+                level="WARNING", direction=direction.value,
+                stop_loss=stop_loss, take_profits=",".join(str(t) for t in take_profits),
+                risk_reward=assessment.risk_reward,
+                stop_distance_percent=assessment.stop_distance_percent,
+                rejection_reason=assessment.rejection_reason,
+                total_seconds=round(time.perf_counter() - started, 3),
+            )
             signal = self._wait_signal(
                 symbol,
                 list(analyses),
@@ -445,12 +495,70 @@ class SignalEngine:
                 notes=notes,
             )
             if signal.direction == SignalDirection.WAIT:
+                self._emit_signal_trace(
+                    "signal_result", "Intelligence layer downgraded the setup to WAIT",
+                    correlation_id=correlation_id, symbol=symbol,
+                    direction="WAIT", total_score=round(total_score, 3),
+                    decision=str(signal.intelligence.get("decision") or ""),
+                    quality=str(signal.intelligence.get("quality") or ""),
+                    final_confidence=signal.confidence,
+                    total_seconds=round(time.perf_counter() - started, 3),
+                )
                 return signal
         logger.info(
             "Signal for %s: %s | entry %.6g | SL %.6g | R/R %.2f | confidence %d",
             symbol, direction.value, entry, stop_loss, assessment.risk_reward, confidence,
         )
+        self._emit_signal_trace(
+            "signal_generated", f"{direction.value} signal produced for {symbol}",
+            correlation_id=correlation_id, symbol=symbol,
+            direction=direction.value, confidence=signal.confidence,
+            entry=entry, stop_loss=stop_loss,
+            take_profits=",".join(str(t) for t in signal.take_profits),
+            risk_reward=signal.risk_reward, leverage=signal.leverage,
+            stop_method=stop_method, total_score=round(total_score, 3),
+            timeframes=",".join(signal.timeframes),
+            indicators=",".join(signal.indicators_used),
+            decision=str(signal.intelligence.get("decision") or ""),
+            quality=str(signal.intelligence.get("quality") or ""),
+            intelligence_applied=bool(signal.intelligence),
+            enter_before=signal.enter_before.isoformat() if signal.enter_before else "",
+            expires_at=signal.expires_at.isoformat() if signal.expires_at else "",
+            total_seconds=round(time.perf_counter() - started, 3),
+        )
         return signal
+
+    @staticmethod
+    def _emit_signal_trace(
+        event: str,
+        message: str,
+        *,
+        correlation_id: str,
+        symbol: str = "",
+        level: str = "INFO",
+        **fields: Any,
+    ) -> None:
+        """
+        انتشار یک رویداد ردیابیِ تولید سیگنال.
+
+        چرا جدا از logger؟ این رویدادها باید در «مرکز لاگ»ِ برنامه با دستهٔ
+        SIGNALS و شناسهٔ ردیابیِ یکسان دیده شوند تا بشود یک اجرا را از
+        دریافت داده تا تصمیم نهایی دنبال کرد (الزام ۸). تابع هرگز استثنا
+        بیرون نمی‌دهد: خطای لاگ نباید تولید سیگنال را متوقف کند.
+        """
+
+        try:
+            audit_emit(
+                event,
+                message,
+                category=LogCategory.SIGNALS,
+                level=level,
+                symbol=symbol or None,
+                correlation_id=correlation_id,
+                **fields,
+            )
+        except Exception:  # noqa: BLE001 - لاگ نباید موتور سیگنال را متوقف کند
+            logger.debug("Signal trace event failed", exc_info=True)
 
     @staticmethod
     def _attach_forecast(

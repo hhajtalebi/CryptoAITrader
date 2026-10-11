@@ -268,7 +268,6 @@ def test_slippage_and_spread_move_entry_against_the_trader(direction: str) -> No
     """لغزش و اسپرد باید به زیان معامله‌گر باشند، نه به نفع او."""
 
     model = ExecutionModel(fee_percent=0.0, spread_percent=0.10, slippage_percent=0.10)
-    bars = flat_candles([(100, 100, 100, 100)], start=1_700_000_000, step=STEP)
     entry = model.entry_price(direction, 100.0)
     if direction == "LONG":
         assert entry > 100.0
@@ -329,7 +328,7 @@ def test_walk_forward_windows_are_ordered_and_disjoint() -> None:
         assert fold.train[0] < fold.train[1] <= fold.validation[0]
         assert fold.validation[1] <= fold.test[0]
         assert fold.test[0] < fold.test[1]
-    for first, second in zip(folds, folds[1:]):
+    for first, second in zip(folds, folds[1:], strict=False):
         assert first.test[1] <= second.test[0], "پنجره‌های آزمون هم‌پوشانی دارند"
         # آموزشِ پنجرهٔ بعد نباید به دادهٔ آزمونِ پنجرهٔ قبل دسترسی داشته باشد
         assert second.train[0] < first.test[1]

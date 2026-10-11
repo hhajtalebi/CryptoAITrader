@@ -38,7 +38,7 @@ from typing import Any
 
 import pytest
 
-from ai.agent.autonomous_agent import AgentOutcome, AutonomousAgent
+from ai.agent.autonomous_agent import AutonomousAgent
 from ai.agent.validator import ResponseValidator
 from ai.providers import manager as manager_module
 from ai.providers.base import AIProvider, AIProviderConfig, AIResponse
