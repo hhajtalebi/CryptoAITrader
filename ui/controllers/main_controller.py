@@ -2875,7 +2875,7 @@ class MainController(QObject):
 
         self.runner.submit(
             "outcome-track",
-            self.app.refresh_outcomes(),
+            self.app.refresh_outcomes(tick_engine=self._ensure_tick_engine()),
             on_success=apply,
             on_error=failed,
         )

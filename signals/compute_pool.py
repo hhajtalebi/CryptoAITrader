@@ -46,6 +46,53 @@ IDLE_SHUTDOWN_SECONDS = 180.0
 MAX_CONSECUTIVE_FAILURES = 3
 #: کلاس اولویت «زیر عادی» ویندوز
 _BELOW_NORMAL_PRIORITY_CLASS = 0x00004000
+#: پرچم CREATE_NO_WINDOW ویندوز
+_CREATE_NO_WINDOW = 0x08000000
+
+_console_suppression_installed = False
+
+
+def _suppress_worker_console_windows() -> None:
+    """
+    ۲٫۷٫۲ — ویندوز: کارگرهای استخر دیگر پنجرهٔ کنسول باز نمی‌کنند.
+
+    زمینه: `spawn` کارگرها را با `_winapi.CreateProcess` و پرچم ساختِ صفر
+    می‌سازد (پایتون ۳٫۱۱، popen_spawn_win32). روی ویندوز یک فرایندِ
+    «کنسولی» که والدش کنسول ندارد (اجرای بستهٔ بدون-کنسول یا pythonw)،
+    سیستم‌عامل برایش **یک کنسولِ تازه و نمایان** می‌سازد — دقیقاً همان
+    «ترمینالی که هنگام سیگنال‌گیری مدام باز و بسته می‌شود»: هر بار استخر
+    پس از بیکاری بسته و در پویش بعدی دوباره ساخته می‌شود، دو پنجرهٔ کنسول
+    لحظه‌ای ظاهر و محو می‌شوند.
+
+    راه‌حل: پرچم CREATE_NO_WINDOW را به همهٔ CreateProcessهای این برنامه
+    اضافه می‌کنیم (یک‌بار، هم‌اکنون). این پرچم طبق مستندات مایکروسافت برای
+    برنامه‌های غیرکنسولی نادیده گرفته می‌شود، پس فرایندهای گرافیکیِ دیگر
+    (مثلاً نصب‌کنندهٔ به‌روزرسان) دست‌نخورده می‌مانند؛ و فراخوانی‌های خودمان
+    (`ai.ollama_launcher`) از قبل همین پرچم را داشتند. فقط پنجره‌های
+    کنسولیِ ناخواسته حذف می‌شوند.
+    """
+    global _console_suppression_installed  # noqa: PLW0603
+    if _console_suppression_installed or sys.platform != "win32":
+        return
+    try:
+        import _winapi  # noqa: PLC0415
+
+        original = _winapi.CreateProcess
+
+        def _create_process_quietly(*args: Any, **kwargs: Any) -> Any:
+            # CreateProcess(app_name, cmdline, proc_attrs, thread_attrs,
+            #               inherit, creation_flags, env, curdir, startup_info)
+            if not kwargs and len(args) >= 6 and isinstance(args[5], int):
+                args = list(args)
+                args[5] |= _CREATE_NO_WINDOW
+                args = tuple(args)
+            return original(*args, **kwargs)
+
+        _winapi.CreateProcess = _create_process_quietly  # type: ignore[attr-defined]
+        _console_suppression_installed = True
+        logger.debug("Windows worker consoles will be created hidden")
+    except Exception:  # noqa: BLE001 - فقط بهینه‌سازی نمایشی
+        logger.debug("Could not suppress worker console windows", exc_info=True)
 
 # ---------------------------------------------------------------- سمت کارگر
 _worker_engine: Any = None
@@ -171,6 +218,7 @@ class ComputePool:
                 try:
                     # spawn در همهٔ سیستم‌عامل‌ها: fork پس از ساخت نخ‌های Qt و
                     # شبکه ناامن است و رفتار ویندوز را هم یکسان می‌کند.
+                    _suppress_worker_console_windows()
                     context = multiprocessing.get_context("spawn")
                     self._executor = ProcessPoolExecutor(
                         max_workers=self._workers,

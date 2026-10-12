@@ -99,8 +99,18 @@ class PriceWindow:
     بازهٔ قیمتی دیده‌شده از آخرین بررسی تا کنون.
 
     اگر فقط یک قیمت لحظه‌ای در دست باشد، هر سه مقدار همان است. اگر
-    کندل در دسترس باشد، `high` و `low` واقعی می‌آیند و تشخیص لمس حد
-    ضرر و هدف بسیار دقیق‌تر می‌شود.
+    کندل یا تیک در دسترس باشد، `high` و `low` واقعیِ **همین بازه**
+    می‌آیند و تشخیص لمس حد ضرر و هدف بسیار دقیق‌تر می‌شود.
+
+    ⚠️ هشدار (۲٫۷٫۲ — باگی که نرخ برد را ۲٪ نشان می‌داد):
+
+    `high`/`low` باید افراطِ **بازهٔ از آخرین بررسی تا حالا** باشند،
+    نه ۲۴ ساعت اخیر. پیش‌تر سازندهٔ پنجره، `high_24h`/`low_24h` تیکر
+    صرافی را می‌داد: بازه‌ای که **پیش از ورود به سیگنال** هم قیمت
+    دیده بود. چون حد ضرر معمولاً زیر/بالای ساختارِ ۲۴ ساعت اخیر است،
+    تقریباً هر سیگنالی در **نخستین بررسی** «حد ضرر خورده» اعلام
+    می‌شد، بی‌آنکه بازار بعد از ورود اصلاً به آن سمت رفته باشد. هرگز
+    از افراط‌های چرخشی (۲۴ ساعته/۷ روزه) برای این پنجره استفاده نکنید.
     """
 
     last: float
@@ -117,6 +127,27 @@ class PriceWindow:
         """پایین‌ترین قیمت بازه."""
         candidates = [value for value in (self.last, self.low) if value > 0]
         return min(candidates) if candidates else self.last
+
+
+def window_from_ticks(
+    points: list[tuple[float, float]], last: float, *, since_ms: float = 0.0
+) -> PriceWindow:
+    """
+    ساخت پنجرهٔ «از آخرین بررسی تا حالا» از تیک‌های ثبت‌شده.
+
+    `points` فهرست `(millisecond timestamp, price)` است (همان چیزی که
+    `TickEngine.history` می‌دهد). فقط تیک‌های بعد از `since_ms` شمرده
+    می‌شوند تا قیمت‌های پیش از بازه — که ربطی به این سیگنال ندارند —
+    وارد محاسبهٔ لمس حد ضرر/هدف نشوند.
+
+    اگر تیکی در بازه نباشد، پنجره تک‌قیمتی (`last`) ساخته می‌شود؛
+    کم‌دقت ولی **منصفانه**: هرگز با قیمت‌های قدیمی‌تر از بازه تصمیم
+    نمی‌گیرد.
+    """
+    windowed = [price for stamp, price in points if stamp >= since_ms and price > 0]
+    if not windowed:
+        return PriceWindow(last=last)
+    return PriceWindow(last=last, high=max(windowed), low=min(windowed))
 
 
 @dataclass
@@ -289,35 +320,127 @@ def _to_r(state: OutcomeState, price: float) -> float:
 # ----------------------------------------------------------------- آمار
 
 
+def _field(item: Any, name: str, default: Any = 0) -> Any:
+    """خواندن یک فیلد از شیء یا دیکشنری."""
+    if isinstance(item, dict):
+        return item.get(name, default)
+    return getattr(item, name, default)
+
+
+def ladder_exit(item: Any) -> tuple[float, float]:
+    """
+    نتیجهٔ «خروج پله‌ای» — آنچه یک معامله‌گر واقعی بانک می‌کرد (۲٫۷٫۲).
+
+    سیگنال سه هدف دارد و پیگیری هم پله‌ای است (`targets_hit`)، اما
+    حسابداریِ قدیمی فقط قیمتِ نهایی (حد ضرر یا آخرین هدف) را می‌شمرد:
+    سیگنالی که به هدف اول و دوم رسیده بود و بعد حد ضرر خورده بود،
+    «باختِ -۱R» ثبت می‌شد — در حالی که معامله‌گر دو سوم را با سود
+    بسته بود. همین تعریف، نرخ برد را نظام‌مند پایین‌تر از واقعیت
+    نشان می‌داد و «میانگین R» را بی‌معنا می‌کرد.
+
+    سیاست خروج: سهم‌های مساوی (یک‌سوم) روی هر هدف؛ باقی‌مانده در
+    قیمتِ نهایی (حد ضرر/انقضا). اهرم و سلیقهٔ کاربر در کار نیست،
+    دقیقاً مثل بقیهٔ این ماژول.
+
+    بازگشتی: (درصد، R) — برای سیگنالِ باز یا بدون هدف، همان مقادیرِ
+    مسیر قیمت (`result_percent`/`realized_r`) برگردانده می‌شود.
+    """
+    entry = float(_field(item, "entry_price", 0.0) or 0.0)
+    raw_targets = _field(item, "take_profits", ()) or ()
+    if isinstance(raw_targets, str):
+        # رکوردهای قدیمی/سریال‌شده ممکن است رشتهٔ «103,106,109» باشند
+        raw_targets = [part for part in raw_targets.split(",") if part.strip()]
+    try:
+        targets = tuple(float(t) for t in raw_targets if float(t) > 0)
+    except (TypeError, ValueError):
+        return float(_field(item, "result_percent", 0.0) or 0.0), float(
+            _field(item, "realized_r", 0.0) or 0.0
+        )
+    exit_price = _field(item, "exit_price", None)
+    status = str(_field(item, "status", STATUS_PENDING) or STATUS_PENDING)
+    path_percent = float(_field(item, "result_percent", 0.0) or 0.0)
+    path_r = float(_field(item, "realized_r", 0.0) or 0.0)
+
+    if (
+        entry <= 0
+        or not targets
+        or exit_price is None
+        or float(exit_price or 0) <= 0
+        or status not in CLOSED_STATUSES
+    ):
+        return path_percent, path_r
+
+    is_long = str(_field(item, "direction", "LONG") or "LONG").upper() != "SHORT"
+    stop = float(_field(item, "stop_loss", 0.0) or 0.0)
+    risk = abs(entry - stop) if stop > 0 else 0.0
+    hit = max(0, min(int(_field(item, "targets_hit", 0) or 0), len(targets)))
+
+    percents: list[float] = []
+    rs: list[float] = []
+    for index in range(len(targets)):
+        if index < hit:
+            price = targets[index]
+        else:
+            price = float(exit_price)
+        percents.append(percent_change(entry, price, is_long=is_long))
+        if risk > 0:
+            move = (price - entry) if is_long else (entry - price)
+            rs.append(move / risk)
+        else:
+            rs.append(0.0)
+
+    return round(sum(percents) / len(percents), 4), round(sum(rs) / len(rs), 3)
+
+
 def summarize(outcomes: list[Any]) -> dict[str, Any]:
     """
     خلاصهٔ عملکرد از روی فهرست نتیجه‌ها.
 
-    فقط سیگنال‌های **بسته‌شده** در نرخ برد می‌آیند؛ آوردن سیگنال‌های باز
-    نرخ را به‌طور مصنوعی جابه‌جا می‌کند. سیگنال‌های منقضی جداگانه شمرده
-    می‌شوند چون نه برد بودند نه باخت.
+    «برد» یعنی معامله‌ای که با سیاستِ خروجِ پله‌ای (یک‌سوم روی هر هدف،
+    بدون فرضِ سربه‌سر کردنِ حد ضرر) سودده بسته شده باشد — نه لزوماً
+    رسیدن به آخرین هدف. تعریف قدیمی (فقط رسیدن به هدفِ سوم) صادقانه
+    بود ولی گمراه‌کننده: سیگنالی که دو هدف را زده بود و بعد حد ضرر
+    خورده بود «باختِ -۱R» حساب می‌شد، در حالی که معامله‌گر با خروج
+    پله‌ای ‎+1R‎ بانک کرده بود.
+
+    وضعیت‌های خام هم کنارش می‌آیند (`targets_full`، `stops_hit`) تا
+    کسی از دید هیچ‌چیز پنهان نماند. سیگنال‌های منقضی در نرخ برد نمی‌آیند
+    (نه بردند نه باخت) ولی در Rهای جمع‌شده شمرده می‌شوند.
     """
     total = len(outcomes)
     pending = [item for item in outcomes if _status(item) == STATUS_PENDING]
-    wins = [item for item in outcomes if _status(item) == STATUS_TARGET]
-    losses = [item for item in outcomes if _status(item) == STATUS_STOP]
+    targets_full = [item for item in outcomes if _status(item) == STATUS_TARGET]
+    stops_hit = [item for item in outcomes if _status(item) == STATUS_STOP]
     expired = [item for item in outcomes if _status(item) == STATUS_EXPIRED]
 
-    decided = len(wins) + len(losses)
+    closed = [item for item in outcomes if _status(item) in CLOSED_STATUSES]
+    ladder = [ladder_exit(item) for item in closed]
+    decided_pairs = [
+        pair
+        for item, pair in zip(closed, ladder, strict=True)
+        if _status(item) in (STATUS_TARGET, STATUS_STOP)
+    ]
+    wins = [pair for pair in decided_pairs if pair[1] > 0]
+    losses = [pair for pair in decided_pairs if pair[1] <= 0]
+    profitable = [pair for pair in ladder if pair[1] > 0]
+
+    decided = len(decided_pairs)
     win_rate = (len(wins) / decided * 100) if decided else 0.0
 
-    results = [float(getattr(item, "result_percent", 0) or 0) for item in outcomes
-               if _status(item) in CLOSED_STATUSES]
     r_values = [float(getattr(item, "realized_r", 0) or 0) for item in outcomes
                 if _status(item) in CLOSED_STATUSES]
+    ladder_percents = [pair[0] for pair in ladder]
+    ladder_rs = [pair[1] for pair in ladder]
 
-    win_amounts = [value for value in results if value > 0]
-    loss_amounts = [abs(value) for value in results if value < 0]
+    win_amounts = [value for value in ladder_percents if value > 0]
+    loss_amounts = [abs(value) for value in ladder_percents if value < 0]
 
     gross_win = sum(win_amounts)
     gross_loss = sum(loss_amounts)
     # ضریب سود: مجموع سودها تقسیم بر مجموع زیان‌ها. بالای ۱ یعنی سودده.
     profit_factor = (gross_win / gross_loss) if gross_loss else (gross_win and float("inf"))
+
+    tp1_reached = sum(1 for item in closed if int(_field(item, "targets_hit", 0) or 0) >= 1)
 
     return {
         "total": total,
@@ -327,12 +450,23 @@ def summarize(outcomes: list[Any]) -> dict[str, Any]:
         "expired": len(expired),
         "decided": decided,
         "win_rate": round(win_rate, 1),
-        "total_percent": round(sum(results), 2),
-        "average_percent": round(sum(results) / len(results), 2) if results else 0.0,
-        "total_r": round(sum(r_values), 2),
-        "average_r": round(sum(r_values) / len(r_values), 2) if r_values else 0.0,
-        "best_percent": round(max(results), 2) if results else 0.0,
-        "worst_percent": round(min(results), 2) if results else 0.0,
+        # شفافیتِ تعریف (۲٫۷٫۲): وضعیت‌های خام و متریک‌های پله‌ای
+        "targets_full": len(targets_full),
+        "stops_hit": len(stops_hit),
+        "full_target_rate": round(len(targets_full) / decided * 100, 1) if decided else 0.0,
+        "tp1_reached": tp1_reached,
+        "tp1_rate": round(tp1_reached / decided * 100, 1) if decided else 0.0,
+        "profitable": len(profitable),
+        "profitable_rate": round(len(profitable) / len(ladder) * 100, 1) if ladder else 0.0,
+        "total_percent": round(sum(ladder_percents), 2) if ladder_percents else 0.0,
+        "average_percent": round(sum(ladder_percents) / len(ladder_percents), 2) if ladder_percents else 0.0,
+        "total_r": round(sum(ladder_rs), 2) if ladder_rs else 0.0,
+        "average_r": round(sum(ladder_rs) / len(ladder_rs), 2) if ladder_rs else 0.0,
+        # مقادیر «مسیر قیمت» (بدون خروج پله‌ای) برای مقایسه و اشکال‌زدایی
+        "path_total_r": round(sum(r_values), 2),
+        "path_average_r": round(sum(r_values) / len(r_values), 2) if r_values else 0.0,
+        "best_percent": round(max(ladder_percents), 2) if ladder_percents else 0.0,
+        "worst_percent": round(min(ladder_percents), 2) if ladder_percents else 0.0,
         "average_win": round(sum(win_amounts) / len(win_amounts), 2) if win_amounts else 0.0,
         "average_loss": round(sum(loss_amounts) / len(loss_amounts), 2) if loss_amounts else 0.0,
         "profit_factor": round(profit_factor, 2) if profit_factor not in (0, float("inf")) else profit_factor,
@@ -391,7 +525,9 @@ __all__ = [
     "confidence_buckets",
     "expiry_for",
     "group_by",
+    "ladder_exit",
     "percent_change",
     "summarize",
     "update_outcome",
+    "window_from_ticks",
 ]

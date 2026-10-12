@@ -22,6 +22,8 @@ import os
 import platform
 import shutil
 import subprocess
+import threading
+import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -39,6 +41,16 @@ POLL_INTERVAL = 0.5
 WARM_UP_TIMEOUT = 600.0
 #: مدت نگه‌داشتن مدل در حافظه (هم‌خوان با ارائه‌دهنده)
 KEEP_ALIVE = "30m"
+#: ۲٫۷٫۲: دست‌کم این فاصله بین دو تلاش برای `ollama serve` (ثانیه).
+#: پیش‌تر هر نمونهٔ ارائه‌دهنده یک بار تلاش می‌کرد؛ اگر سرویس واقعاً
+#: پایین بود و رابط هر چند ثانیه وضعیت را می‌پرسید، هر پرسش یک فرایندِ
+#: تازهٔ `ollama serve` می‌ساخت که روی ویندوز پنجرهٔ کنسولش لحظه‌ای ظاهر
+#: می‌شد («ترمینال مدام باز و بسته می‌شود»). حالا راه‌اندازی تک‌پروازه و
+#: با فاصلهٔ دست‌کم ۶۰ ثانیه است.
+LAUNCH_COOLDOWN_SECONDS = 60.0
+
+_launch_guard = threading.Lock()
+_last_launch_monotonic = 0.0
 
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
 
@@ -111,9 +123,24 @@ def start_service(executable: str) -> bool:
 
     فرایند جدا می‌ماند تا بستن برنامه اولاما را نبندد (کاربر ممکن است در
     ترمینال هم از آن استفاده کند).
+
+    نسخهٔ ۲٫۷٫۲: راه‌اندازی «تک‌پروازه» است — اگر کمتر از
+    `LAUNCH_COOLDOWN_SECONDS` از آخرین تلاش گذشته باشد، فرایند تازه‌ای
+    ساخته نمی‌شود (همان اولی یا بالا می‌آید یا نه؛ تکرارِ بی‌فاصله فقط
+    پنجره و فرایند اضافه می‌سازد).
     """
+    global _last_launch_monotonic  # noqa: PLW0603
     if not executable:
         return False
+    with _launch_guard:
+        now = time.monotonic()
+        if now - _last_launch_monotonic < LAUNCH_COOLDOWN_SECONDS:
+            logger.debug(
+                "Ollama start skipped: last attempt %.0fs ago",
+                now - _last_launch_monotonic,
+            )
+            return False
+        _last_launch_monotonic = now
     kwargs: dict = {
         "stdin": subprocess.DEVNULL,
         "stdout": subprocess.DEVNULL,
@@ -151,7 +178,11 @@ async def ensure_running(base_url: str, *, wait_seconds: float = START_WAIT_SECO
     if not executable:
         return False, "Ollama is not installed on this machine (https://ollama.com/download)"
     if not start_service(executable):
-        return False, f"Ollama was found at {executable} but could not be started"
+        return False, (
+            f"Ollama is installed at {executable} but is not answering and a "
+            f"start was already attempted in the last {int(LAUNCH_COOLDOWN_SECONDS)}s "
+            "(or the process could not be launched)"
+        )
     loop = asyncio.get_running_loop()
     deadline = loop.time() + max(1.0, wait_seconds)
     while loop.time() < deadline:

@@ -35,6 +35,22 @@ def _register_plugins() -> None:
         register_builtin_strategies()
 
 
+@pytest.fixture(autouse=True)
+def _reset_ollama_crash_fuse() -> None:
+    """
+    فیوزِ فروپاشیِ مدل بین آزمون‌ها نشت نکند (۲٫۷٫۲).
+
+    فیوز در تولید سراسری (سطح ماژول) است تا نمونه‌های تازهٔ ارائه‌دهنده
+    نتوانند از زیرش در بروند؛ اما آزمون‌هایی که عمداً فروپاشی می‌سازند
+    نباید آزمون‌های بعدی را با پیامِ «فیوز باز» بکشند.
+    """
+    try:
+        from ai.providers.ollama_provider import reset_crash_breaker
+    except Exception:  # noqa: BLE001 - اگر ماژول در دسترس نیست، کاری نکن
+        return
+    reset_crash_breaker()
+
+
 @pytest.fixture()
 def temp_paths(tmp_path: Path) -> AppPaths:
     """مسیرهای برنامه روی پوشه موقت."""

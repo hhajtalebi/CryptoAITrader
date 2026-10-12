@@ -30,6 +30,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -120,6 +121,80 @@ RUNNER_CRASH_RETRIES = 2
 #: بدون مکث، درخواست بعدی به اولامایی می‌رسد که هنوز مشغول پاک‌کردن
 #: مدل مُرده است و باز هم شکست می‌خورد.
 RUNNER_CRASH_BACKOFF = 1.5
+
+# ------------------------------------------------------------------
+# فیوزِ قطع در برابر فروپاشی‌های پیاپی اجراکننده (۲٫۷٫۲)
+# ------------------------------------------------------------------
+# وقتی اجراکنندهٔ مدل روی دستگاهی پشت‌سرهم می‌میرد، تلاشِ هر باره فقط
+# کار را بدتر می‌کند: هر تحلیل چند دقیقه معطل می‌ماند، هر بار مدل از نو
+# بارگذاری می‌شود و روی ویندوز هر بارگذاری هم پنجره‌ای می‌سازد و هم
+# حافظه را تکه‌تکه می‌کند. سیگنال‌ها هم در این فاصله بدون تحلیلِ واقعی
+# می‌مانند — بی‌آنکه کاربر بفهمد چرا.
+#
+# پس پس از چند فروپاشیِ پیاپی، فیوز برای مدتی باز می‌شود: درخواست‌ها
+# بی‌درنگ با پیامِ علتِ واقعی رد می‌شوند تا کاربر مدل کوچک‌تری انتخاب
+# کند یا حافظه آزاد کند. با اولین پاسخ موفق، فیوز بسته می‌شود.
+CRASH_BREAKER_THRESHOLD = 3
+#: پنجره‌ای که در آن فروپاشی‌ها «پیاپی» حساب می‌شوند (ثانیه)
+CRASH_BREAKER_WINDOW = 900.0
+#: مدت باز ماندن فیوز پس از رسیدن به آستانه (ثانیه)
+CRASH_BREAKER_COOLDOWN = 600.0
+
+_crash_breaker_lock = threading.Lock()
+_crash_failure_times: list[float] = []
+_crash_breaker_open_until = 0.0
+
+
+def _record_crash_failure() -> None:
+    """ثبت یک فروپاشیِ اجراکننده و باز کردن فیوز در صورت تکرار."""
+    global _crash_breaker_open_until  # noqa: PLW0603
+    now = time.monotonic()
+    with _crash_breaker_lock:
+        _crash_failure_times.append(now)
+        cutoff = now - CRASH_BREAKER_WINDOW
+        recent = [t for t in _crash_failure_times if t >= cutoff]
+        _crash_failure_times[:] = recent
+        if len(recent) >= CRASH_BREAKER_THRESHOLD:
+            _crash_breaker_open_until = now + CRASH_BREAKER_COOLDOWN
+            logger.error(
+                "Ollama runner crashed %s times within %.0f minutes; refusing new "
+                "requests for %.0f minutes. Fix the real cause first (see the "
+                "previous errors): use a smaller/quantised model, close other "
+                "apps, or lower ai.ollama_max_context.",
+                len(recent),
+                CRASH_BREAKER_WINDOW / 60.0,
+                CRASH_BREAKER_COOLDOWN / 60.0,
+            )
+
+
+def _clear_crash_failures() -> None:
+    """بستن فیوز پس از یک پاسخ موفق."""
+    global _crash_breaker_open_until  # noqa: PLW0603
+    with _crash_breaker_lock:
+        _crash_failure_times.clear()
+        _crash_breaker_open_until = 0.0
+
+
+def _crash_breaker_note() -> str | None:
+    """اگر فیوز باز است پیامِ ردِ سریع، وگرنه None."""
+    with _crash_breaker_lock:
+        remaining = _crash_breaker_open_until - time.monotonic()
+    if remaining <= 0:
+        return None
+    return (
+        f"The local model keeps crashing on this machine; new requests are "
+        f"paused for {int(remaining / 60) + 1} more minute(s). This is a hardware/"
+        f"model-size problem, not a network one — try a smaller or quantised "
+        f"model, close other apps, or lower ai.ollama_max_context."
+    )
+
+
+def reset_crash_breaker() -> None:
+    """بازنشانی کامل فیوز — برای آزمون‌ها."""
+    global _crash_breaker_open_until  # noqa: PLW0603
+    with _crash_breaker_lock:
+        _crash_failure_times.clear()
+        _crash_breaker_open_until = 0.0
 
 FALLBACK_NUM_CTX = 4096
 
@@ -567,6 +642,11 @@ class OllamaProvider(AIProvider):
         قفل، درخواست‌ها را پشت سر هم می‌کند. چند صد میلی‌ثانیه انتظار
         بیشتر، در برابر مرگ اجراکننده معاملهٔ خوبی است.
         """
+        note = _crash_breaker_note()
+        if note:
+            # فیوزِ فروپاشی باز است: به‌جای یک معطلیِ چنددقیقه‌ایِ دیگر و
+            # فشارِ بیشتر روی مدلی که پشت‌سرهم می‌میرد، بی‌درنگ رد می‌کنیم.
+            raise AIProviderError(note, details={"provider": self.name, "fused": True})
         async with self._request_lock:
             return await self._generate_once(
                 messages, json_mode=json_mode, temperature=temperature
@@ -819,6 +899,11 @@ class OllamaProvider(AIProvider):
                 payload["model"] = model
                 response = await client.post("/api/chat", json=payload)
             if response.status_code >= 400:
+                if _is_runner_crash(response) or self._is_memory_error(response):
+                    # فروپاشیِ اجراکننده/کمبود حافظه: برای فیوز شمارده می‌شود
+                    # تا تکرارِ بی‌وقفهٔ درخواست‌ها (و بارگذاری‌های مکرر مدل
+                    # که روی ویندوز پنجره هم می‌سازد) متوقف شود.
+                    _record_crash_failure()
                 raise AIProviderError(
                     self._describe_http_error(response, model),
                     details={
@@ -859,6 +944,7 @@ class OllamaProvider(AIProvider):
             raise AIProviderError("Ollama returned invalid JSON") from exc
 
         latency = round(time.monotonic() - started_at, 3)
+        _clear_crash_failures()
         logger.info(
             "Ollama reply from '%s' in %.2fs (prompt %s tokens, completion %s tokens)",
             data.get("model") or model,

@@ -1141,7 +1141,9 @@ class Application:
             logger.debug("Could not start outcome tracking for signal %s", signal_id,
                          exc_info=True)
 
-    async def refresh_outcomes(self, *, limit: int | None = None) -> dict[str, Any]:
+    async def refresh_outcomes(
+        self, *, limit: int | None = None, tick_engine: Any = None
+    ) -> dict[str, Any]:
         """
         یک دور بررسی قیمت برای همهٔ سیگنال‌های باز.
 
@@ -1149,17 +1151,26 @@ class Application:
         نماد: سی سیگنال باز یعنی سی درخواست جدا و برخورد با محدودیت نرخ
         صرافی. یک درخواست برای همه، هم سریع‌تر است هم مؤدبانه‌تر.
 
-        بازگشتی: شمارش `checked/closed/wins/losses/expired`.
+        نسخهٔ ۲٫۷٫۲: `tick_engine` (اختیاری) تیک‌های ثبت‌شدهٔ هر نماد را
+        می‌دهد تا پنجرهٔ قیمتِ «از آخرین بررسی تا حالا» واقعاً همان بازه
+        باشد. پیش‌تر بازه از `high_24h`/`low_24h` تیکر ساخته می‌شد که
+        قیمت‌های **پیش از ورود** را هم داشت و تقریباً هر سیگنال را در
+        نخستین بررسی «حد ضرر خورده» اعلام می‌کرد.
+
+        بازگشتی: شمارش `checked/closed/wins/losses/expired/full_targets`
+        (برد/باخت با سیاست خروجِ پله‌ای — `signals.outcome_tracker.ladder_exit`).
         """
         from signals.outcome_tracker import (
             CLOSED_STATUSES,
             STATUS_EXPIRED,
-            STATUS_STOP,
-            STATUS_TARGET,
+            ladder_exit,
             update_outcome,
         )
 
-        report = {"checked": 0, "closed": 0, "wins": 0, "losses": 0, "expired": 0}
+        report = {
+            "checked": 0, "closed": 0, "wins": 0, "losses": 0,
+            "expired": 0, "full_targets": 0,
+        }
         if self.market is None:
             return report
 
@@ -1168,7 +1179,14 @@ class Application:
         if not records:
             return report
 
-        prices = await self._outcome_prices({record.symbol for record in records})
+        prices = await self._outcome_prices(
+            {record.symbol for record in records},
+            since={
+                record.symbol: record.checked_at or record.created_at
+                for record in records
+            },
+            tick_engine=tick_engine,
+        )
         if not prices:
             return report
 
@@ -1182,17 +1200,26 @@ class Application:
             report["checked"] += 1
             if state.status in CLOSED_STATUSES:
                 report["closed"] += 1
-                if state.status == STATUS_TARGET:
-                    report["wins"] += 1
-                elif state.status == STATUS_STOP:
-                    report["losses"] += 1
-                elif state.status == STATUS_EXPIRED:
+                if state.status == STATUS_EXPIRED:
                     report["expired"] += 1
+                if state.status == "TARGET":
+                    report["full_targets"] += 1
+                # برد/باخت واقعی با خروجِ پله‌ای، نه صرف وضعیت نهایی:
+                # سیگنالی که دو هدف را زده و بعد حد ضرر خورده، معامله‌ای
+                # سودده (‎+1R‎) بوده است، نه «باخت».
+                if state.status != STATUS_EXPIRED:
+                    _, ladder_r = ladder_exit(state)
+                    if ladder_r > 0:
+                        report["wins"] += 1
+                    else:
+                        report["losses"] += 1
 
         if report["closed"]:
             logger.info(
-                "Outcome tracking closed %s signal(s): %s win / %s loss",
+                "Outcome tracking closed %s signal(s): %s win / %s loss "
+                "(%s reached all targets)",
                 report["closed"], report["wins"], report["losses"],
+                report["full_targets"],
             )
         return report
 
@@ -1263,16 +1290,48 @@ class Application:
             logger.info("AI reviewed %s closed signal(s)", report["reviewed"])
         return report
 
-    async def _outcome_prices(self, symbols: set[str]) -> dict[str, Any]:
+    async def _outcome_prices(
+        self,
+        symbols: set[str],
+        *,
+        since: dict[str, Any] | None = None,
+        tick_engine: Any = None,
+    ) -> dict[str, Any]:
         """
-        گرفتن بازهٔ قیمتی نمادهای تحت پیگیری.
+        گرفتن بازهٔ قیمتی «از آخرین بررسی تا حالا» برای نمادهای تحت پیگیری.
 
-        ترجیح با فهرست یک‌جای تیکرهاست چون `high_24h`/`low_24h` را هم
-        می‌دهد و همان چیزی است که برای تشخیص «آیا در این فاصله حد ضرر
-        لمس شد؟» لازم داریم. اگر آن درخواست شکست خورد، به قیمت لحظه‌ای
-        تک‌تک نمادها برمی‌گردیم — دقتش کمتر است ولی پیگیری متوقف نمی‌شود.
+        نسخهٔ ۲٫۷٫۲ — رفع باگِ نرخ برد ۲٪:
+
+        پیش‌تر این سازنده `high_24h`/`low_24h` تیکر را به‌عنوان بازه
+        می‌داد و `update_outcome` آن را «از آخرین بررسی تا حالا» می‌خواند.
+        یک بازهٔ ۲۴ ساعته تقریباً همیشه حد ضرر را در بر می‌گیرد (حد ضرر
+        کنار ساختار همان ۲۴ ساعت است)، پس تقریباً هر سیگنال در نخستین
+        بررسی «حد ضرر خورده» اعلام می‌شد — حتی اگر بعد از ورود قیمت
+        اصلاً به سمت حد ضرر نرفته بود.
+
+        حالا بازه از تیک‌های ثبت‌شدهٔ `tick_engine` پس از `since` ساخته
+        می‌شود (`window_from_ticks`) و اگر تیکی در بازه نبود، فقط قیمتِ
+        لحظه‌ای می‌نشیند — دقتش کمتر است ولی منصفانه. هرگز از افراط‌های
+        چرخشی (۲۴ ساعته/۷ روزه) استفاده نمی‌شود.
         """
-        from signals.outcome_tracker import PriceWindow
+        from signals.outcome_tracker import as_utc, window_from_ticks
+
+        def since_ms(symbol: str) -> float:
+            moment = (since or {}).get(symbol)
+            if moment is None:
+                return 0.0
+            try:
+                return as_utc(moment).timestamp() * 1000.0
+            except (TypeError, ValueError, OSError):
+                return 0.0
+
+        def points_for(symbol: str) -> list[tuple[float, float]]:
+            if tick_engine is None:
+                return []
+            try:
+                return list(tick_engine.history(symbol) or [])
+            except Exception:  # noqa: BLE001 - تاریخچه هرگز پیگیری را نمی‌شکند
+                return []
 
         windows: dict[str, Any] = {}
         try:
@@ -1283,10 +1342,10 @@ class Application:
 
         for ticker in tickers:
             if ticker.symbol in symbols and ticker.last_price > 0:
-                windows[ticker.symbol] = PriceWindow(
-                    last=float(ticker.last_price),
-                    high=float(ticker.high_24h or 0),
-                    low=float(ticker.low_24h or 0),
+                windows[ticker.symbol] = window_from_ticks(
+                    points_for(ticker.symbol),
+                    float(ticker.last_price),
+                    since_ms=since_ms(ticker.symbol),
                 )
 
         missing = symbols - set(windows)
@@ -1296,7 +1355,9 @@ class Application:
             except Exception:  # noqa: BLE001
                 continue
             if price > 0:
-                windows[symbol] = PriceWindow(last=float(price))
+                windows[symbol] = window_from_ticks(
+                    points_for(symbol), float(price), since_ms=since_ms(symbol)
+                )
         return windows
 
     async def analyze_scanned_signal(self, signal: Any) -> Any:
